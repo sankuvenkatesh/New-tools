@@ -1,0 +1,890 @@
+bl_info = {
+    "name": "Smart Curve Tools",
+    "author": "Venkatesh Sanku (merged by AI assistant)",
+    "version": (2, 1),
+    "blender": (5, 0, 0),
+    "location": "Graph Editor > Sidebar > Smart Curve Tools Tab",
+    "description": (
+        "Combined toolset: Smart Euler Filter for unwrap/smooth Euler or Quaternion rotations preserving handles, "
+        "advanced smoothing of F-Curves (weighted / moving average / gaussian), keyframe decimation/cleanup, "
+        "easing presets, and noise/jitter tools. "
+        "Works for objects and pose bones, with preserved keyframe handles. Batch smoothing affects all keyframes."
+    ),
+    "category": "Animation",
+}
+
+import bpy
+import math
+import random
+from mathutils import Euler, Quaternion
+
+# ----- Utility Functions -----
+
+def clamp(value, minv, maxv):
+    return min(max(value, minv), maxv)
+
+def get_graph_fcurves(context):
+    """Get F-Curves from Graph Editor context - Blender 5.0"""
+    fcurves = []
+
+    # Method 1: Selected editable fcurves
+    try:
+        selected_fcurves = getattr(context, "selected_editable_fcurves", [])
+        if selected_fcurves:
+            fcurves.extend(selected_fcurves)
+    except:
+        pass
+
+    # Method 2: Graph Editor space data
+    try:
+        if context.space_data and context.space_data.type == 'GRAPH_EDITOR':
+            if context.space_data.edit_object and context.space_data.edit_object.animation_data:
+                if context.space_data.edit_object.animation_data.action:
+                    fcurves.extend(context.space_data.edit_object.animation_data.action.fcurves)
+    except:
+        pass
+
+    # Method 3: Active object
+    try:
+        obj = context.active_object
+        if obj and obj.animation_data and obj.animation_data.action:
+            fcurves.extend(obj.animation_data.action.fcurves)
+    except:
+        pass
+
+    return list(set(fcurves))
+
+def auto_fix_bad_keyframes(fcurve):
+    try:
+        keyframes = fcurve.keyframe_points
+        n = len(keyframes)
+        for i in range(n):
+            y = keyframes[i].co[1]
+            if not math.isfinite(y):
+                left = next((keyframes[j].co[1] for j in range(i - 1, -1, -1) if math.isfinite(keyframes[j].co[1])), None)
+                right = next((keyframes[j].co[1] for j in range(i + 1, n) if math.isfinite(keyframes[j].co[1])), None)
+                if left is not None and right is not None:
+                    keyframes[i].co[1] = (left + right) / 2
+                elif left is not None:
+                    keyframes[i].co[1] = left
+                elif right is not None:
+                    keyframes[i].co[1] = right
+                else:
+                    keyframes[i].co[1] = 0.0
+    except:
+        pass
+
+def set_bezier_and_auto_clamp_handles(fcurve):
+    try:
+        for kp in fcurve.keyframe_points:
+            kp.interpolation = 'BEZIER'
+            kp.handle_left_type = 'AUTO_CLAMPED'
+            kp.handle_right_type = 'AUTO_CLAMPED'
+        fcurve.update()
+    except:
+        pass
+
+# ORIGINAL SMOOTHING - EXACT LOGIC (method: WEIGHTED)
+def smooth_keyframes(fcurve, iterations, strength, sensitivity, preserve_ends=True, all_keyframes=False):
+    try:
+        keyframes = fcurve.keyframe_points
+        n = len(keyframes)
+        if n < 3:
+            return {'moved': 0, 'max_delta': 0}
+        if all_keyframes:
+            indices = list(range(n))
+        else:
+            indices = [i for i, kp in enumerate(keyframes) if kp.select_control_point]
+            if len(indices) < 3:
+                return {'moved': 0, 'max_delta': 0}
+        values = [kp.co[1] for kp in keyframes]
+        stats = {'moved': 0, 'max_delta': 0}
+        strength_factor = strength ** 3
+        smooth_factor = 1.0 - sensitivity
+        for _ in range(iterations):
+            new_values = values[:]
+            for idx_pos in range(1, len(indices) - 1):
+                i = indices[idx_pos]
+                if preserve_ends and (idx_pos == 0 or idx_pos == len(indices) - 1):
+                    continue
+                left_i = indices[idx_pos-1]
+                right_i = indices[idx_pos+1]
+                left = values[left_i]
+                center = values[i]
+                right = values[right_i]
+                average = (left + center + right) / 3
+                diff = abs(center - average)
+                base = abs(center) if center != 0 else 1.0
+                weight_unclamped = strength_factor * (1 - smooth_factor + smooth_factor * (diff / base))
+                weight = clamp(weight_unclamped, 0.0, 1.0)
+                new_val = center * (1 - weight) + average * weight
+                if not math.isfinite(new_val):
+                    new_val = center
+                delta = new_val - center
+                new_values[i] = new_val
+                if abs(delta) > 0:
+                    stats['moved'] += 1
+                    stats['max_delta'] = max(stats['max_delta'], abs(delta))
+            values = new_values
+        for i in indices:
+            keyframes[i].co[1] = values[i]
+        auto_fix_bad_keyframes(fcurve)
+        fcurve.update()
+        return stats
+    except:
+        return {'moved': 0, 'max_delta': 0}
+
+# NEW: Moving Average smoothing
+def moving_average_smooth(fcurve, iterations, window, preserve_ends=True, all_keyframes=False):
+    try:
+        keyframes = fcurve.keyframe_points
+        n = len(keyframes)
+        if n < 3:
+            return {'moved': 0, 'max_delta': 0}
+        if all_keyframes:
+            indices = list(range(n))
+        else:
+            indices = [i for i, kp in enumerate(keyframes) if kp.select_control_point]
+            if len(indices) < 3:
+                return {'moved': 0, 'max_delta': 0}
+        values = [kp.co[1] for kp in keyframes]
+        stats = {'moved': 0, 'max_delta': 0}
+        half = max(1, window // 2)
+        for _ in range(iterations):
+            new_values = values[:]
+            for idx_pos, i in enumerate(indices):
+                if preserve_ends and (idx_pos == 0 or idx_pos == len(indices) - 1):
+                    continue
+                lo = max(0, i - half)
+                hi = min(n, i + half + 1)
+                window_vals = values[lo:hi]
+                new_val = sum(window_vals) / len(window_vals)
+                if not math.isfinite(new_val):
+                    new_val = values[i]
+                delta = new_val - values[i]
+                new_values[i] = new_val
+                if abs(delta) > 0:
+                    stats['moved'] += 1
+                    stats['max_delta'] = max(stats['max_delta'], abs(delta))
+            values = new_values
+        for i in indices:
+            keyframes[i].co[1] = values[i]
+        auto_fix_bad_keyframes(fcurve)
+        fcurve.update()
+        return stats
+    except:
+        return {'moved': 0, 'max_delta': 0}
+
+# NEW: Gaussian smoothing
+def gaussian_smooth(fcurve, iterations, window, sigma, preserve_ends=True, all_keyframes=False):
+    try:
+        keyframes = fcurve.keyframe_points
+        n = len(keyframes)
+        if n < 3:
+            return {'moved': 0, 'max_delta': 0}
+        if all_keyframes:
+            indices = list(range(n))
+        else:
+            indices = [i for i, kp in enumerate(keyframes) if kp.select_control_point]
+            if len(indices) < 3:
+                return {'moved': 0, 'max_delta': 0}
+        values = [kp.co[1] for kp in keyframes]
+        stats = {'moved': 0, 'max_delta': 0}
+        half = max(1, window // 2)
+        sigma = max(0.01, sigma)
+        kernel = [math.exp(-(k ** 2) / (2 * sigma ** 2)) for k in range(-half, half + 1)]
+        for _ in range(iterations):
+            new_values = values[:]
+            for idx_pos, i in enumerate(indices):
+                if preserve_ends and (idx_pos == 0 or idx_pos == len(indices) - 1):
+                    continue
+                acc = 0.0
+                wsum = 0.0
+                for k_idx, offset in enumerate(range(-half, half + 1)):
+                    j = i + offset
+                    if 0 <= j < n:
+                        w = kernel[k_idx]
+                        acc += values[j] * w
+                        wsum += w
+                new_val = acc / wsum if wsum > 0 else values[i]
+                if not math.isfinite(new_val):
+                    new_val = values[i]
+                delta = new_val - values[i]
+                new_values[i] = new_val
+                if abs(delta) > 0:
+                    stats['moved'] += 1
+                    stats['max_delta'] = max(stats['max_delta'], abs(delta))
+            values = new_values
+        for i in indices:
+            keyframes[i].co[1] = values[i]
+        auto_fix_bad_keyframes(fcurve)
+        fcurve.update()
+        return stats
+    except:
+        return {'moved': 0, 'max_delta': 0}
+
+def dispatch_smooth(fcurve, settings, all_keyframes):
+    """Route to the smoothing algorithm chosen in settings.smoothing_method"""
+    if settings.smoothing_method == 'MOVING_AVERAGE':
+        return moving_average_smooth(fcurve, settings.iterations, settings.ma_window, settings.preserve_ends, all_keyframes)
+    elif settings.smoothing_method == 'GAUSSIAN':
+        return gaussian_smooth(fcurve, settings.iterations, settings.ma_window, settings.gaussian_sigma, settings.preserve_ends, all_keyframes)
+    else:
+        return smooth_keyframes(fcurve, settings.iterations, settings.strength, settings.sensitivity, settings.preserve_ends, all_keyframes)
+
+# NEW: Ramer-Douglas-Peucker decimation for keyframe cleanup
+def _point_line_distance(p, a, b):
+    if a == b:
+        return math.hypot(p[0] - a[0], p[1] - a[1])
+    x1, y1 = a
+    x2, y2 = b
+    x0, y0 = p
+    num = abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
+    den = math.hypot(y2 - y1, x2 - x1)
+    return num / den if den != 0 else 0.0
+
+def rdp_decimate(points, epsilon):
+    if len(points) < 3:
+        return points
+    dmax = 0.0
+    index = 0
+    start, end = points[0], points[-1]
+    for i in range(1, len(points) - 1):
+        d = _point_line_distance(points[i], start, end)
+        if d > dmax:
+            index = i
+            dmax = d
+    if dmax > epsilon:
+        left = rdp_decimate(points[:index + 1], epsilon)
+        right = rdp_decimate(points[index:], epsilon)
+        return left[:-1] + right
+    else:
+        return [start, end]
+
+# ----- Smart Euler Filter (ORIGINAL LOGIC) -----
+
+def nearest_equivalent_euler(a1, a2):
+    twopi = 2 * math.pi
+    while a2 - a1 > math.pi:
+        a2 -= twopi
+    while a2 - a1 < -math.pi:
+        a2 += twopi
+    return a2
+
+def get_selection_info(context):
+    obj = context.active_object
+    if not obj:
+        return None, None, None
+    try:
+        if obj.type == 'ARMATURE' and hasattr(context, 'active_pose_bone'):
+            bone = context.active_pose_bone
+            if bone:
+                return bone, bone.rotation_mode, f'pose.bones["{bone.name}"]'
+    except:
+        pass
+    return obj, getattr(obj, 'rotation_mode', 'XYZ'), ""
+
+def get_rotation_fcurves(mode_code, all_fcurves, rna_path_prefix):
+    try:
+        if mode_code == "EULER":
+            channel = "rotation_euler"
+            num_channels = 3
+        else:
+            channel = "rotation_quaternion"
+            num_channels = 4
+
+        if rna_path_prefix:
+            prefix = rna_path_prefix
+            found = [fc for fc in all_fcurves if fc.data_path.startswith(f'{prefix}.') and fc.data_path.endswith(channel)]
+        else:
+            found = [fc for fc in all_fcurves if fc.data_path == channel]
+
+        found = sorted(found, key=lambda fc: getattr(fc, 'array_index', 0))
+        found = found[:num_channels]
+
+        # FIXED: Accept even single channel for partial rotations
+        if not found:
+            return None, f"No {channel} f-curves found."
+        return found, None
+    except:
+        return None, "Error finding rotation curves"
+
+def get_fcurve_keyframe_map(fcurve):
+    try:
+        return {int(round(kp.co[0])): kp for kp in fcurve.keyframe_points}
+    except:
+        return {}
+
+def collect_keyframes_with_handles_any(curves):
+    try:
+        axis_keyframes = [get_fcurve_keyframe_map(fc) for fc in curves]
+        frames = sorted({f for mapping in axis_keyframes for f in mapping})
+        if not frames:
+            return []
+        keyframe_info = []
+        for f in frames:
+            kps = [mapping.get(f) for mapping in axis_keyframes]
+            value = [kp.co[1] if kp else None for kp in kps]
+            handles = [{
+                'handle_left_type': getattr(kp, 'handle_left_type', None) if kp else None,
+                'handle_right_type': getattr(kp, 'handle_right_type', None) if kp else None,
+                'handle_left': getattr(kp, 'handle_left', None).copy() if kp and hasattr(kp, 'handle_left') else None,
+                'handle_right': getattr(kp, 'handle_right', None).copy() if kp and hasattr(kp, 'handle_right') else None,
+            } for kp in kps]
+            keyframe_info.append({'frame': f, 'value': value, 'handles': handles})
+        return keyframe_info
+    except:
+        return []
+
+def unwrap_keyframe_values_euler_any(keyframes):
+    out = []
+    prev = None
+    for info in keyframes:
+        e = info['value']
+        if prev is None:
+            fixed = list(e)
+        else:
+            fixed = [nearest_equivalent_euler(prev[i], e[i]) if e[i] is not None and prev[i] is not None else e[i]
+                     for i in range(len(e))]
+        out.append({'frame': info['frame'], 'value': fixed, 'handles': info['handles']})
+        prev = [fixed[i] if fixed[i] is not None else (prev[i] if prev else None) for i in range(len(fixed))]
+    return out
+
+def unwrap_keyframe_values_quaternion_any(keyframes):
+    out = []
+    prev = None
+    for info in keyframes:
+        v = info['value']
+        if len(v) == 4:
+            q = Quaternion([x if x is not None else (prev[i] if prev is not None else 0.0) for i, x in enumerate(v)])
+            if prev is not None and prev.dot(q) < 0.0:
+                q = -q
+            values = [q.w, q.x, q.y, q.z]
+            prev = Quaternion(q)
+        else:
+            values = v if prev is None else [
+                -v[i] if v[i] is not None and prev[i] is not None and abs(v[i] + prev[i]) < abs(v[i] - prev[i]) else v[i]
+                for i in range(len(v))
+            ]
+            prev = [values[i] if values[i] is not None else (prev[i] if prev else None) for i in range(len(values))]
+        out.append({'frame': info['frame'], 'value': values, 'handles': info['handles']})
+    return out
+
+def preserve_and_update_fcurve_points_any(curves, keyframe_infos):
+    try:
+        for axis, fc in enumerate(curves):
+            frame_map = get_fcurve_keyframe_map(fc)
+            for info in keyframe_infos:
+                f = info['frame']
+                v = info['value'][axis]
+                kph = info['handles'][axis]
+                kp = frame_map.get(f)
+                if kp and v is not None:
+                    kp.co[1] = v
+                    if kph and kph.get('handle_left_type') is not None:
+                        kp.handle_left_type = kph['handle_left_type']
+                    if kph and kph.get('handle_right_type') is not None:
+                        kp.handle_right_type = kph['handle_right_type']
+                    if kph and kph.get('handle_left') is not None:
+                        kp.handle_left = kph['handle_left']
+                    if kph and kph.get('handle_right') is not None:
+                        kp.handle_right = kph['handle_right']
+            fc.update()
+    except:
+        pass
+
+# ----- OPERATORS -----
+
+class ROTATION_OT_smart_euler_filter(bpy.types.Operator):
+    """Smart Euler Filter - Works on selected rotation curves OR all rotation curves"""
+    bl_idname = "graph.smart_euler_filter"
+    bl_label = "Smart Euler Filter"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        fcurves = get_graph_fcurves(context)
+        if not fcurves:
+            self.report({'ERROR'}, "No F-Curves found")
+            return {'CANCELLED'}
+
+        entity, rot_mode, rna_path_prefix = get_selection_info(context)
+        if not entity:
+            self.report({'ERROR'}, "No active object or pose bone")
+            return {'CANCELLED'}
+
+        if rot_mode == "QUATERNION":
+            mode_code = "QUATERNION"
+        elif rot_mode in {"XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX"}:
+            mode_code = "EULER"
+        else:
+            mode_code = "EULER"
+
+        rotation_fcurves_all, err = get_rotation_fcurves(mode_code, fcurves, rna_path_prefix)
+        if rotation_fcurves_all is None:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+
+        # FIXED: If user selected specific rotation channels, use only those. Otherwise use all.
+        selected_fcurves = [fc for fc in rotation_fcurves_all if getattr(fc, 'select', False)]
+        rotation_fcurves = selected_fcurves if selected_fcurves else rotation_fcurves_all
+
+        keyframes = collect_keyframes_with_handles_any(rotation_fcurves)
+        if not keyframes:
+            self.report({'ERROR'}, "No rotation keyframes found")
+            return {'CANCELLED'}
+
+        if mode_code == "EULER":
+            unwrapped = unwrap_keyframe_values_euler_any(keyframes)
+        else:
+            unwrapped = unwrap_keyframe_values_quaternion_any(keyframes)
+
+        preserve_and_update_fcurve_points_any(rotation_fcurves, unwrapped)
+        if context.area:
+            context.area.tag_redraw()
+
+        self.report({'INFO'}, f"{mode_code} continuity applied to {len(rotation_fcurves)} channel(s) ({'selected' if selected_fcurves else 'all'})")
+        return {'FINISHED'}
+
+
+EASE_INTERPOLATIONS = [
+    ('LINEAR', "Linear", "Linear interpolation"),
+    ('BEZIER', "Bezier", "Bezier interpolation"),
+    ('SINE', "Sinusoidal", "Sine ease"),
+    ('QUAD', "Quadratic", "Quadratic ease"),
+    ('CUBIC', "Cubic", "Cubic ease"),
+    ('QUART', "Quartic", "Quartic ease"),
+    ('QUINT', "Quintic", "Quintic ease"),
+    ('EXPO', "Exponential", "Exponential ease"),
+    ('CIRC', "Circular", "Circular ease"),
+    ('BACK', "Back", "Back ease (overshoot)"),
+    ('BOUNCE', "Bounce", "Bounce ease"),
+    ('ELASTIC', "Elastic", "Elastic ease"),
+]
+
+EASE_MODES = [
+    ('EASE_IN', "Ease In", ""),
+    ('EASE_OUT', "Ease Out", ""),
+    ('EASE_IN_OUT', "Ease In-Out", ""),
+    ('AUTO', "Auto", ""),
+]
+
+
+class CurveSmoothProperties(bpy.types.PropertyGroup):
+    iterations: bpy.props.IntProperty(
+        name="Iterations",
+        description="Number of smoothing iterations",
+        default=5, min=1, max=50
+    )
+    strength: bpy.props.FloatProperty(
+        name="Strength",
+        description="Smoothing intensity (0-1) - used by Weighted Average method",
+        default=0.5, min=0.0, max=1.0
+    )
+    sensitivity: bpy.props.FloatProperty(
+        name="Sensitivity",
+        description="Smoothing sensitivity falloff (Reversed effect, 0-1) - used by Weighted Average method",
+        default=0.5, min=0.0, max=1.0
+    )
+    preserve_ends: bpy.props.BoolProperty(
+        name="Preserve Ends",
+        description="Do not smooth the first and last selected keyframes",
+        default=True
+    )
+
+    # --- Smoothing method selection ---
+    smoothing_method: bpy.props.EnumProperty(
+        name="Method",
+        description="Algorithm used for smoothing",
+        items=[
+            ('WEIGHTED', "Weighted Average", "Original adaptive weighted smoothing"),
+            ('MOVING_AVERAGE', "Moving Average", "Simple sliding-window average"),
+            ('GAUSSIAN', "Gaussian", "Gaussian-weighted sliding window"),
+        ],
+        default='WEIGHTED'
+    )
+    ma_window: bpy.props.IntProperty(
+        name="Window Size",
+        description="Window size (in keyframes) for Moving Average / Gaussian smoothing",
+        default=5, min=3, max=51
+    )
+    gaussian_sigma: bpy.props.FloatProperty(
+        name="Sigma",
+        description="Standard deviation for Gaussian smoothing (larger = smoother)",
+        default=1.5, min=0.1, max=10.0
+    )
+
+    # --- Cleanup / decimation ---
+    decimate_error: bpy.props.FloatProperty(
+        name="Error Tolerance",
+        description="Maximum allowed value deviation when decimating/simplifying keyframes",
+        default=0.05, min=0.0001, max=10.0
+    )
+
+    # --- Easing presets ---
+    ease_interpolation: bpy.props.EnumProperty(
+        name="Interpolation",
+        items=EASE_INTERPOLATIONS,
+        default='BEZIER'
+    )
+    ease_mode: bpy.props.EnumProperty(
+        name="Easing",
+        items=EASE_MODES,
+        default='EASE_IN_OUT'
+    )
+
+    # --- Noise ---
+    noise_scale: bpy.props.FloatProperty(name="Noise Scale", default=10.0, min=0.01, max=1000.0)
+    noise_strength: bpy.props.FloatProperty(name="Noise Strength", default=1.0, min=0.0, max=100.0)
+    noise_phase: bpy.props.FloatProperty(name="Noise Phase", default=0.0)
+
+    # --- Jitter ---
+    jitter_amount: bpy.props.FloatProperty(name="Jitter Amount", default=0.1, min=0.0, max=100.0)
+    jitter_seed: bpy.props.IntProperty(name="Jitter Seed", default=0, min=0)
+
+
+class CurveSmoothOperator(bpy.types.Operator):
+    """Smooth Selected Keyframes of Selected F-Curves (Advanced)"""
+    bl_idname = "graph.smooth_selected_keyframes"
+    bl_label = "Smooth Selected Keyframes (Advanced)"
+    bl_options = {'REGISTER', 'UNDO', 'PRESET'}
+
+    def execute(self, context):
+        settings = context.scene.curve_smooth_settings
+        smoothed_count = 0
+        total_keys = 0
+        biggest_move = 0
+        curves = getattr(context, "selected_editable_fcurves", [])
+
+        if not curves:
+            self.report({'WARNING'}, "No editable F-Curves selected")
+            return {'CANCELLED'}
+
+        for fcurve in curves:
+            selected_keys = [kp for kp in fcurve.keyframe_points if kp.select_control_point]
+            if len(selected_keys) >= 3:
+                stats = dispatch_smooth(fcurve, settings, all_keyframes=False)
+                set_bezier_and_auto_clamp_handles(fcurve)
+                smoothed_count += 1
+                total_keys += stats['moved']
+                biggest_move = max(biggest_move, stats['max_delta'])
+
+        if smoothed_count == 0:
+            self.report({'WARNING'}, "Not enough selected keyframes to smooth")
+            return {'CANCELLED'}
+
+        self.report({'INFO'},
+                    f"Smoothed {total_keys} keyframes in {smoothed_count} F-Curve(s). Largest change: {biggest_move:.2f}")
+        return {'FINISHED'}
+
+class CurveSmoothAllOperator(bpy.types.Operator):
+    """Batch Smooth All F-Curves (Advanced)"""
+    bl_idname = "graph.smooth_all_keyframes"
+    bl_label = "Batch Smooth All F-Curves"
+    bl_options = {'REGISTER', 'UNDO', 'PRESET'}
+
+    def execute(self, context):
+        settings = context.scene.curve_smooth_settings
+        smoothed_count = 0
+        total_keys = 0
+        biggest_move = 0
+
+        fcurves = get_graph_fcurves(context)
+        if not fcurves:
+            self.report({'WARNING'}, "No F-Curves found")
+            return {'CANCELLED'}
+
+        for fcurve in fcurves:
+            if len(fcurve.keyframe_points) >= 3:
+                stats = dispatch_smooth(fcurve, settings, all_keyframes=True)  # Always process all keyframes in batch mode
+                set_bezier_and_auto_clamp_handles(fcurve)
+                smoothed_count += 1
+                total_keys += stats['moved']
+                biggest_move = max(biggest_move, stats['max_delta'])
+
+        if smoothed_count == 0:
+            self.report({'WARNING'}, "No F-Curves to smooth")
+            return {'CANCELLED'}
+
+        self.report({'INFO'},
+                    f"Batch smoothed {total_keys} keyframes in {smoothed_count} F-Curve(s). Largest change: {biggest_move:.2f}")
+        return {'FINISHED'}
+
+class ResetCurveSmoothValuesOperator(bpy.types.Operator):
+    """Reset Curve Smooth Values to Defaults"""
+    bl_idname = "graph.reset_curve_smooth_values"
+    bl_label = "Reset Curve Smooth Values"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.curve_smooth_settings
+        settings.iterations = 5
+        settings.strength = 0.5
+        settings.sensitivity = 0.5
+        settings.preserve_ends = True
+        settings.smoothing_method = 'WEIGHTED'
+        settings.ma_window = 5
+        settings.gaussian_sigma = 1.5
+        settings.decimate_error = 0.05
+        settings.ease_interpolation = 'BEZIER'
+        settings.ease_mode = 'EASE_IN_OUT'
+        settings.noise_scale = 10.0
+        settings.noise_strength = 1.0
+        settings.noise_phase = 0.0
+        settings.jitter_amount = 0.1
+        settings.jitter_seed = 0
+        self.report({'INFO'}, "Reset smoothing parameters to default values")
+        return {'FINISHED'}
+
+
+class GRAPH_OT_decimate_keyframes(bpy.types.Operator):
+    """Decimate/simplify keyframes on selected F-Curves using error-tolerance reduction (removes redundant keys)"""
+    bl_idname = "graph.smart_decimate_keyframes"
+    bl_label = "Decimate Keyframes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.curve_smooth_settings
+        curves = getattr(context, "selected_editable_fcurves", [])
+        if not curves:
+            self.report({'WARNING'}, "No editable F-Curves selected")
+            return {'CANCELLED'}
+
+        total_before = 0
+        total_after = 0
+
+        for fcurve in curves:
+            try:
+                keyframes = fcurve.keyframe_points
+                n = len(keyframes)
+                if n < 3:
+                    total_before += n
+                    total_after += n
+                    continue
+                points = [(kp.co[0], kp.co[1]) for kp in keyframes]
+                total_before += n
+                kept_points = rdp_decimate(points, settings.decimate_error)
+                kept_frames = {round(p[0], 4) for p in kept_points}
+                kept_frames.add(round(points[0][0], 4))
+                kept_frames.add(round(points[-1][0], 4))
+
+                to_remove = []
+                for i in range(n - 1, -1, -1):
+                    f = round(keyframes[i].co[0], 4)
+                    if f not in kept_frames:
+                        to_remove.append(i)
+
+                for i in to_remove:
+                    keyframes.remove(keyframes[i])
+
+                total_after += (n - len(to_remove))
+                fcurve.update()
+            except Exception:
+                continue
+
+        removed = total_before - total_after
+        self.report({'INFO'}, f"Removed {removed} keyframe(s) ({total_before} -> {total_after})")
+        return {'FINISHED'}
+
+
+class GRAPH_OT_apply_ease_preset(bpy.types.Operator):
+    """Apply an easing/interpolation preset to selected keyframes"""
+    bl_idname = "graph.apply_ease_preset"
+    bl_label = "Apply Ease Preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.curve_smooth_settings
+        curves = getattr(context, "selected_editable_fcurves", [])
+        if not curves:
+            self.report({'WARNING'}, "No editable F-Curves selected")
+            return {'CANCELLED'}
+
+        count = 0
+        for fcurve in curves:
+            for kp in fcurve.keyframe_points:
+                if kp.select_control_point:
+                    kp.interpolation = settings.ease_interpolation
+                    if settings.ease_interpolation not in {'LINEAR', 'CONSTANT'}:
+                        try:
+                            kp.easing = settings.ease_mode
+                        except Exception:
+                            pass
+                    count += 1
+            fcurve.update()
+
+        if count == 0:
+            self.report({'WARNING'}, "No selected keyframes found")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Applied {settings.ease_interpolation} / {settings.ease_mode} to {count} keyframe(s)")
+        return {'FINISHED'}
+
+
+class GRAPH_OT_add_noise_modifier(bpy.types.Operator):
+    """Add a Noise F-Modifier to selected F-Curves"""
+    bl_idname = "graph.smart_add_noise"
+    bl_label = "Add Noise Modifier"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.curve_smooth_settings
+        curves = getattr(context, "selected_editable_fcurves", [])
+        if not curves:
+            self.report({'WARNING'}, "No editable F-Curves selected")
+            return {'CANCELLED'}
+
+        count = 0
+        for fcurve in curves:
+            try:
+                mod = fcurve.modifiers.new(type='NOISE')
+                mod.scale = settings.noise_scale
+                mod.strength = settings.noise_strength
+                mod.phase = settings.noise_phase
+                count += 1
+            except Exception:
+                continue
+
+        self.report({'INFO'}, f"Added Noise modifier to {count} F-Curve(s)")
+        return {'FINISHED'}
+
+
+class GRAPH_OT_remove_noise_modifiers(bpy.types.Operator):
+    """Remove all Noise F-Modifiers from selected F-Curves"""
+    bl_idname = "graph.smart_remove_noise"
+    bl_label = "Remove Noise Modifiers"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        curves = getattr(context, "selected_editable_fcurves", [])
+        if not curves:
+            self.report({'WARNING'}, "No editable F-Curves selected")
+            return {'CANCELLED'}
+
+        count = 0
+        for fcurve in curves:
+            for mod in list(fcurve.modifiers):
+                if mod.type == 'NOISE':
+                    fcurve.modifiers.remove(mod)
+                    count += 1
+
+        self.report({'INFO'}, f"Removed {count} Noise modifier(s)")
+        return {'FINISHED'}
+
+
+class GRAPH_OT_bake_jitter(bpy.types.Operator):
+    """Randomly jitter the values of selected keyframes (baked directly, not a modifier)"""
+    bl_idname = "graph.smart_bake_jitter"
+    bl_label = "Bake Jitter to Keyframes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.curve_smooth_settings
+        curves = getattr(context, "selected_editable_fcurves", [])
+        if not curves:
+            self.report({'WARNING'}, "No editable F-Curves selected")
+            return {'CANCELLED'}
+
+        rng = random.Random(settings.jitter_seed)
+        count = 0
+        for fcurve in curves:
+            for kp in fcurve.keyframe_points:
+                if kp.select_control_point:
+                    offset = rng.uniform(-settings.jitter_amount, settings.jitter_amount)
+                    kp.co[1] += offset
+                    count += 1
+            fcurve.update()
+
+        if count == 0:
+            self.report({'WARNING'}, "No selected keyframes found")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Jittered {count} keyframe(s)")
+        return {'FINISHED'}
+
+
+class SMARTCURVETOOLS_PT_panel(bpy.types.Panel):
+    bl_label = "Smart Curve Tools"
+    bl_space_type = 'GRAPH_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "Smart Curve Tools"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.curve_smooth_settings
+
+        box = layout.box()
+        box.label(text="Smart Euler Filter", icon='CON_ROTLIKE')
+        box.operator("graph.smart_euler_filter", icon='CON_ROTLIKE')
+
+        box = layout.box()
+        box.label(text="Smoothing", icon='MOD_SMOOTH')
+        box.prop(settings, "smoothing_method")
+        box.prop(settings, "iterations")
+        if settings.smoothing_method == 'WEIGHTED':
+            box.prop(settings, "strength")
+            box.prop(settings, "sensitivity")
+        else:
+            box.prop(settings, "ma_window")
+            if settings.smoothing_method == 'GAUSSIAN':
+                box.prop(settings, "gaussian_sigma")
+        box.prop(settings, "preserve_ends")
+        box.operator("graph.smooth_selected_keyframes", text="Smooth Selected Keyframes")
+        box.operator("graph.smooth_all_keyframes", text="Batch Smooth All F-Curves")
+        box.operator("graph.reset_curve_smooth_values", text="Reset Smooth Values")
+
+        box = layout.box()
+        box.label(text="Cleanup", icon='TRASH')
+        box.prop(settings, "decimate_error")
+        box.operator("graph.smart_decimate_keyframes", text="Decimate / Simplify Keyframes")
+
+        box = layout.box()
+        box.label(text="Easing Presets", icon='IPO_BEZIER')
+        box.prop(settings, "ease_interpolation")
+        if settings.ease_interpolation not in {'LINEAR', 'CONSTANT'}:
+            box.prop(settings, "ease_mode")
+        box.operator("graph.apply_ease_preset", text="Apply to Selected Keyframes")
+
+        box = layout.box()
+        box.label(text="Noise & Jitter", icon='FORCE_TURBULENCE')
+        box.prop(settings, "noise_scale")
+        box.prop(settings, "noise_strength")
+        box.prop(settings, "noise_phase")
+        row = box.row(align=True)
+        row.operator("graph.smart_add_noise", text="Add Noise Modifier")
+        row.operator("graph.smart_remove_noise", text="Remove")
+        box.separator()
+        box.prop(settings, "jitter_amount")
+        box.prop(settings, "jitter_seed")
+        box.operator("graph.smart_bake_jitter", text="Bake Jitter to Keyframes")
+
+# ----- Register and Unregister -----
+
+classes = [
+    ROTATION_OT_smart_euler_filter,
+    CurveSmoothProperties,
+    CurveSmoothOperator,
+    CurveSmoothAllOperator,
+    ResetCurveSmoothValuesOperator,
+    GRAPH_OT_decimate_keyframes,
+    GRAPH_OT_apply_ease_preset,
+    GRAPH_OT_add_noise_modifier,
+    GRAPH_OT_remove_noise_modifiers,
+    GRAPH_OT_bake_jitter,
+    SMARTCURVETOOLS_PT_panel,
+]
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.curve_smooth_settings = bpy.props.PointerProperty(type=CurveSmoothProperties)
+
+def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+    try:
+        del bpy.types.Scene.curve_smooth_settings
+    except:
+        pass
+
+if __name__ == "__main__":
+    register()
