@@ -1,7 +1,8 @@
+
 bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
-    "version": (3, 0, 0),
+    "version": (4, 0, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-panel) > Overlapper",
     "description": "Automatic overlapping / follow-through secondary animation for a chain of "
@@ -11,7 +12,6 @@ bl_info = {
 
 import bpy
 import math
-import random
 from mathutils import Vector, Euler, Quaternion
 
 # ---------------------------------------------------------------------------
@@ -55,7 +55,7 @@ def ensure_action(id_obj):
 # ---------------------------------------------------------------------------
 
 def get_frame_range(context):
-    """Uses the Blender preview range (i.e. the currently selected timeline
+    """Uses the Blender preview range (i.e. the currently isolated timeline
     range) if enabled, otherwise the full scene range."""
     scene = context.scene
     if scene.use_preview_range:
@@ -93,8 +93,7 @@ def create_empty(name, collection, size=0.15):
 # ---------------------------------------------------------------------------
 # ChainItem - a small abstraction over "an animated Object" vs "a pose bone
 # inside an Armature", so the rest of the algorithm doesn't need to care
-# which one it's dealing with. This is what lets Overlapper work on real
-# rigs (FK chains, Advanced Skeleton, etc.) and not just loose objects.
+# which one it's dealing with.
 # ---------------------------------------------------------------------------
 
 class ChainItem:
@@ -102,7 +101,7 @@ class ChainItem:
 
     def __init__(self, kind, id_obj, bone_name=None):
         self.kind = kind          # 'OBJECT' or 'BONE'
-        self.id_obj = id_obj      # the animated datablock (Object, always - the Armature for bones)
+        self.id_obj = id_obj      # the animated datablock (Object - the Armature, for bones)
         self.bone_name = bone_name
 
     @property
@@ -114,6 +113,12 @@ class ChainItem:
     @property
     def pose_bone(self):
         return self.id_obj.pose.bones[self.bone_name]
+
+    @property
+    def bone_data(self):
+        """The underlying edit/rest Bone datablock - this is what actually
+        carries hierarchy info (.parent / .children); PoseBone does not."""
+        return self.id_obj.data.bones[self.bone_name]
 
     def world_matrix(self):
         if self.kind == 'BONE':
@@ -144,10 +149,29 @@ class ChainItem:
         target = self.pose_bone if self.kind == 'BONE' else self.id_obj
         return target.location.copy()
 
+    def hierarchy_depth(self):
+        """Number of ancestors above this item. Used to auto-order a chain
+        root-to-tip regardless of the (unreliable) order Blender reports
+        selection in."""
+        depth = 0
+        if self.kind == 'BONE':
+            b = self.bone_data.parent
+            while b is not None:
+                depth += 1
+                b = b.parent
+        else:
+            obj = self.id_obj.parent
+            while obj is not None:
+                depth += 1
+                obj = obj.parent
+        return depth
+
 
 def get_selected_chain(context):
-    """Returns an ordered list of ChainItems for either the selected pose
-    bones (when in Pose Mode) or the selected objects (Object Mode)."""
+    """Returns a list of ChainItems for either the selected pose bones
+    (Pose Mode) or the selected objects (Object Mode). Order is NOT
+    meaningful yet - Blender does not reliably report selection in click
+    order, so the caller always re-sorts by hierarchy depth afterwards."""
     if context.mode == 'POSE' and context.selected_pose_bones:
         armature_obj = context.object
         return [ChainItem('BONE', armature_obj, b.name) for b in context.selected_pose_bones]
@@ -156,21 +180,23 @@ def get_selected_chain(context):
 
 def expand_hierarchy(chain):
     """Depth-first expansion: each chain item followed by its descendants
-    (child objects, or child bones), so a whole FK/Advanced-Skeleton chain
-    can be grabbed by selecting just its root control."""
+    (child objects, or - correctly, via the Bone datablock - child bones),
+    so a whole FK / Advanced-Skeleton chain can be grabbed by selecting
+    just its root control."""
     seen = set()
     result = []
 
     def walk_object(obj):
-        key = obj.name
-        if key in seen:
+        if obj.name in seen:
             return
-        seen.add(key)
+        seen.add(obj.name)
         result.append(ChainItem('OBJECT', obj))
         for child in sorted(obj.children, key=lambda c: c.name):
             walk_object(child)
 
     def walk_bone(armature_obj, bone):
+        # bone is a bpy.types.Bone (armature.data.bones[...]), NOT a PoseBone -
+        # PoseBone has no .children, only Bone does.
         key = (armature_obj.name, bone.name)
         if key in seen:
             return
@@ -181,11 +207,18 @@ def expand_hierarchy(chain):
 
     for item in chain:
         if item.kind == 'BONE':
-            walk_bone(item.id_obj, item.pose_bone)
+            walk_bone(item.id_obj, item.bone_data)
         else:
             walk_object(item.id_obj)
 
     return result
+
+
+def order_chain(chain):
+    """Sort root-to-tip by hierarchy depth so the overlap delay always
+    progresses correctly down the chain, no matter what order the controls
+    were selected/clicked in (Blender does not preserve that reliably)."""
+    return sorted(chain, key=lambda item: item.hierarchy_depth())
 
 
 # ---------------------------------------------------------------------------
@@ -234,13 +267,15 @@ def evaluate_curves(loc_fcurves, rot_fcurves, frame, frame_start, frame_end, cyc
     return loc, quat
 
 
-def apply_wind(delta_rot, index, frame, speed, scale, base_amp, seed):
+def wind_offset(frame, speed, seed):
+    """Two independent, out-of-phase noise-ish oscillators (in -1..1) used
+    to drive wind on Y/Z. Deterministic per-object via seed, so different
+    controls sway differently instead of moving as one rigid slab."""
     phase = (seed * 12.9898) % (2 * math.pi)
-    t = frame * 0.15 * max(speed, 0.001) + phase
-    amp = base_amp * scale
-    delta_rot.y += math.sin(t) * amp
-    delta_rot.z += math.cos(t * 0.87 + 1.3) * amp
-    return delta_rot
+    t = frame * 0.15 * max(speed, 0.0001) + phase
+    y = math.sin(t) + 0.5 * math.sin(t * 2.13 + 1.0)
+    z = math.cos(t * 0.87 + 1.3) + 0.5 * math.cos(t * 1.9 + 0.4)
+    return y, z
 
 
 def simplify_fcurves(fcurves, tolerance=0.0001):
@@ -299,6 +334,8 @@ def run_overlapper(context, props):
     if props.hierarchy_mode:
         chain = expand_hierarchy(chain)
 
+    chain = order_chain(chain)
+
     if len(chain) < 2:
         return False, "Select at least two controls (objects, or pose bones in Pose Mode)."
 
@@ -318,33 +355,26 @@ def run_overlapper(context, props):
     helper_coll = get_or_create_collection(HELPER_COLLECTION_NAME)
 
     # --- Step 1: build follower empties + their (empty) fcurves up front ---
-    followers = []          # ChainItem-aligned list of empty objects (for Debug mode visibility)
     follower_curves = []    # ChainItem-aligned list of (loc_fcurves, rot_fcurves)
     for i, item in enumerate(chain):
         empty = create_empty(f"{HELPER_PREFIX}{i:02d}_{item.name}", helper_coll)
         action = ensure_action(empty)
         loc_fcs = [get_fcurve(empty, action, "location", c) for c in range(3)]
         rot_fcs = [get_fcurve(empty, action, "rotation_quaternion", c) for c in range(4)]
-        followers.append(empty)
         follower_curves.append((loc_fcs, rot_fcs))
 
     # --- Step 2: single pass over the frame range - sample world transforms
     #     into the followers AND (if needed) capture each control's own
-    #     current local rotation/location BEFORE anything gets modified.
-    #     Doing this in one frame-major pass keeps cost to one frame_set
-    #     per frame (not per control) and guarantees the baseline can never
-    #     be contaminated by writes happening later in the process. ---
+    #     current local rotation/location BEFORE anything gets modified. ---
     need_baseline = not props.bake_new_layer
     baseline_rot = {i: [] for i in range(start_index, len(chain))} if need_baseline else None
     baseline_loc = {i: [] for i in range(start_index, len(chain))} if (need_baseline and props.add_translate) else None
 
-    spacing_samples = None
+    spacing_samples = []
 
     for f in range(frame_start, frame_end + 1):
         scene.frame_set(f)
         prev_loc = None
-        spacing_total = 0.0
-        spacing_count = 0
         for i, item in enumerate(chain):
             mat = item.world_matrix()
             loc, quat, _scale = mat.decompose()
@@ -355,17 +385,13 @@ def run_overlapper(context, props):
                 rot_fcs[c].keyframe_points.insert(f, quat[c], options={'FAST'})
 
             if prev_loc is not None:
-                spacing_total += (loc - prev_loc).length
-                spacing_count += 1
+                spacing_samples.append((loc - prev_loc).length)
             prev_loc = loc
 
             if need_baseline and i >= start_index:
                 baseline_rot[i].append(item.read_rotation_euler())
                 if baseline_loc is not None:
                     baseline_loc[i].append(item.read_location())
-
-        if f == frame_start and spacing_count > 0:
-            spacing_samples = spacing_total / spacing_count
 
     for loc_fcs, rot_fcs in follower_curves:
         for fc in loc_fcs + rot_fcs:
@@ -375,12 +401,19 @@ def run_overlapper(context, props):
 
     scene.frame_set(original_frame)
 
-    # --- Step 3: intensity / adaptive scale ---
-    intensity = props.scale if props.scale > 0.0001 else 0.0001
-    if props.adaptive_scale and spacing_samples and spacing_samples > 0.0001:
-        scale_factor = (spacing_samples / intensity) * 0.2
+    # --- Step 3: intensity / adaptive scale.
+    #     Fixed to always be MONOTONIC with the Scale slider (higher Scale
+    #     -> always more overlap, with or without Adaptive Scale on).
+    #     Adaptive Scale supplies a size-appropriate baseline multiplier
+    #     (average distance between controls) so a tiny character and a
+    #     giant one both get a sensible default without manual tweaking. ---
+    intensity = max(props.scale, 0.0001)
+    if props.adaptive_scale and spacing_samples:
+        avg_spacing = sum(spacing_samples) / len(spacing_samples)
+        size_baseline = max(avg_spacing, 0.0001) * 0.5
     else:
-        scale_factor = intensity
+        size_baseline = 1.0
+    scale_factor = intensity * size_baseline
 
     # --- Step 4: group chain entries by their animated datablock (an
     #     Armature can own many bones - they must share one action / one
@@ -395,12 +428,9 @@ def run_overlapper(context, props):
             order.append(key)
         groups[key].append((rank, i, item))
 
-    touched_objects = set()
-
     for key in order:
         entries = groups[key]
         id_obj = entries[0][2].id_obj
-        touched_objects.add(id_obj)
 
         if props.bake_new_layer:
             push_base_action_to_nla(id_obj, frame_start)
@@ -425,6 +455,13 @@ def run_overlapper(context, props):
                                for c in range(3)]
 
             seed = (i + 1) * 7.13
+            # Overshoot: a decaying oscillation layered on top of the drag
+            # delta so the chain can bounce past rest before settling,
+            # instead of just smoothly trailing. Purely a per-frame formula
+            # (no iterative simulation state), so it can't blow up/desync.
+            overshoot_amp = props.overshoot
+            overshoot_freq = 1.2
+            overshoot_damp = 0.12
 
             for f_index, f in enumerate(range(frame_start, frame_end + 1)):
                 own_loc, own_quat = evaluate_curves(*follower_curve, f, frame_start, frame_end, cyclic, cycle_len)
@@ -432,13 +469,20 @@ def run_overlapper(context, props):
 
                 rel_quat = own_quat.rotation_difference(lag_quat)
                 rel_euler = rel_quat.to_euler()
-                d_rot = Euler((rel_euler.x * scale_factor,
-                               rel_euler.y * scale_factor,
-                               rel_euler.z * scale_factor))
+
+                mult = scale_factor
+                if overshoot_amp > 0.0001 and delay > 0.0001:
+                    t = (f - frame_start) * 0.3
+                    osc = math.cos(t * overshoot_freq + delay) * math.exp(-abs(math.sin(t * 0.05)) * overshoot_damp * rank)
+                    mult = scale_factor * (1.0 + overshoot_amp * osc)
+
+                d_rot = Euler((rel_euler.x * mult, rel_euler.y * mult, rel_euler.z * mult))
 
                 if props.use_wind:
-                    d_rot = apply_wind(d_rot, i, f, props.wind_speed, props.wind_scale,
-                                        base_amp=0.05, seed=seed)
+                    wy, wz = wind_offset(f, props.wind_speed, seed)
+                    wind_amp = 0.12 * props.wind_scale * scale_factor
+                    d_rot.y += wy * wind_amp
+                    d_rot.z += wz * wind_amp
 
                 if additive_only:
                     final_rot_euler = d_rot
@@ -457,7 +501,12 @@ def run_overlapper(context, props):
                         rot_fcurves[c].keyframe_points.insert(f, final_rot_euler[c], options={'FAST'})
 
                 if loc_fcurves is not None:
-                    d_loc = (lag_loc - own_loc) * scale_factor
+                    d_loc = (lag_loc - own_loc) * mult
+                    if props.use_wind:
+                        wy, wz = wind_offset(f, props.wind_speed, seed + 3.7)
+                        wind_amp_loc = 0.02 * props.wind_scale * scale_factor
+                        d_loc.y += wy * wind_amp_loc
+                        d_loc.z += wz * wind_amp_loc
                     if additive_only:
                         final_loc = d_loc
                     else:
@@ -495,25 +544,34 @@ def run_overlapper(context, props):
 
 class OverlapperProperties(bpy.types.PropertyGroup):
     softness: bpy.props.FloatProperty(
-        name="Softness",
-        description="More animation velocity, less softness. Delay (in frames) added "
-                    "per control down the chain",
+        name="Drag / Softness",
+        description="Delay (in frames) each control down the chain lags behind the "
+                    "one before it. Higher = looser/lighter (fabric, hair). "
+                    "Lower = stiffer/heavier",
         default=3.0, min=0.0, soft_max=30.0,
     )
     scale: bpy.props.FloatProperty(
         name="Scale",
-        description="More Scale, more overlap amplitude",
+        description="Overlap amplitude. Higher = more overlap motion. Works whether "
+                    "Adaptive Scale is on or off",
         default=1.0, min=0.0001, soft_max=10.0,
     )
+    overshoot: bpy.props.FloatProperty(
+        name="Overshoot / Stiffness",
+        description="Adds a decaying bounce past the resting pose before it settles, "
+                    "instead of a smooth trail. 0 = no bounce",
+        default=0.0, min=0.0, soft_max=3.0,
+    )
     use_wind: bpy.props.BoolProperty(
-        name="Wind", description="Add wind animation on overlapped controls", default=False,
+        name="Wind", description="Add procedural wind sway, even on a stationary character",
+        default=False,
     )
     wind_scale: bpy.props.FloatProperty(
-        name="Scale", description="More Scale, more wind amplitude",
+        name="Scale", description="Wind amplitude",
         default=1.0, min=0.0, soft_max=10.0,
     )
     wind_speed: bpy.props.FloatProperty(
-        name="Speed", description="More Speed, more wind frequency",
+        name="Speed", description="Wind frequency",
         default=1.0, min=0.0001, soft_max=10.0,
     )
     show_options: bpy.props.BoolProperty(name="Options", default=True)
@@ -521,25 +579,26 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     dont_use_first: bpy.props.BoolProperty(
         name="Don't use first controls",
-        description="Don't use the first control in the selected sequence of controls",
+        description="Don't use the first (root) control in the selected chain",
         default=False,
     )
     add_translate: bpy.props.BoolProperty(
         name="Add translate",
-        description="Also create overlapping translation, not just rotation",
+        description="Also create overlapping translation, not just rotation "
+                    "(good for chest, hips, belt items, loose flesh)",
         default=False,
     )
     hierarchy_mode: bpy.props.BoolProperty(
         name="Hierarchy",
         description="Automatically add every child object / child bone below each "
-                    "selected control (works with plain FK chains and rigs such as "
-                    "Advanced Skeleton)",
+                    "selected control - select just the root of an FK chain (works "
+                    "with plain FK chains and rigs such as Advanced Skeleton)",
         default=False,
     )
     cycle_mode: bpy.props.BoolProperty(
         name="Cycle",
         description="Create a seamless overlapping action for cycle animation. The "
-                    "first and last frame of the range must already match",
+                    "first and last frame of the selected range must already match",
         default=False,
     )
 
@@ -556,8 +615,9 @@ class OverlapperProperties(bpy.types.PropertyGroup):
     )
     adaptive_scale: bpy.props.BoolProperty(
         name="Adaptive scale",
-        description="Automatically find a good overlap scale based on the distance "
-                    "between selected controls",
+        description="Automatically find a sensible overlap scale based on the "
+                    "distance between selected controls, so tiny or huge rigs "
+                    "don't need the Scale slider re-tuned by hand",
         default=True,
     )
     create_selection_set: bpy.props.BoolProperty(
@@ -639,6 +699,7 @@ class OVERLAPPER_PT_panel(bpy.types.Panel):
         col = layout.column(align=True)
         col.prop(props, "softness")
         col.prop(props, "scale")
+        col.prop(props, "overshoot")
 
         box = layout.box()
         box.prop(props, "use_wind")
