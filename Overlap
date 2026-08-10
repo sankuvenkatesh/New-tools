@@ -1,12 +1,12 @@
-
 bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
-    "version": (4, 0, 0),
+    "version": (5, 0, 0),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-panel) > Overlapper",
     "description": "Automatic overlapping / follow-through secondary animation for a chain of "
-                   "selected objects or bones.",
+                   "selected objects or bones - aim-based lag rig, ported from the original "
+                   "Maya MEL tool's algorithm.",
     "category": "Animation",
 }
 
@@ -24,12 +24,7 @@ RESULT_COLLECTION_NAME = "OverlapperSet"
 
 
 # ---------------------------------------------------------------------------
-# Version-safe Action / F-Curve access
-#
-# Blender 5.0 removed the legacy Action.fcurves accessor (replaced by the
-# slotted-action / channelbag system introduced in 4.4). This helper uses
-# the modern API and transparently falls back to the legacy one on older
-# Blender versions, so the same code path works everywhere.
+# Version-safe Action / F-Curve access (Blender 5.0 removed Action.fcurves)
 # ---------------------------------------------------------------------------
 
 def get_fcurve(id_obj, action, data_path, index):
@@ -55,8 +50,6 @@ def ensure_action(id_obj):
 # ---------------------------------------------------------------------------
 
 def get_frame_range(context):
-    """Uses the Blender preview range (i.e. the currently isolated timeline
-    range) if enabled, otherwise the full scene range."""
     scene = context.scene
     if scene.use_preview_range:
         return scene.frame_preview_start, scene.frame_preview_end
@@ -91,17 +84,15 @@ def create_empty(name, collection, size=0.15):
 
 
 # ---------------------------------------------------------------------------
-# ChainItem - a small abstraction over "an animated Object" vs "a pose bone
-# inside an Armature", so the rest of the algorithm doesn't need to care
-# which one it's dealing with.
+# ChainItem
 # ---------------------------------------------------------------------------
 
 class ChainItem:
     __slots__ = ("kind", "id_obj", "bone_name")
 
     def __init__(self, kind, id_obj, bone_name=None):
-        self.kind = kind          # 'OBJECT' or 'BONE'
-        self.id_obj = id_obj      # the animated datablock (Object - the Armature, for bones)
+        self.kind = kind
+        self.id_obj = id_obj
         self.bone_name = bone_name
 
     @property
@@ -116,8 +107,6 @@ class ChainItem:
 
     @property
     def bone_data(self):
-        """The underlying edit/rest Bone datablock - this is what actually
-        carries hierarchy info (.parent / .children); PoseBone does not."""
         return self.id_obj.data.bones[self.bone_name]
 
     def world_matrix(self):
@@ -150,9 +139,6 @@ class ChainItem:
         return target.location.copy()
 
     def hierarchy_depth(self):
-        """Number of ancestors above this item. Used to auto-order a chain
-        root-to-tip regardless of the (unreliable) order Blender reports
-        selection in."""
         depth = 0
         if self.kind == 'BONE':
             b = self.bone_data.parent
@@ -168,10 +154,6 @@ class ChainItem:
 
 
 def get_selected_chain(context):
-    """Returns a list of ChainItems for either the selected pose bones
-    (Pose Mode) or the selected objects (Object Mode). Order is NOT
-    meaningful yet - Blender does not reliably report selection in click
-    order, so the caller always re-sorts by hierarchy depth afterwards."""
     if context.mode == 'POSE' and context.selected_pose_bones:
         armature_obj = context.object
         return [ChainItem('BONE', armature_obj, b.name) for b in context.selected_pose_bones]
@@ -179,10 +161,6 @@ def get_selected_chain(context):
 
 
 def expand_hierarchy(chain):
-    """Depth-first expansion: each chain item followed by its descendants
-    (child objects, or - correctly, via the Bone datablock - child bones),
-    so a whole FK / Advanced-Skeleton chain can be grabbed by selecting
-    just its root control."""
     seen = set()
     result = []
 
@@ -195,8 +173,6 @@ def expand_hierarchy(chain):
             walk_object(child)
 
     def walk_bone(armature_obj, bone):
-        # bone is a bpy.types.Bone (armature.data.bones[...]), NOT a PoseBone -
-        # PoseBone has no .children, only Bone does.
         key = (armature_obj.name, bone.name)
         if key in seen:
             return
@@ -215,14 +191,14 @@ def expand_hierarchy(chain):
 
 
 def order_chain(chain):
-    """Sort root-to-tip by hierarchy depth so the overlap delay always
-    progresses correctly down the chain, no matter what order the controls
-    were selected/clicked in (Blender does not preserve that reliably)."""
+    """Sort root-to-tip by hierarchy depth - Blender does not preserve click
+    order for multi-selection, so this is the only reliable way to know
+    which end of the chain is the root."""
     return sorted(chain, key=lambda item: item.hierarchy_depth())
 
 
 # ---------------------------------------------------------------------------
-# Non-destructive "anim layer" support via NLA (Add-blended track)
+# NLA anim-layer support
 # ---------------------------------------------------------------------------
 
 def push_base_action_to_nla(id_obj, frame_start):
@@ -247,8 +223,7 @@ def add_overlap_nla_layer(id_obj, action, frame_start):
 
 
 # ---------------------------------------------------------------------------
-# Curve evaluation (pure math - no scene.frame_set needed, so it can't drift
-# or desync no matter how fast the underlying animation moves)
+# Curve evaluation - pure math, no scene.frame_set, can't drift
 # ---------------------------------------------------------------------------
 
 def evaluate_curves(loc_fcurves, rot_fcurves, frame, frame_start, frame_end, cyclic, cycle_len):
@@ -264,13 +239,14 @@ def evaluate_curves(loc_fcurves, rot_fcurves, frame, frame_start, frame_end, cyc
                         rot_fcurves[1].evaluate(frame),
                         rot_fcurves[2].evaluate(frame),
                         rot_fcurves[3].evaluate(frame)))
+    if quat.magnitude > 1e-8:
+        quat.normalize()
+    else:
+        quat = Quaternion((1, 0, 0, 0))
     return loc, quat
 
 
 def wind_offset(frame, speed, seed):
-    """Two independent, out-of-phase noise-ish oscillators (in -1..1) used
-    to drive wind on Y/Z. Deterministic per-object via seed, so different
-    controls sway differently instead of moving as one rigid slab."""
     phase = (seed * 12.9898) % (2 * math.pi)
     t = frame * 0.15 * max(speed, 0.0001) + phase
     y = math.sin(t) + 0.5 * math.sin(t * 2.13 + 1.0)
@@ -294,8 +270,6 @@ def simplify_fcurves(fcurves, tolerance=0.0001):
 
 
 def add_to_selection_set(chain):
-    """Object mode -> a regular Collection. Bones -> a Bone Collection on
-    each Armature's data (the bone-group equivalent since Blender 4.0)."""
     object_items = [it for it in chain if it.kind == 'OBJECT']
     bone_items = [it for it in chain if it.kind == 'BONE']
 
@@ -320,11 +294,30 @@ def add_to_selection_set(chain):
                     if bone is not None:
                         bcoll.assign(bone)
             except AttributeError:
-                pass  # Bone Collections API unavailable (older Blender) - skip quietly
+                pass
 
 
 # ---------------------------------------------------------------------------
-# Core algorithm
+# Core algorithm - aim-based lag, ported from the Maya MEL source:
+#
+#   1. A clean "joint" (follower) is baked for every control - an exact,
+#      unmodified copy of its world-space motion.
+#   2. Each follower grows a "whisker": a point offset from it, in the
+#      follower's OWN local frame, along the direction of the next control
+#      in the chain (measured once, at the first frame - like Maya's joint
+#      orient). The whisker rotates rigidly with the follower.
+#   3. The whisker's position is sampled at a DELAYED frame (same delay for
+#      every link - see note below) - that's the aim target.
+#   4. The control's extra rotation = the swing needed to aim its whisker
+#      at that delayed target instead of its current one.
+#   5. Wind nudges the delayed target sideways before step 4, so it comes
+#      out through the same aim math as real motion instead of being
+#      tacked onto the rotation channel directly.
+#
+#   Delay is the SAME value at every link (matching the MEL source) rather
+#   than growing per link - a properly parented FK/bone chain compounds it
+#   naturally (child inherits the parent's lag, then adds its own), which
+#   is what actually produces "tip lags more than the root".
 # ---------------------------------------------------------------------------
 
 def run_overlapper(context, props):
@@ -354,8 +347,8 @@ def run_overlapper(context, props):
     original_frame = scene.frame_current
     helper_coll = get_or_create_collection(HELPER_COLLECTION_NAME)
 
-    # --- Step 1: build follower empties + their (empty) fcurves up front ---
-    follower_curves = []    # ChainItem-aligned list of (loc_fcurves, rot_fcurves)
+    # --- Step 1: follower empties + fcurves ---
+    follower_curves = []
     for i, item in enumerate(chain):
         empty = create_empty(f"{HELPER_PREFIX}{i:02d}_{item.name}", helper_coll)
         action = ensure_action(empty)
@@ -363,9 +356,9 @@ def run_overlapper(context, props):
         rot_fcs = [get_fcurve(empty, action, "rotation_quaternion", c) for c in range(4)]
         follower_curves.append((loc_fcs, rot_fcs))
 
-    # --- Step 2: single pass over the frame range - sample world transforms
-    #     into the followers AND (if needed) capture each control's own
-    #     current local rotation/location BEFORE anything gets modified. ---
+    # --- Step 2: single frame-major pass - bake followers AND capture each
+    #     control's own baseline local rotation/location before anything
+    #     gets modified. ---
     need_baseline = not props.bake_new_layer
     baseline_rot = {i: [] for i in range(start_index, len(chain))} if need_baseline else None
     baseline_loc = {i: [] for i in range(start_index, len(chain))} if (need_baseline and props.add_translate) else None
@@ -401,36 +394,56 @@ def run_overlapper(context, props):
 
     scene.frame_set(original_frame)
 
-    # --- Step 3: intensity / adaptive scale.
-    #     Fixed to always be MONOTONIC with the Scale slider (higher Scale
-    #     -> always more overlap, with or without Adaptive Scale on).
-    #     Adaptive Scale supplies a size-appropriate baseline multiplier
-    #     (average distance between controls) so a tiny character and a
-    #     giant one both get a sensible default without manual tweaking. ---
+    # --- Step 3: bind-pose "whisker" direction for every link, in each
+    #     follower's OWN local space, so it rotates rigidly with it later
+    #     (this is what Maya's joint-orient step accomplishes). ---
+    bind_pos, bind_quat = [], []
+    for i in range(len(chain)):
+        p, q = evaluate_curves(*follower_curves[i], frame_start, frame_start, frame_end, False, 0)
+        bind_pos.append(p)
+        bind_quat.append(q)
+
+    bind_local_dir = []
+    for i in range(len(chain)):
+        if i < len(chain) - 1:
+            world_dir = bind_pos[i + 1] - bind_pos[i]
+        elif i > 0:
+            world_dir = bind_pos[i] - bind_pos[i - 1]
+        else:
+            world_dir = Vector((1.0, 0.0, 0.0))
+        if world_dir.length < 1e-6:
+            world_dir = Vector((1.0, 0.0, 0.0))
+        world_dir.normalize()
+        bind_local_dir.append((bind_quat[i].inverted() @ world_dir).normalized())
+
+    # --- Step 4: whisker length. Bigger Scale -> shorter whisker -> the
+    #     same positional lag swings through a BIGGER angle -> more
+    #     overlap. (This is the actual relationship in the source tool,
+    #     even though it looks backwards at a glance.) ---
     intensity = max(props.scale, 0.0001)
     if props.adaptive_scale and spacing_samples:
         avg_spacing = sum(spacing_samples) / len(spacing_samples)
-        size_baseline = max(avg_spacing, 0.0001) * 0.5
     else:
-        size_baseline = 1.0
-    scale_factor = intensity * size_baseline
+        avg_spacing = 1.0
+    whisker_length = max(avg_spacing, 0.0001) / intensity
 
-    # --- Step 4: group chain entries by their animated datablock (an
-    #     Armature can own many bones - they must share one action / one
-    #     pair of NLA layers, not one each). ---
+    delay = max(props.softness, 0.0)  # same delay at every link - see module docstring
+
+    # --- Step 5: group by animated datablock (bones on one Armature share
+    #     an action / NLA layers) ---
     groups = {}
     order = []
-    for rank, i in enumerate(range(start_index, len(chain))):
+    for i in range(start_index, len(chain)):
         item = chain[i]
         key = item.id_obj.name
         if key not in groups:
             groups[key] = []
             order.append(key)
-        groups[key].append((rank, i, item))
+        groups[key].append(i)
 
     for key in order:
         entries = groups[key]
-        id_obj = entries[0][2].id_obj
+        id_obj = chain[entries[0]].id_obj
 
         if props.bake_new_layer:
             push_base_action_to_nla(id_obj, frame_start)
@@ -441,12 +454,13 @@ def run_overlapper(context, props):
             target_action = ensure_action(id_obj)
             additive_only = False
 
-        for rank, i, item in entries:
+        for i in entries:
+            item = chain[i]
             follower_curve = follower_curves[i]
-            delay = props.softness * rank
+            local_dir = bind_local_dir[i]
+
             rot_prop = "rotation_quaternion" if item.rotation_mode() == 'QUATERNION' else "rotation_euler"
             rot_channels = 4 if rot_prop == "rotation_quaternion" else 3
-
             rot_fcurves = [get_fcurve(id_obj, target_action, item.data_path(rot_prop), c)
                            for c in range(rot_channels)]
             loc_fcurves = None
@@ -455,34 +469,31 @@ def run_overlapper(context, props):
                                for c in range(3)]
 
             seed = (i + 1) * 7.13
-            # Overshoot: a decaying oscillation layered on top of the drag
-            # delta so the chain can bounce past rest before settling,
-            # instead of just smoothly trailing. Purely a per-frame formula
-            # (no iterative simulation state), so it can't blow up/desync.
-            overshoot_amp = props.overshoot
-            overshoot_freq = 1.2
-            overshoot_damp = 0.12
 
             for f_index, f in enumerate(range(frame_start, frame_end + 1)):
-                own_loc, own_quat = evaluate_curves(*follower_curve, f, frame_start, frame_end, cyclic, cycle_len)
-                lag_loc, lag_quat = evaluate_curves(*follower_curve, f - delay, frame_start, frame_end, cyclic, cycle_len)
+                own_pos, own_quat = evaluate_curves(*follower_curve, f, frame_start, frame_end, cyclic, cycle_len)
+                d_pos, d_quat = evaluate_curves(*follower_curve, f - delay, frame_start, frame_end, cyclic, cycle_len)
 
-                rel_quat = own_quat.rotation_difference(lag_quat)
-                rel_euler = rel_quat.to_euler()
-
-                mult = scale_factor
-                if overshoot_amp > 0.0001 and delay > 0.0001:
-                    t = (f - frame_start) * 0.3
-                    osc = math.cos(t * overshoot_freq + delay) * math.exp(-abs(math.sin(t * 0.05)) * overshoot_damp * rank)
-                    mult = scale_factor * (1.0 + overshoot_amp * osc)
-
-                d_rot = Euler((rel_euler.x * mult, rel_euler.y * mult, rel_euler.z * mult))
+                aim_now = (own_quat @ local_dir).normalized()
+                whisker_delayed_dir = (d_quat @ local_dir).normalized()
+                delayed_target = d_pos + whisker_delayed_dir * whisker_length
 
                 if props.use_wind:
+                    up1 = (d_quat @ Vector((0.0, 1.0, 0.0))).normalized()
+                    up2 = (d_quat @ Vector((0.0, 0.0, 1.0))).normalized()
                     wy, wz = wind_offset(f, props.wind_speed, seed)
-                    wind_amp = 0.12 * props.wind_scale * scale_factor
-                    d_rot.y += wy * wind_amp
-                    d_rot.z += wz * wind_amp
+                    wind_amp = 0.07 * whisker_length * props.wind_scale
+                    delayed_target = delayed_target + up1 * (wy * wind_amp) + up2 * (wz * wind_amp)
+
+                aim_dir = delayed_target - own_pos
+                if aim_dir.length < 1e-6:
+                    aim_dir = aim_now.copy()
+                else:
+                    aim_dir.normalize()
+
+                swing = aim_now.rotation_difference(aim_dir)
+                delta_local = own_quat.inverted() @ swing @ own_quat
+                d_rot = delta_local.to_euler()
 
                 if additive_only:
                     final_rot_euler = d_rot
@@ -501,12 +512,7 @@ def run_overlapper(context, props):
                         rot_fcurves[c].keyframe_points.insert(f, final_rot_euler[c], options={'FAST'})
 
                 if loc_fcurves is not None:
-                    d_loc = (lag_loc - own_loc) * mult
-                    if props.use_wind:
-                        wy, wz = wind_offset(f, props.wind_speed, seed + 3.7)
-                        wind_amp_loc = 0.02 * props.wind_scale * scale_factor
-                        d_loc.y += wy * wind_amp_loc
-                        d_loc.z += wz * wind_amp_loc
+                    d_loc = d_pos - own_pos  # raw positional lag, unscaled
                     if additive_only:
                         final_loc = d_loc
                     else:
@@ -526,11 +532,9 @@ def run_overlapper(context, props):
         if props.bake_new_layer:
             add_overlap_nla_layer(id_obj, target_action, frame_start)
 
-    # --- Step 5: selection set ---
     if props.create_selection_set:
         add_to_selection_set(chain[start_index:])
 
-    # --- Step 6: cleanup helper empties unless Debug mode is on ---
     if not props.debug_mode:
         remove_collection(HELPER_COLLECTION_NAME)
 
@@ -544,35 +548,27 @@ def run_overlapper(context, props):
 
 class OverlapperProperties(bpy.types.PropertyGroup):
     softness: bpy.props.FloatProperty(
-        name="Drag / Softness",
-        description="Delay (in frames) each control down the chain lags behind the "
-                    "one before it. Higher = looser/lighter (fabric, hair). "
-                    "Lower = stiffer/heavier",
+        name="Softness",
+        description="Delay, in frames, applied at every link. A parented FK/bone chain "
+                    "compounds this naturally down the hierarchy, so the tip ends up "
+                    "lagging more than the root even though this value is the same "
+                    "everywhere. Higher = looser/lighter, lower = stiffer/heavier",
         default=3.0, min=0.0, soft_max=30.0,
     )
     scale: bpy.props.FloatProperty(
         name="Scale",
-        description="Overlap amplitude. Higher = more overlap motion. Works whether "
-                    "Adaptive Scale is on or off",
+        description="Overlap amplitude. Higher = more overlap motion",
         default=1.0, min=0.0001, soft_max=10.0,
-    )
-    overshoot: bpy.props.FloatProperty(
-        name="Overshoot / Stiffness",
-        description="Adds a decaying bounce past the resting pose before it settles, "
-                    "instead of a smooth trail. 0 = no bounce",
-        default=0.0, min=0.0, soft_max=3.0,
     )
     use_wind: bpy.props.BoolProperty(
         name="Wind", description="Add procedural wind sway, even on a stationary character",
         default=False,
     )
     wind_scale: bpy.props.FloatProperty(
-        name="Scale", description="Wind amplitude",
-        default=1.0, min=0.0, soft_max=10.0,
+        name="Scale", description="Wind amplitude", default=1.0, min=0.0, soft_max=10.0,
     )
     wind_speed: bpy.props.FloatProperty(
-        name="Speed", description="Wind frequency",
-        default=1.0, min=0.0001, soft_max=10.0,
+        name="Speed", description="Wind frequency", default=1.0, min=0.0001, soft_max=10.0,
     )
     show_options: bpy.props.BoolProperty(name="Options", default=True)
     show_advanced: bpy.props.BoolProperty(name="Advanced", default=False)
@@ -615,9 +611,9 @@ class OverlapperProperties(bpy.types.PropertyGroup):
     )
     adaptive_scale: bpy.props.BoolProperty(
         name="Adaptive scale",
-        description="Automatically find a sensible overlap scale based on the "
-                    "distance between selected controls, so tiny or huge rigs "
-                    "don't need the Scale slider re-tuned by hand",
+        description="Base the overlap on the distance between selected controls, so "
+                    "tiny or huge rigs don't need the Scale slider re-tuned by hand. "
+                    "When off, a fixed 1-unit baseline is used instead",
         default=True,
     )
     create_selection_set: bpy.props.BoolProperty(
@@ -699,7 +695,6 @@ class OVERLAPPER_PT_panel(bpy.types.Panel):
         col = layout.column(align=True)
         col.prop(props, "softness")
         col.prop(props, "scale")
-        col.prop(props, "overshoot")
 
         box = layout.box()
         box.prop(props, "use_wind")
