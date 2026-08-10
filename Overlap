@@ -1,0 +1,613 @@
+bl_info = {
+    "name": "Overlapper",
+    "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
+    "version": (2, 0, 0),
+    "blender": (3, 6, 0),
+    "location": "View3D > Sidebar (N-panel) > Overlapper",
+    "description": "Automatic overlapping / follow-through secondary animation for a chain of "
+                   "selected objects or bones (Blender port of the Maya 'Overlapper' tool).",
+    "category": "Animation",
+}
+
+import bpy
+import math
+import random
+from mathutils import Vector, Euler, Quaternion
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+HELPER_COLLECTION_NAME = "Overlapper_Helpers"
+HELPER_PREFIX = "OVL_"
+RESULT_COLLECTION_NAME = "OverlapperSet"
+
+
+# ---------------------------------------------------------------------------
+# Small utilities
+# ---------------------------------------------------------------------------
+
+def get_frame_range(context):
+    """Mirrors Maya's use of the playback slider range: uses the Blender
+    preview range if enabled, otherwise the full scene range."""
+    scene = context.scene
+    if scene.use_preview_range:
+        return scene.frame_preview_start, scene.frame_preview_end
+    return scene.frame_start, scene.frame_end
+
+
+def get_or_create_collection(name, parent=None):
+    if name in bpy.data.collections:
+        return bpy.data.collections[name]
+    coll = bpy.data.collections.new(name)
+    if parent is None:
+        parent = bpy.context.scene.collection
+    parent.children.link(coll)
+    return coll
+
+
+def remove_collection(name):
+    coll = bpy.data.collections.get(name)
+    if coll is None:
+        return
+    for obj in list(coll.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+    bpy.data.collections.remove(coll)
+
+
+def create_empty(name, collection, size=0.15):
+    empty = bpy.data.objects.new(name, None)
+    empty.empty_display_type = 'PLAIN_AXES'
+    empty.empty_display_size = size
+    collection.objects.link(empty)
+    return empty
+
+
+def expand_hierarchy(objects):
+    """Depth-first expansion: each selected object followed by its
+    descendants, matching Maya's 'select -hi' + Hierarchy option."""
+    seen = set()
+    result = []
+
+    def walk(obj):
+        if obj.name in seen:
+            return
+        seen.add(obj.name)
+        result.append(obj)
+        for child in sorted(obj.children, key=lambda c: c.name):
+            walk(child)
+
+    for obj in objects:
+        walk(obj)
+    return result
+
+
+def ensure_action(obj):
+    if obj.animation_data is None:
+        obj.animation_data_create()
+    if obj.animation_data.action is None:
+        obj.animation_data.action = bpy.data.actions.new(name=f"{obj.name}Action")
+    return obj.animation_data.action
+
+
+def get_or_create_fcurve(action, data_path, index):
+    fc = action.fcurves.find(data_path, index=index)
+    if fc is None:
+        fc = action.fcurves.new(data_path, index=index)
+    return fc
+
+
+def get_rotation_info(obj):
+    """Returns (data_path, channel_count) for the object's active rotation mode.
+    Axis-angle objects are treated as Euler for the purposes of this addon
+    (Overlapper switches them to Euler-style delta math); this covers the
+    vast majority of animated rigs which use Euler or Quaternion rotation."""
+    if obj.rotation_mode == 'QUATERNION':
+        return "rotation_quaternion", 4
+    return "rotation_euler", 3
+
+
+def read_rotation_euler(obj):
+    if obj.rotation_mode == 'QUATERNION':
+        return obj.rotation_quaternion.to_euler()
+    if obj.rotation_mode == 'AXIS_ANGLE':
+        aa = obj.rotation_axis_angle
+        return Quaternion((aa[1], aa[2], aa[3]), aa[0]).to_euler()
+    return obj.rotation_euler.copy()
+
+
+# ---------------------------------------------------------------------------
+# Baking helpers - "follower" empties that carry a clean, dense copy of a
+# control's world-space animation. This stands in for the joint chain that
+# the original Maya tool builds and bakes.
+# ---------------------------------------------------------------------------
+
+def bake_follower(empty, source, frame_start, frame_end):
+    """Sample the source object's world transform every frame and key it
+    onto the follower empty using LOCAL loc/rot (world matrix decomposed
+    into the empty's own space, since the empty has no parent)."""
+    for f in range(int(frame_start), int(frame_end) + 1):
+        bpy.context.scene.frame_set(f)
+        mat = source.matrix_world.copy()
+        loc, rot_quat, _scale = mat.decompose()
+        empty.location = loc
+        empty.rotation_mode = 'QUATERNION'
+        empty.rotation_quaternion = rot_quat
+        empty.keyframe_insert(data_path="location", frame=f)
+        empty.keyframe_insert(data_path="rotation_quaternion", frame=f)
+
+    action = empty.animation_data.action if empty.animation_data else None
+    if action:
+        for fc in action.fcurves:
+            for kp in fc.keyframe_points:
+                kp.interpolation = 'LINEAR'
+            fc.update()
+
+
+def evaluate_follower(follower, frame, frame_start, frame_end, cyclic, cycle_len):
+    """Evaluate a follower empty's baked location + rotation at an arbitrary
+    (possibly fractional, possibly out-of-range) frame. When cyclic is True
+    the frame is wrapped into [frame_start, frame_start + cycle_len) so a
+    delayed sample near the start of the range seamlessly reads from the
+    end of the range (the first/last pose is expected to match, exactly
+    like the Maya tool's cycle requirement)."""
+    if cyclic and cycle_len > 0:
+        frame = frame_start + ((frame - frame_start) % cycle_len)
+    else:
+        frame = max(frame_start, min(frame_end, frame))
+
+    action = follower.animation_data.action
+    fmap = {(fc.data_path, fc.array_index): fc for fc in action.fcurves}
+
+    loc = Vector((0.0, 0.0, 0.0))
+    for i in range(3):
+        fc = fmap.get(("location", i))
+        if fc:
+            loc[i] = fc.evaluate(frame)
+
+    quat = [1.0, 0.0, 0.0, 0.0]
+    for i in range(4):
+        fc = fmap.get(("rotation_quaternion", i))
+        if fc:
+            quat[i] = fc.evaluate(frame)
+
+    return loc, Quaternion(quat)
+
+
+# ---------------------------------------------------------------------------
+# Non-destructive "anim layer" support via NLA (analogous to Maya's
+# "Bake on anim layer" option)
+# ---------------------------------------------------------------------------
+
+def push_base_action_to_nla(obj):
+    if obj.animation_data is None:
+        obj.animation_data_create()
+    anim = obj.animation_data
+    if anim.action is not None:
+        track = anim.nla_tracks.new()
+        track.name = "Overlapper_Base"
+        action = anim.action
+        track.strips.new(action.name, int(action.frame_range[0]), action)
+        anim.action = None
+
+
+def add_overlap_nla_layer(obj, action):
+    anim = obj.animation_data
+    track = anim.nla_tracks.new()
+    track.name = "Overlapper_Overlap"
+    strip = track.strips.new(action.name, int(action.frame_range[0]), action)
+    strip.blend_type = 'ADD'
+    strip.name = "Overlap"
+
+
+# ---------------------------------------------------------------------------
+# Core algorithm
+# ---------------------------------------------------------------------------
+
+def compute_average_spacing(chain, frame):
+    bpy.context.scene.frame_set(frame)
+    if len(chain) < 2:
+        return 1.0
+    total = 0.0
+    for a, b in zip(chain[:-1], chain[1:]):
+        total += (a.matrix_world.translation - b.matrix_world.translation).length
+    avg = total / (len(chain) - 1)
+    return avg if avg > 0.0001 else 1.0
+
+
+def apply_wind(delta_rot, index, frame, speed, scale, base_amp, seed):
+    rng_phase = (seed * 12.9898) % (2 * math.pi)
+    t = frame * 0.15 * max(speed, 0.001) + rng_phase
+    amp = base_amp * scale
+    delta_rot.y += math.sin(t) * amp
+    delta_rot.z += math.cos(t * 0.87 + 1.3) * amp
+    return delta_rot
+
+
+def run_overlapper(context, props):
+    scene = context.scene
+    chain = list(context.selected_objects)
+
+    if props.hierarchy_mode:
+        chain = expand_hierarchy(chain)
+
+    if len(chain) < 2:
+        return False, "Select more than one control, or enable Hierarchy mode in Options."
+
+    frame_start, frame_end = get_frame_range(context)
+    if frame_end <= frame_start:
+        return False, "Invalid frame range."
+
+    cycle_len = frame_end - frame_start
+    cyclic = props.cycle_mode
+
+    helper_coll = get_or_create_collection(HELPER_COLLECTION_NAME)
+
+    start_index = 1 if props.dont_use_first else 0
+    if len(chain) - start_index < 1:
+        return False, "Not enough controls after 'Don't use first controls'."
+
+    # --- Step 1: bake a clean follower copy of each control's animation ---
+    followers = []
+    for i, obj in enumerate(chain):
+        empty = create_empty(f"{HELPER_PREFIX}Joint_{i:02d}_{obj.name}", helper_coll)
+        bake_follower(empty, obj, frame_start, frame_end)
+        followers.append(empty)
+
+    # --- Step 2: intensity / adaptive scale ---
+    intensity = props.scale if props.scale > 0.0001 else 0.0001
+    if props.adaptive_scale:
+        avg_spacing = compute_average_spacing(chain, frame_start)
+        scale_factor = (avg_spacing / intensity) * 0.2
+    else:
+        scale_factor = intensity
+
+    original_rotations = {}
+    for obj in chain:
+        original_rotations[obj.name] = get_rotation_info(obj)
+
+    # --- Step 3 & 4: compute + bake the delayed / overlapping offset for
+    #     each control down the chain, additive on top of its own motion ---
+    for rank, i in enumerate(range(start_index, len(chain))):
+        obj = chain[i]
+        follower = followers[i]
+        delay = props.softness * rank
+
+        if props.bake_new_layer:
+            push_base_action_to_nla(obj)
+            overlap_action = bpy.data.actions.new(name=f"{obj.name}_Overlap")
+            target_action = overlap_action
+            additive_only = True
+        else:
+            target_action = ensure_action(obj)
+            additive_only = False
+
+        rot_path, rot_channels = original_rotations[obj.name]
+        rot_fcurves = [get_or_create_fcurve(target_action, rot_path, c) for c in range(rot_channels)]
+        loc_fcurves = None
+        if props.add_translate:
+            loc_fcurves = [get_or_create_fcurve(target_action, "location", c) for c in range(3)]
+
+        seed = (i + 1) * 7.13
+
+        for f in range(int(frame_start), int(frame_end) + 1):
+            own_loc, own_quat = evaluate_follower(follower, f, frame_start, frame_end, cyclic, cycle_len)
+            lag_loc, lag_quat = evaluate_follower(follower, f - delay, frame_start, frame_end, cyclic, cycle_len)
+
+            # Rotation delta: difference between the control's current pose
+            # and its own delayed pose, expressed as a small Euler offset
+            # and scaled by the overlap intensity - this is what produces
+            # the trailing / whip-like secondary motion.
+            rel_quat = own_quat.rotation_difference(lag_quat)
+            rel_euler = rel_quat.to_euler()
+            d_rot = Euler((
+                rel_euler.x * scale_factor,
+                rel_euler.y * scale_factor,
+                rel_euler.z * scale_factor,
+            ))
+
+            if props.use_wind:
+                d_rot = apply_wind(d_rot, i, f, props.wind_speed, props.wind_scale,
+                                    base_amp=0.05, seed=seed)
+
+            if additive_only:
+                final_rot = d_rot
+            else:
+                bpy.context.scene.frame_set(f)
+                base_euler = read_rotation_euler(obj)
+                final_rot = Euler((
+                    base_euler.x + d_rot.x,
+                    base_euler.y + d_rot.y,
+                    base_euler.z + d_rot.z,
+                ))
+
+            if rot_path == "rotation_quaternion":
+                q = final_rot.to_quaternion()
+                for c in range(4):
+                    rot_fcurves[c].keyframe_points.insert(f, q[c], options={'FAST'})
+            else:
+                for c in range(3):
+                    rot_fcurves[c].keyframe_points.insert(f, final_rot[c], options={'FAST'})
+
+            if loc_fcurves is not None:
+                d_loc = (lag_loc - own_loc) * scale_factor
+                if additive_only:
+                    final_loc = d_loc
+                else:
+                    bpy.context.scene.frame_set(f)
+                    final_loc = obj.location.copy() + d_loc
+                for c in range(3):
+                    loc_fcurves[c].keyframe_points.insert(f, final_loc[c], options={'FAST'})
+
+        for fc in rot_fcurves:
+            fc.update()
+        if loc_fcurves is not None:
+            for fc in loc_fcurves:
+                fc.update()
+
+        if props.bake_new_layer:
+            add_overlap_nla_layer(obj, target_action)
+
+        if props.delete_redundant:
+            simplify_fcurves(rot_fcurves + (loc_fcurves or []), frame_start, frame_end)
+
+    # --- Step 5: selection set (Blender collection) ---
+    if props.create_selection_set:
+        result_coll = get_or_create_collection(RESULT_COLLECTION_NAME)
+        for obj in chain[start_index:]:
+            if obj.name not in result_coll.objects:
+                result_coll.objects.link(obj)
+
+    # --- Step 6: cleanup helper empties unless Debug mode is on ---
+    if not props.debug_mode:
+        remove_collection(HELPER_COLLECTION_NAME)
+
+    bpy.context.scene.frame_set(frame_start)
+    for obj in chain:
+        obj.select_set(True)
+
+    return True, f"Overlap applied to {len(chain) - start_index} control(s)."
+
+
+def simplify_fcurves(fcurves, frame_start, frame_end, tolerance=0.0001):
+    """Remove redundant keyframes: any point whose value is (nearly) equal
+    to both its neighbours is deleted, mirroring the Maya 'Delete redundant'
+    option."""
+    for fc in fcurves:
+        pts = fc.keyframe_points
+        to_remove = []
+        for idx in range(1, len(pts) - 1):
+            prev_v = pts[idx - 1].co[1]
+            cur_v = pts[idx].co[1]
+            next_v = pts[idx + 1].co[1]
+            if abs(cur_v - prev_v) < tolerance and abs(cur_v - next_v) < tolerance:
+                to_remove.append(idx)
+        for idx in reversed(to_remove):
+            pts.remove(pts[idx])
+        fc.update()
+
+
+# ---------------------------------------------------------------------------
+# Properties
+# ---------------------------------------------------------------------------
+
+class OverlapperProperties(bpy.types.PropertyGroup):
+    softness: bpy.props.FloatProperty(
+        name="Softness",
+        description="More animation velocity, less softness. Delay (in frames) added "
+                    "per control down the chain",
+        default=3.0, min=0.0, soft_max=30.0,
+    )
+    scale: bpy.props.FloatProperty(
+        name="Scale",
+        description="More Scale, more overlap amplitude",
+        default=1.0, min=0.0001, soft_max=10.0,
+    )
+    use_wind: bpy.props.BoolProperty(
+        name="Wind",
+        description="Add wind animation on overlapped controls",
+        default=False,
+    )
+    wind_scale: bpy.props.FloatProperty(
+        name="Scale",
+        description="More Scale, more wind amplitude",
+        default=1.0, min=0.0, soft_max=10.0,
+    )
+    wind_speed: bpy.props.FloatProperty(
+        name="Speed",
+        description="More Speed, more wind frequency",
+        default=1.0, min=0.0001, soft_max=10.0,
+    )
+    show_options: bpy.props.BoolProperty(name="Options", default=True)
+    show_advanced: bpy.props.BoolProperty(name="Advanced", default=False)
+
+    dont_use_first: bpy.props.BoolProperty(
+        name="Don't use first controls",
+        description="Don't use the first control in the selected sequence of controls",
+        default=False,
+    )
+    add_translate: bpy.props.BoolProperty(
+        name="Add translate",
+        description="Add translate overlap for selected controls",
+        default=False,
+    )
+    hierarchy_mode: bpy.props.BoolProperty(
+        name="Hierarchy",
+        description="Add all objects below the hierarchy of each selected control",
+        default=False,
+    )
+    cycle_mode: bpy.props.BoolProperty(
+        name="Cycle",
+        description="Create seamless overlapping action for cycle animation. The first "
+                    "and last frame of the range must already match",
+        default=False,
+    )
+
+    debug_mode: bpy.props.BoolProperty(
+        name="Debug mode",
+        description="Don't delete Overlapper helper objects. Expert mode, be careful",
+        default=False,
+    )
+    bake_new_layer: bpy.props.BoolProperty(
+        name="Bake on anim layer",
+        description="Bake each new overlapping animation onto a new non-destructive "
+                    "NLA track (Add) instead of writing directly into the existing action",
+        default=False,
+    )
+    adaptive_scale: bpy.props.BoolProperty(
+        name="Adaptive scale",
+        description="Overlap Scale automatically adjusts for the distance between "
+                    "selected controls",
+        default=True,
+    )
+    create_selection_set: bpy.props.BoolProperty(
+        name="Create selection set",
+        description="Add the overlapped controls to an 'OverlapperSet' collection",
+        default=True,
+    )
+    delete_redundant: bpy.props.BoolProperty(
+        name="Delete redundant",
+        description="Delete redundant keys on overlapped controls after baking",
+        default=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Operators
+# ---------------------------------------------------------------------------
+
+class OVERLAPPER_OT_run(bpy.types.Operator):
+    bl_idname = "overlapper.run"
+    bl_label = "Overlap"
+    bl_description = "Create overlapping / follow-through animation for the selected chain"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return len(context.selected_objects) >= 1
+
+    def execute(self, context):
+        props = context.scene.overlapper_props
+        import time
+        t0 = time.time()
+        ok, message = run_overlapper(context, props)
+        if not ok:
+            self.report({'WARNING'}, message)
+            return {'CANCELLED'}
+        elapsed = time.time() - t0
+        self.report({'INFO'}, f"{message} ({elapsed:.2f}s)")
+        return {'FINISHED'}
+
+
+class OVERLAPPER_OT_cleanup(bpy.types.Operator):
+    bl_idname = "overlapper.cleanup"
+    bl_label = "CleanUp"
+    bl_description = "Delete all Overlapper helper objects"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        remove_collection(HELPER_COLLECTION_NAME)
+        for obj in list(bpy.data.objects):
+            if obj.name.startswith(HELPER_PREFIX):
+                bpy.data.objects.remove(obj, do_unlink=True)
+        self.report({'INFO'}, "Overlapper helpers cleaned up.")
+        return {'FINISHED'}
+
+
+class OVERLAPPER_OT_open_url(bpy.types.Operator):
+    bl_idname = "overlapper.open_url"
+    bl_label = "Open URL"
+    bl_options = {'INTERNAL'}
+
+    url: bpy.props.StringProperty()
+
+    def execute(self, context):
+        bpy.ops.wm.url_open(url=self.url)
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+class OVERLAPPER_PT_panel(bpy.types.Panel):
+    bl_label = "Overlapper 2.0"
+    bl_idname = "OVERLAPPER_PT_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Overlapper"
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.overlapper_props
+
+        col = layout.column(align=True)
+        col.prop(props, "softness")
+        col.prop(props, "scale")
+
+        box = layout.box()
+        box.prop(props, "use_wind")
+        if props.use_wind:
+            row = box.row(align=True)
+            row.prop(props, "wind_scale")
+            row.prop(props, "wind_speed")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(props, "show_options",
+                 icon='TRIA_DOWN' if props.show_options else 'TRIA_RIGHT', emboss=False)
+        if props.show_options:
+            box.prop(props, "dont_use_first")
+            box.prop(props, "add_translate")
+            box.prop(props, "hierarchy_mode")
+            box.prop(props, "cycle_mode")
+
+        box = layout.box()
+        row = box.row()
+        row.prop(props, "show_advanced",
+                 icon='TRIA_DOWN' if props.show_advanced else 'TRIA_RIGHT', emboss=False)
+        if props.show_advanced:
+            box.prop(props, "debug_mode")
+            box.prop(props, "bake_new_layer")
+            box.prop(props, "adaptive_scale")
+            box.prop(props, "create_selection_set")
+            box.prop(props, "delete_redundant")
+            box.operator("overlapper.cleanup", icon='TRASH')
+
+        layout.separator()
+        layout.operator("overlapper.run", icon='MOD_DYNAMICPAINT')
+
+        row = layout.row(align=True)
+        op = row.operator("overlapper.open_url", text="Intro")
+        op.url = "https://vimeo.com/286860063"
+        op = row.operator("overlapper.open_url", text="Tutorial")
+        op.url = "https://vimeo.com/287771379"
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+classes = (
+    OverlapperProperties,
+    OVERLAPPER_OT_run,
+    OVERLAPPER_OT_cleanup,
+    OVERLAPPER_OT_open_url,
+    OVERLAPPER_PT_panel,
+)
+
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.overlapper_props = bpy.props.PointerProperty(type=OverlapperProperties)
+
+
+def unregister():
+    del bpy.types.Scene.overlapper_props
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+
+if __name__ == "__main__":
+    register()
