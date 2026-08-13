@@ -1,13 +1,13 @@
 bl_info = {
     "name": "Smart Curve Tools",
     "author": "Venkatesh Sanku (merged by AI assistant)",
-    "version": (2, 1),
+    "version": (2, 2),
     "blender": (5, 0, 0),
     "location": "Graph Editor > Sidebar > Smart Curve Tools Tab",
     "description": (
         "Combined toolset: Smart Euler Filter for unwrap/smooth Euler or Quaternion rotations preserving handles, "
-        "advanced smoothing of F-Curves (weighted / moving average / gaussian), keyframe decimation/cleanup, "
-        "easing presets, and noise/jitter tools. "
+        "advanced smoothing of F-Curves (weighted / moving average / gaussian), easing presets, "
+        "a spring/overshoot follow-through simulator, keyframe staggering across curves, and value mirroring. "
         "Works for objects and pose bones, with preserved keyframe handles. Batch smoothing affects all keyframes."
     ),
     "category": "Animation",
@@ -15,7 +15,6 @@ bl_info = {
 
 import bpy
 import math
-import random
 from mathutils import Euler, Quaternion
 
 # ----- Utility Functions -----
@@ -232,34 +231,25 @@ def dispatch_smooth(fcurve, settings, all_keyframes):
     else:
         return smooth_keyframes(fcurve, settings.iterations, settings.strength, settings.sensitivity, settings.preserve_ends, all_keyframes)
 
-# NEW: Ramer-Douglas-Peucker decimation for keyframe cleanup
-def _point_line_distance(p, a, b):
-    if a == b:
-        return math.hypot(p[0] - a[0], p[1] - a[1])
-    x1, y1 = a
-    x2, y2 = b
-    x0, y0 = p
-    num = abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
-    den = math.hypot(y2 - y1, x2 - x1)
-    return num / den if den != 0 else 0.0
-
-def rdp_decimate(points, epsilon):
-    if len(points) < 3:
-        return points
-    dmax = 0.0
-    index = 0
-    start, end = points[0], points[-1]
-    for i in range(1, len(points) - 1):
-        d = _point_line_distance(points[i], start, end)
-        if d > dmax:
-            index = i
-            dmax = d
-    if dmax > epsilon:
-        left = rdp_decimate(points[:index + 1], epsilon)
-        right = rdp_decimate(points[index:], epsilon)
-        return left[:-1] + right
-    else:
-        return [start, end]
+# NEW: Damped spring simulator, used to bake overshoot/follow-through
+def simulate_spring(values, stiffness, damping, mass, dt=1.0):
+    """Drive a damped harmonic oscillator toward each sampled target value in turn.
+    Returns a list of simulated positions the same length as `values`."""
+    n = len(values)
+    if n == 0:
+        return []
+    result = [values[0]]
+    pos = values[0]
+    velocity = 0.0
+    mass = max(mass, 0.0001)
+    for i in range(1, n):
+        target = values[i]
+        force = -stiffness * (pos - target) - damping * velocity
+        accel = force / mass
+        velocity += accel * dt
+        pos += velocity * dt
+        result.append(pos)
+    return result
 
 # ----- Smart Euler Filter (ORIGINAL LOGIC) -----
 
@@ -513,13 +503,6 @@ class CurveSmoothProperties(bpy.types.PropertyGroup):
         default=1.5, min=0.1, max=10.0
     )
 
-    # --- Cleanup / decimation ---
-    decimate_error: bpy.props.FloatProperty(
-        name="Error Tolerance",
-        description="Maximum allowed value deviation when decimating/simplifying keyframes",
-        default=0.05, min=0.0001, max=10.0
-    )
-
     # --- Easing presets ---
     ease_interpolation: bpy.props.EnumProperty(
         name="Interpolation",
@@ -532,14 +515,61 @@ class CurveSmoothProperties(bpy.types.PropertyGroup):
         default='EASE_IN_OUT'
     )
 
-    # --- Noise ---
-    noise_scale: bpy.props.FloatProperty(name="Noise Scale", default=10.0, min=0.01, max=1000.0)
-    noise_strength: bpy.props.FloatProperty(name="Noise Strength", default=1.0, min=0.0, max=100.0)
-    noise_phase: bpy.props.FloatProperty(name="Noise Phase", default=0.0)
+    # --- Spring / overshoot simulator ---
+    spring_stiffness: bpy.props.FloatProperty(
+        name="Stiffness",
+        description="How strongly the spring pulls toward the original curve (higher = snappier, less overshoot)",
+        default=0.3, min=0.01, max=2.0
+    )
+    spring_damping: bpy.props.FloatProperty(
+        name="Damping",
+        description="How quickly the overshoot settles (higher = settles faster, lower = more bouncy)",
+        default=0.7, min=0.0, max=2.0
+    )
+    spring_mass: bpy.props.FloatProperty(
+        name="Mass",
+        description="Simulated mass - higher values produce slower, heavier-feeling overshoot",
+        default=1.0, min=0.01, max=20.0
+    )
+    spring_overshoot: bpy.props.FloatProperty(
+        name="Overshoot Amount",
+        description="Blend between the original motion (0) and the full spring simulation (1); values above 1 exaggerate it",
+        default=1.0, min=0.0, max=2.0
+    )
+    spring_sample_step: bpy.props.IntProperty(
+        name="Sample Step",
+        description="Frame interval used to sample and rebake the curve (1 = every frame)",
+        default=1, min=1, max=10
+    )
 
-    # --- Jitter ---
-    jitter_amount: bpy.props.FloatProperty(name="Jitter Amount", default=0.1, min=0.0, max=100.0)
-    jitter_seed: bpy.props.IntProperty(name="Jitter Seed", default=0, min=0)
+    # --- Stagger keyframes across curves ---
+    stagger_offset: bpy.props.FloatProperty(
+        name="Frame Offset / Curve",
+        description="How many frames to shift each successive selected F-Curve by, creating a wave/follow-through effect",
+        default=2.0, min=-50.0, max=50.0
+    )
+    stagger_value_scale: bpy.props.FloatProperty(
+        name="Amplitude Change / Curve",
+        description="Additional amplitude scale applied to each successive curve (0 = no change, e.g. 0.1 = +10% per curve)",
+        default=0.0, min=-1.0, max=1.0
+    )
+
+    # --- Mirror curve values ---
+    mirror_pivot_mode: bpy.props.EnumProperty(
+        name="Pivot",
+        description="What value to mirror keyframes around",
+        items=[
+            ('ZERO', "Zero", "Mirror around a value of 0"),
+            ('AVERAGE', "Curve Average", "Mirror around each curve's own average value"),
+            ('CUSTOM', "Custom", "Mirror around a manually specified value"),
+        ],
+        default='AVERAGE'
+    )
+    mirror_pivot_value: bpy.props.FloatProperty(
+        name="Custom Pivot Value",
+        description="Value to mirror around when Pivot is set to Custom",
+        default=0.0
+    )
 
 
 class CurveSmoothOperator(bpy.types.Operator):
@@ -624,22 +654,27 @@ class ResetCurveSmoothValuesOperator(bpy.types.Operator):
         settings.smoothing_method = 'WEIGHTED'
         settings.ma_window = 5
         settings.gaussian_sigma = 1.5
-        settings.decimate_error = 0.05
         settings.ease_interpolation = 'BEZIER'
         settings.ease_mode = 'EASE_IN_OUT'
-        settings.noise_scale = 10.0
-        settings.noise_strength = 1.0
-        settings.noise_phase = 0.0
-        settings.jitter_amount = 0.1
-        settings.jitter_seed = 0
+        settings.spring_stiffness = 0.3
+        settings.spring_damping = 0.7
+        settings.spring_mass = 1.0
+        settings.spring_overshoot = 1.0
+        settings.spring_sample_step = 1
+        settings.stagger_offset = 2.0
+        settings.stagger_value_scale = 0.0
+        settings.mirror_pivot_mode = 'AVERAGE'
+        settings.mirror_pivot_value = 0.0
         self.report({'INFO'}, "Reset smoothing parameters to default values")
         return {'FINISHED'}
 
 
-class GRAPH_OT_decimate_keyframes(bpy.types.Operator):
-    """Decimate/simplify keyframes on selected F-Curves using error-tolerance reduction (removes redundant keys)"""
-    bl_idname = "graph.smart_decimate_keyframes"
-    bl_label = "Decimate Keyframes"
+class GRAPH_OT_bake_spring_overshoot(bpy.types.Operator):
+    """Simulate spring/overshoot dynamics on selected F-Curves and bake the result as new keyframes
+    (adds secondary-motion follow-through after fast movement). Rebuilds the curve at the scene's
+    frame range, so this replaces existing keyframes on the curve - undo if you don't like the result."""
+    bl_idname = "graph.smart_spring_overshoot"
+    bl_label = "Bake Spring Overshoot"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -649,40 +684,53 @@ class GRAPH_OT_decimate_keyframes(bpy.types.Operator):
             self.report({'WARNING'}, "No editable F-Curves selected")
             return {'CANCELLED'}
 
-        total_before = 0
-        total_after = 0
+        scene = context.scene
+        frame_start = scene.frame_start
+        frame_end = scene.frame_end
+        step = max(1, settings.spring_sample_step)
 
+        count = 0
         for fcurve in curves:
             try:
                 keyframes = fcurve.keyframe_points
-                n = len(keyframes)
-                if n < 3:
-                    total_before += n
-                    total_after += n
+                if len(keyframes) < 2:
                     continue
-                points = [(kp.co[0], kp.co[1]) for kp in keyframes]
-                total_before += n
-                kept_points = rdp_decimate(points, settings.decimate_error)
-                kept_frames = {round(p[0], 4) for p in kept_points}
-                kept_frames.add(round(points[0][0], 4))
-                kept_frames.add(round(points[-1][0], 4))
 
-                to_remove = []
-                for i in range(n - 1, -1, -1):
-                    f = round(keyframes[i].co[0], 4)
-                    if f not in kept_frames:
-                        to_remove.append(i)
+                frames = list(range(frame_start, frame_end + 1, step))
+                if not frames:
+                    continue
 
-                for i in to_remove:
-                    keyframes.remove(keyframes[i])
+                original_values = [fcurve.evaluate(f) for f in frames]
+                spring_values = simulate_spring(
+                    original_values,
+                    settings.spring_stiffness,
+                    settings.spring_damping,
+                    settings.spring_mass,
+                    dt=float(step)
+                )
 
-                total_after += (n - len(to_remove))
+                blended = [
+                    orig + (spring - orig) * settings.spring_overshoot
+                    for orig, spring in zip(original_values, spring_values)
+                ]
+
+                for kp in list(keyframes):
+                    keyframes.remove(kp)
+                for f, v in zip(frames, blended):
+                    keyframes.insert(f, v)
+
+                set_bezier_and_auto_clamp_handles(fcurve)
+                auto_fix_bad_keyframes(fcurve)
                 fcurve.update()
+                count += 1
             except Exception:
                 continue
 
-        removed = total_before - total_after
-        self.report({'INFO'}, f"Removed {removed} keyframe(s) ({total_before} -> {total_after})")
+        if count == 0:
+            self.report({'WARNING'}, "No F-Curves processed")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Baked spring overshoot on {count} F-Curve(s), frames {frame_start}-{frame_end}")
         return {'FINISHED'}
 
 
@@ -720,61 +768,61 @@ class GRAPH_OT_apply_ease_preset(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class GRAPH_OT_add_noise_modifier(bpy.types.Operator):
-    """Add a Noise F-Modifier to selected F-Curves"""
-    bl_idname = "graph.smart_add_noise"
-    bl_label = "Add Noise Modifier"
+class GRAPH_OT_stagger_keyframes(bpy.types.Operator):
+    """Time-offset (and optionally scale) each selected F-Curve by an increasing amount,
+    creating a staggered wave / follow-through effect across a chain of curves (e.g. a tail,
+    chain of bones, or cloth points). Curves are processed in the order the Graph Editor returns them."""
+    bl_idname = "graph.smart_stagger_keyframes"
+    bl_label = "Stagger Keyframes"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         settings = context.scene.curve_smooth_settings
-        curves = getattr(context, "selected_editable_fcurves", [])
+        curves = list(getattr(context, "selected_editable_fcurves", []))
         if not curves:
             self.report({'WARNING'}, "No editable F-Curves selected")
             return {'CANCELLED'}
 
+        offset_step = settings.stagger_offset
+        scale_step = settings.stagger_value_scale
+
         count = 0
-        for fcurve in curves:
-            try:
-                mod = fcurve.modifiers.new(type='NOISE')
-                mod.scale = settings.noise_scale
-                mod.strength = settings.noise_strength
-                mod.phase = settings.noise_phase
-                count += 1
-            except Exception:
+        for idx, fcurve in enumerate(curves):
+            time_offset = offset_step * idx
+            value_scale = 1.0 + (scale_step * idx)
+            keyframes = fcurve.keyframe_points
+            if len(keyframes) == 0:
                 continue
 
-        self.report({'INFO'}, f"Added Noise modifier to {count} F-Curve(s)")
-        return {'FINISHED'}
+            values = [kp.co[1] for kp in keyframes]
+            pivot = sum(values) / len(values)
 
+            for kp in keyframes:
+                kp.co[0] += time_offset
+                kp.co[1] = pivot + (kp.co[1] - pivot) * value_scale
+                if kp.handle_left_type not in {'AUTO', 'AUTO_CLAMPED'}:
+                    kp.handle_left[0] += time_offset
+                    kp.handle_left[1] = pivot + (kp.handle_left[1] - pivot) * value_scale
+                if kp.handle_right_type not in {'AUTO', 'AUTO_CLAMPED'}:
+                    kp.handle_right[0] += time_offset
+                    kp.handle_right[1] = pivot + (kp.handle_right[1] - pivot) * value_scale
 
-class GRAPH_OT_remove_noise_modifiers(bpy.types.Operator):
-    """Remove all Noise F-Modifiers from selected F-Curves"""
-    bl_idname = "graph.smart_remove_noise"
-    bl_label = "Remove Noise Modifiers"
-    bl_options = {'REGISTER', 'UNDO'}
+            fcurve.update()
+            count += 1
 
-    def execute(self, context):
-        curves = getattr(context, "selected_editable_fcurves", [])
-        if not curves:
-            self.report({'WARNING'}, "No editable F-Curves selected")
+        if count == 0:
+            self.report({'WARNING'}, "No F-Curves processed")
             return {'CANCELLED'}
 
-        count = 0
-        for fcurve in curves:
-            for mod in list(fcurve.modifiers):
-                if mod.type == 'NOISE':
-                    fcurve.modifiers.remove(mod)
-                    count += 1
-
-        self.report({'INFO'}, f"Removed {count} Noise modifier(s)")
+        self.report({'INFO'}, f"Staggered {count} F-Curve(s), {offset_step:g} frame(s) apart")
         return {'FINISHED'}
 
 
-class GRAPH_OT_bake_jitter(bpy.types.Operator):
-    """Randomly jitter the values of selected keyframes (baked directly, not a modifier)"""
-    bl_idname = "graph.smart_bake_jitter"
-    bl_label = "Bake Jitter to Keyframes"
+class GRAPH_OT_mirror_curve_values(bpy.types.Operator):
+    """Flip (mirror) the values of selected keyframes around a pivot value.
+    Operates on selected keyframes if any are selected, otherwise all keyframes on the curve."""
+    bl_idname = "graph.smart_mirror_values"
+    bl_label = "Mirror Curve Values"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -784,21 +832,35 @@ class GRAPH_OT_bake_jitter(bpy.types.Operator):
             self.report({'WARNING'}, "No editable F-Curves selected")
             return {'CANCELLED'}
 
-        rng = random.Random(settings.jitter_seed)
         count = 0
         for fcurve in curves:
-            for kp in fcurve.keyframe_points:
-                if kp.select_control_point:
-                    offset = rng.uniform(-settings.jitter_amount, settings.jitter_amount)
-                    kp.co[1] += offset
-                    count += 1
+            keyframes = fcurve.keyframe_points
+            selected = [kp for kp in keyframes if kp.select_control_point]
+            target = selected if selected else list(keyframes)
+            if not target:
+                continue
+
+            if settings.mirror_pivot_mode == 'ZERO':
+                pivot = 0.0
+            elif settings.mirror_pivot_mode == 'AVERAGE':
+                pivot = sum(kp.co[1] for kp in target) / len(target)
+            else:
+                pivot = settings.mirror_pivot_value
+
+            for kp in target:
+                kp.co[1] = pivot - (kp.co[1] - pivot)
+                if kp.handle_left_type not in {'AUTO', 'AUTO_CLAMPED'}:
+                    kp.handle_left[1] = pivot - (kp.handle_left[1] - pivot)
+                if kp.handle_right_type not in {'AUTO', 'AUTO_CLAMPED'}:
+                    kp.handle_right[1] = pivot - (kp.handle_right[1] - pivot)
+                count += 1
             fcurve.update()
 
         if count == 0:
-            self.report({'WARNING'}, "No selected keyframes found")
+            self.report({'WARNING'}, "No keyframes found to mirror")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Jittered {count} keyframe(s)")
+        self.report({'INFO'}, f"Mirrored {count} keyframe(s)")
         return {'FINISHED'}
 
 
@@ -833,11 +895,6 @@ class SMARTCURVETOOLS_PT_panel(bpy.types.Panel):
         box.operator("graph.reset_curve_smooth_values", text="Reset Smooth Values")
 
         box = layout.box()
-        box.label(text="Cleanup", icon='TRASH')
-        box.prop(settings, "decimate_error")
-        box.operator("graph.smart_decimate_keyframes", text="Decimate / Simplify Keyframes")
-
-        box = layout.box()
         box.label(text="Easing Presets", icon='IPO_BEZIER')
         box.prop(settings, "ease_interpolation")
         if settings.ease_interpolation not in {'LINEAR', 'CONSTANT'}:
@@ -845,17 +902,26 @@ class SMARTCURVETOOLS_PT_panel(bpy.types.Panel):
         box.operator("graph.apply_ease_preset", text="Apply to Selected Keyframes")
 
         box = layout.box()
-        box.label(text="Noise & Jitter", icon='FORCE_TURBULENCE')
-        box.prop(settings, "noise_scale")
-        box.prop(settings, "noise_strength")
-        box.prop(settings, "noise_phase")
-        row = box.row(align=True)
-        row.operator("graph.smart_add_noise", text="Add Noise Modifier")
-        row.operator("graph.smart_remove_noise", text="Remove")
-        box.separator()
-        box.prop(settings, "jitter_amount")
-        box.prop(settings, "jitter_seed")
-        box.operator("graph.smart_bake_jitter", text="Bake Jitter to Keyframes")
+        box.label(text="Spring / Overshoot", icon='PHYSICS')
+        box.prop(settings, "spring_stiffness")
+        box.prop(settings, "spring_damping")
+        box.prop(settings, "spring_mass")
+        box.prop(settings, "spring_overshoot")
+        box.prop(settings, "spring_sample_step")
+        box.operator("graph.smart_spring_overshoot", text="Bake Spring Overshoot")
+
+        box = layout.box()
+        box.label(text="Stagger Keyframes", icon='NLA_PUSHDOWN')
+        box.prop(settings, "stagger_offset")
+        box.prop(settings, "stagger_value_scale")
+        box.operator("graph.smart_stagger_keyframes", text="Stagger Selected Curves")
+
+        box = layout.box()
+        box.label(text="Mirror Values", icon='ARROW_LEFTRIGHT')
+        box.prop(settings, "mirror_pivot_mode")
+        if settings.mirror_pivot_mode == 'CUSTOM':
+            box.prop(settings, "mirror_pivot_value")
+        box.operator("graph.smart_mirror_values", text="Mirror Selected Keyframes")
 
 # ----- Register and Unregister -----
 
@@ -865,11 +931,10 @@ classes = [
     CurveSmoothOperator,
     CurveSmoothAllOperator,
     ResetCurveSmoothValuesOperator,
-    GRAPH_OT_decimate_keyframes,
     GRAPH_OT_apply_ease_preset,
-    GRAPH_OT_add_noise_modifier,
-    GRAPH_OT_remove_noise_modifiers,
-    GRAPH_OT_bake_jitter,
+    GRAPH_OT_bake_spring_overshoot,
+    GRAPH_OT_stagger_keyframes,
+    GRAPH_OT_mirror_curve_values,
     SMARTCURVETOOLS_PT_panel,
 ]
 
