@@ -22,6 +22,8 @@ HELPER_COLLECTION_NAME = "Overlapper_Helpers"
 HELPER_PREFIX = "OVL_"
 RESULT_COLLECTION_NAME = "OverlapperSet"
 
+VALID_EULER_ORDERS = {'XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX'}
+
 
 # ---------------------------------------------------------------------------
 # Version-safe Action / F-Curve access (Blender 5.0 removed Action.fcurves)
@@ -124,14 +126,21 @@ class ChainItem:
             return f'pose.bones["{self.bone_name}"].{prop}'
         return prop
 
-    def read_rotation_euler(self):
+    def read_rotation_euler(self, order='XYZ'):
+        """Return the control's current rotation as an Euler in `order`.
+        For QUATERNION/AXIS_ANGLE modes the order only has to be internally
+        consistent with how the delta is decoded later (see run_overlapper),
+        so 'XYZ' is fine there. For a real Euler-mode control it must match
+        the control's own rotation_mode, since these values get summed
+        component-wise with the delta and written straight back into the
+        native rotation_euler/rotation_axis_angle channels."""
         mode = self.rotation_mode()
         target = self.pose_bone if self.kind == 'BONE' else self.id_obj
         if mode == 'QUATERNION':
-            return target.rotation_quaternion.to_euler()
+            return target.rotation_quaternion.to_euler(order)
         if mode == 'AXIS_ANGLE':
             aa = target.rotation_axis_angle
-            return Quaternion((aa[1], aa[2], aa[3]), aa[0]).to_euler()
+            return Quaternion((aa[1], aa[2], aa[3]), aa[0]).to_euler(order)
         return target.rotation_euler.copy()
 
     def read_location(self):
@@ -382,7 +391,9 @@ def run_overlapper(context, props):
             prev_loc = loc
 
             if need_baseline and i >= start_index:
-                baseline_rot[i].append(item.read_rotation_euler())
+                order = item.rotation_mode()
+                order = order if order in VALID_EULER_ORDERS else 'XYZ'
+                baseline_rot[i].append(item.read_rotation_euler(order))
                 if baseline_loc is not None:
                     baseline_loc[i].append(item.read_location())
 
@@ -459,8 +470,23 @@ def run_overlapper(context, props):
             follower_curve = follower_curves[i]
             local_dir = bind_local_dir[i]
 
-            rot_prop = "rotation_quaternion" if item.rotation_mode() == 'QUATERNION' else "rotation_euler"
-            rot_channels = 4 if rot_prop == "rotation_quaternion" else 3
+            control_mode = item.rotation_mode()
+            if control_mode == 'QUATERNION':
+                rot_prop = "rotation_quaternion"
+                rot_channels = 4
+                euler_order = 'XYZ'  # arbitrary but must match the decode below
+            elif control_mode == 'AXIS_ANGLE':
+                rot_prop = "rotation_axis_angle"
+                rot_channels = 4
+                euler_order = 'XYZ'
+            else:
+                rot_prop = "rotation_euler"
+                rot_channels = 3
+                # Must match the control's actual Euler order: a delta decomposed
+                # in the wrong order and summed component-wise produces a
+                # different rotation than intended once angles get non-trivial.
+                euler_order = control_mode if control_mode in VALID_EULER_ORDERS else 'XYZ'
+
             rot_fcurves = [get_fcurve(id_obj, target_action, item.data_path(rot_prop), c)
                            for c in range(rot_channels)]
             loc_fcurves = None
@@ -493,7 +519,7 @@ def run_overlapper(context, props):
 
                 swing = aim_now.rotation_difference(aim_dir)
                 delta_local = own_quat.inverted() @ swing @ own_quat
-                d_rot = delta_local.to_euler()
+                d_rot = delta_local.to_euler(euler_order)
 
                 if additive_only:
                     final_rot_euler = d_rot
@@ -501,12 +527,20 @@ def run_overlapper(context, props):
                     base_euler = baseline_rot[i][f_index]
                     final_rot_euler = Euler((base_euler.x + d_rot.x,
                                               base_euler.y + d_rot.y,
-                                              base_euler.z + d_rot.z))
+                                              base_euler.z + d_rot.z), euler_order)
 
                 if rot_prop == "rotation_quaternion":
                     q = final_rot_euler.to_quaternion()
                     for c in range(4):
                         rot_fcurves[c].keyframe_points.insert(f, q[c], options={'FAST'})
+                elif rot_prop == "rotation_axis_angle":
+                    q = final_rot_euler.to_quaternion()
+                    axis, angle = q.to_axis_angle()
+                    if axis.length < 1e-8:
+                        axis = Vector((0.0, 1.0, 0.0))
+                    values = (angle, axis.x, axis.y, axis.z)
+                    for c in range(4):
+                        rot_fcurves[c].keyframe_points.insert(f, values[c], options={'FAST'})
                 else:
                     for c in range(3):
                         rot_fcurves[c].keyframe_points.insert(f, final_rot_euler[c], options={'FAST'})
@@ -662,6 +696,22 @@ class OVERLAPPER_OT_run(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class OVERLAPPER_OT_reset(bpy.types.Operator):
+    bl_idname = "overlapper.reset"
+    bl_label = "Reset Values"
+    bl_description = "Reset all Overlapper settings on this scene back to their defaults"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        props = context.scene.overlapper_props
+        for key in props.rna_type.properties.keys():
+            if key in ('rna_type', 'name'):
+                continue
+            props.property_unset(key)
+        self.report({'INFO'}, "Overlapper settings reset to defaults.")
+        return {'FINISHED'}
+
+
 class OVERLAPPER_OT_cleanup(bpy.types.Operator):
     bl_idname = "overlapper.cleanup"
     bl_label = "CleanUp"
@@ -726,7 +776,9 @@ class OVERLAPPER_PT_panel(bpy.types.Panel):
             box.operator("overlapper.cleanup", icon='TRASH')
 
         layout.separator()
-        layout.operator("overlapper.run", icon='MOD_DYNAMICPAINT')
+        row = layout.row(align=True)
+        row.operator("overlapper.run", icon='MOD_DYNAMICPAINT')
+        row.operator("overlapper.reset", icon='LOOP_BACK', text="")
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +788,7 @@ class OVERLAPPER_PT_panel(bpy.types.Panel):
 classes = (
     OverlapperProperties,
     OVERLAPPER_OT_run,
+    OVERLAPPER_OT_reset,
     OVERLAPPER_OT_cleanup,
     OVERLAPPER_PT_panel,
 )
