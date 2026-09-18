@@ -2,7 +2,7 @@ bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
     "version": (5, 2, 1),
-    "blender": (4, 2, 0),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N-panel) > Overlapper",
     "description": "Automatic overlapping / follow-through secondary animation for chains of objects or bones.",
     "category": "Animation",
@@ -10,99 +10,224 @@ bl_info = {
 
 import bpy
 import math
-from mathutils import Vector, Euler, Quaternion
+from mathutils import Vector, Euler, Quaternion, Matrix
+
 
 HELPER_COLLECTION_NAME = "Overlapper_Helpers"
 HELPER_PREFIX = "OVL_"
 RESULT_COLLECTION_NAME = "OverlapperSet"
 
-VALID_EULER_ORDERS = {'XYZ', 'XZY', 'YXZ', 'YZX', 'ZXY', 'ZYX'}
+VALID_EULER_ORDERS = {
+    'XYZ',
+    'XZY',
+    'YXZ',
+    'YZX',
+    'ZXY',
+    'ZYX'
+}
 
 _BACKUP_STORE = {}
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Version-safe Action / F-Curve access
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def get_fcurve(id_obj, action, data_path, index):
+    """
+    Blender 5.x uses fcurve_ensure_for_datablock().
+    Older Blender versions can fall back to fcurves.find/new().
+    """
     try:
         return action.fcurve_ensure_for_datablock(
-            id_obj, data_path, index=index
+            id_obj,
+            data_path,
+            index=index
         )
     except AttributeError:
-        fc = action.fcurves.find(data_path, index=index)
+        fc = action.fcurves.find(
+            data_path,
+            index=index
+        )
+
         if fc is None:
-            fc = action.fcurves.new(data_path, index=index)
+            fc = action.fcurves.new(
+                data_path,
+                index=index
+            )
+
         return fc
 
 
 def ensure_action(id_obj):
     if id_obj.animation_data is None:
         id_obj.animation_data_create()
+
     if id_obj.animation_data.action is None:
         id_obj.animation_data.action = bpy.data.actions.new(
             name=f"{id_obj.name}Action"
         )
+
     return id_obj.animation_data.action
 
 
-# ---------------------------------------------------------------------------
+def ensure_animation_data(id_obj):
+    if id_obj.animation_data is None:
+        id_obj.animation_data_create()
+
+    return id_obj.animation_data
+
+
+def get_action_slot(anim):
+    """
+    Blender 4.4+ introduced Action Slots.
+
+    Return the currently assigned slot when available.
+    """
+    try:
+        return anim.action_slot
+    except AttributeError:
+        return None
+
+
+def assign_action_slot(anim, slot):
+    """
+    Restore an Action Slot when Blender exposes the API.
+    """
+    if slot is None:
+        return
+
+    try:
+        anim.action_slot = slot
+        return
+    except (AttributeError, TypeError, RuntimeError):
+        pass
+
+    try:
+        anim.action_slot_handle = slot.handle
+    except (AttributeError, TypeError, RuntimeError):
+        pass
+
+
+def get_strip_action_slot(strip):
+    try:
+        return strip.action_slot
+    except AttributeError:
+        return None
+
+
+def assign_strip_action_slot(strip, slot):
+    if slot is None:
+        return
+
+    try:
+        strip.action_slot = slot
+        return
+    except (AttributeError, TypeError, RuntimeError):
+        pass
+
+    try:
+        strip.action_slot_handle = slot.handle
+    except (AttributeError, TypeError, RuntimeError):
+        pass
+
+
+# ============================================================================
 # Small utilities
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def get_frame_range(context):
     scene = context.scene
+
     if scene.use_preview_range:
-        return scene.frame_preview_start, scene.frame_preview_end
-    return scene.frame_start, scene.frame_end
+        return (
+            scene.frame_preview_start,
+            scene.frame_preview_end
+        )
+
+    return (
+        scene.frame_start,
+        scene.frame_end
+    )
 
 
 def get_or_create_collection(name, parent=None):
     if name in bpy.data.collections:
         return bpy.data.collections[name]
+
     coll = bpy.data.collections.new(name)
+
     if parent is None:
         parent = bpy.context.scene.collection
+
     parent.children.link(coll)
+
     return coll
 
 
 def remove_collection(name):
     coll = bpy.data.collections.get(name)
+
     if coll is None:
         return
+
     for obj in list(coll.objects):
-        bpy.data.objects.remove(obj, do_unlink=True)
+        bpy.data.objects.remove(
+            obj,
+            do_unlink=True
+        )
+
     bpy.data.collections.remove(coll)
 
 
 def create_empty(name, collection, size=0.15):
-    empty = bpy.data.objects.new(name, None)
+    empty = bpy.data.objects.new(
+        name,
+        None
+    )
+
     empty.empty_display_type = 'PLAIN_AXES'
     empty.empty_display_size = size
+
     collection.objects.link(empty)
+
     return empty
 
 
 def clamp(value, low, high):
-    return max(low, min(high, value))
+    return max(
+        low,
+        min(high, value)
+    )
 
 
-def safe_normalized(v, fallback=Vector((1.0, 0.0, 0.0))):
+def safe_normalized(
+        v,
+        fallback=Vector((1.0, 0.0, 0.0))
+):
     if v.length < 1e-8:
         return fallback.copy()
+
     return v.normalized()
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # ChainItem
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 class ChainItem:
-    __slots__ = ("kind", "id_obj", "bone_name")
+    __slots__ = (
+        "kind",
+        "id_obj",
+        "bone_name"
+    )
 
-    def __init__(self, kind, id_obj, bone_name=None):
+    def __init__(
+            self,
+            kind,
+            id_obj,
+            bone_name=None
+    ):
         self.kind = kind
         self.id_obj = id_obj
         self.bone_name = bone_name
@@ -110,23 +235,38 @@ class ChainItem:
     @property
     def name(self):
         if self.kind == 'BONE':
-            return f"{self.id_obj.name}:{self.bone_name}"
+            return (
+                f"{self.id_obj.name}:"
+                f"{self.bone_name}"
+            )
+
         return self.id_obj.name
 
     @property
     def pose_bone(self):
-        return self.id_obj.pose.bones[self.bone_name]
+        return self.id_obj.pose.bones[
+            self.bone_name
+        ]
 
     @property
     def bone_data(self):
-        return self.id_obj.data.bones[self.bone_name]
+        return self.id_obj.data.bones[
+            self.bone_name
+        ]
 
     def target(self):
-        return self.pose_bone if self.kind == 'BONE' else self.id_obj
+        if self.kind == 'BONE':
+            return self.pose_bone
+
+        return self.id_obj
 
     def world_matrix(self):
         if self.kind == 'BONE':
-            return self.id_obj.matrix_world @ self.pose_bone.matrix
+            return (
+                self.id_obj.matrix_world
+                @ self.pose_bone.matrix
+            )
+
         return self.id_obj.matrix_world.copy()
 
     def rotation_mode(self):
@@ -134,45 +274,92 @@ class ChainItem:
 
     def data_path(self, prop):
         if self.kind == 'BONE':
-            return f'pose.bones["{self.bone_name}"].{prop}'
+            return (
+                f'pose.bones["{self.bone_name}"].'
+                f'{prop}'
+            )
+
         return prop
 
-    def read_rotation_euler(self, order='XYZ'):
+    def read_rotation_euler(
+            self,
+            order='XYZ'
+    ):
         target = self.target()
         mode = self.rotation_mode()
+
         if mode == 'QUATERNION':
-            return target.rotation_quaternion.to_euler(order)
+            return target.rotation_quaternion.to_euler(
+                order
+            )
+
         if mode == 'AXIS_ANGLE':
             aa = target.rotation_axis_angle
-            return Quaternion((aa[1], aa[2], aa[3]), aa[0]).to_euler(order)
-        return target.rotation_euler.copy()
+
+            return Quaternion(
+                (
+                    aa[1],
+                    aa[2],
+                    aa[3]
+                ),
+                aa[0]
+            ).to_euler(order)
+
+        result = target.rotation_euler.copy()
+
+        try:
+            result.order = order
+        except AttributeError:
+            pass
+
+        return result
 
     def read_location(self):
         return self.target().location.copy()
 
     def hierarchy_depth(self):
         depth = 0
+
         if self.kind == 'BONE':
             b = self.bone_data.parent
+
             while b is not None:
                 depth += 1
                 b = b.parent
+
         else:
             obj = self.id_obj.parent
+
             while obj is not None:
                 depth += 1
                 obj = obj.parent
+
         return depth
 
 
 def get_selected_chain(context):
-    if context.mode == 'POSE' and context.selected_pose_bones:
+    if (
+        context.mode == 'POSE'
+        and context.selected_pose_bones
+    ):
         armature_obj = context.object
+
         return [
-            ChainItem('BONE', armature_obj, b.name)
+            ChainItem(
+                'BONE',
+                armature_obj,
+                b.name
+            )
             for b in context.selected_pose_bones
         ]
-    return [ChainItem('OBJECT', obj) for obj in context.selected_objects]
+
+    return [
+        ChainItem(
+            'OBJECT',
+            obj
+        )
+        for obj in context.selected_objects
+    ]
 
 
 def expand_hierarchy(chain):
@@ -182,142 +369,421 @@ def expand_hierarchy(chain):
     def walk_object(obj):
         if obj.name in seen:
             return
+
         seen.add(obj.name)
-        result.append(ChainItem('OBJECT', obj))
-        for child in sorted(obj.children, key=lambda c: c.name):
+
+        result.append(
+            ChainItem(
+                'OBJECT',
+                obj
+            )
+        )
+
+        for child in sorted(
+            obj.children,
+            key=lambda c: c.name
+        ):
             walk_object(child)
 
-    def walk_bone(armature_obj, bone):
-        key = (armature_obj.name, bone.name)
+    def walk_bone(
+            armature_obj,
+            bone
+    ):
+        key = (
+            armature_obj.name,
+            bone.name
+        )
+
         if key in seen:
             return
+
         seen.add(key)
-        result.append(ChainItem('BONE', armature_obj, bone.name))
-        for child in sorted(bone.children, key=lambda c: c.name):
-            walk_bone(armature_obj, child)
+
+        result.append(
+            ChainItem(
+                'BONE',
+                armature_obj,
+                bone.name
+            )
+        )
+
+        for child in sorted(
+            bone.children,
+            key=lambda c: c.name
+        ):
+            walk_bone(
+                armature_obj,
+                child
+            )
 
     for item in chain:
         if item.kind == 'BONE':
-            walk_bone(item.id_obj, item.bone_data)
+            walk_bone(
+                item.id_obj,
+                item.bone_data
+            )
         else:
-            walk_object(item.id_obj)
+            walk_object(
+                item.id_obj
+            )
 
     return result
 
 
 def order_chain(chain):
-    return sorted(chain, key=lambda item: item.hierarchy_depth())
+    return sorted(
+        chain,
+        key=lambda item: item.hierarchy_depth()
+    )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # NLA support
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def remove_existing_overlap_tracks(id_obj):
     anim = id_obj.animation_data
+
     if anim is None:
         return
+
     for track in list(anim.nla_tracks):
-        if track.name in {"Overlapper_Base", "Overlapper_Overlap"}:
+        if track.name in {
+            "Overlapper_Base",
+            "Overlapper_Overlap"
+        }:
             anim.nla_tracks.remove(track)
 
 
-def push_base_action_to_nla(id_obj, frame_start):
-    if id_obj.animation_data is None:
-        id_obj.animation_data_create()
+def push_base_action_to_nla(
+        id_obj,
+        frame_start
+):
+    """
+    Preserve the source action in an NLA Base track.
 
-    anim = id_obj.animation_data
+    The source action keeps its original action frame range.
+    """
 
-    if anim.action is not None:
-        # Do not stack another Overlapper base layer on top of an earlier run.
-        old_base = anim.nla_tracks.get("Overlapper_Base")
-        if old_base is not None:
-            anim.nla_tracks.remove(old_base)
+    anim = ensure_animation_data(id_obj)
 
-        track = anim.nla_tracks.new()
-        track.name = "Overlapper_Base"
-        action = anim.action
-        strip = track.strips.new(action.name, int(frame_start), action)
-        strip.action_frame_start = action.frame_range[0]
-        strip.action_frame_end = action.frame_range[1]
-        anim.action = None
+    if anim.action is None:
+        return None
+
+    action = anim.action
+    slot = get_action_slot(anim)
+
+    source_start, source_end = map(
+        float,
+        action.frame_range
+    )
+
+    source_end = max(
+        source_end,
+        source_start + 1.0
+    )
+
+    # Remove stale base track.
+    old_base = anim.nla_tracks.get(
+        "Overlapper_Base"
+    )
+
+    if old_base is not None:
+        anim.nla_tracks.remove(
+            old_base
+        )
+
+    track = anim.nla_tracks.new()
+    track.name = "Overlapper_Base"
+
+    strip = track.strips.new(
+        action.name,
+        math.floor(source_start),
+        action
+    )
+
+    assign_strip_action_slot(
+        strip,
+        slot
+    )
+
+    strip.action_frame_start = source_start
+    strip.action_frame_end = source_end
+
+    strip.repeat = 1.0
+    strip.scale = 1.0
+
+    strip.frame_start = source_start
+    strip.frame_end = source_end
+
+    # Preserve normal source-action behavior.
+    try:
+        strip.blend_type = anim.action_blend_type
+    except (AttributeError, TypeError, RuntimeError):
+        strip.blend_type = 'REPLACE'
+
+    try:
+        strip.influence = anim.action_influence
+    except (AttributeError, TypeError, RuntimeError):
+        strip.influence = 1.0
+
+    try:
+        strip.extrapolation = anim.action_extrapolation
+    except (AttributeError, TypeError, RuntimeError):
+        strip.extrapolation = 'NOTHING'
+
+    try:
+        strip.use_auto_blend = False
+    except AttributeError:
+        pass
+
+    try:
+        strip.blend_in = 0.0
+        strip.blend_out = 0.0
+    except AttributeError:
+        pass
+
+    # Prevent the source action from also being evaluated
+    # as the active action.
+    anim.action = None
+
+    return strip
 
 
-def add_overlap_nla_layer(id_obj, action, frame_start):
-    anim = id_obj.animation_data
-    # Remove a stale overlap layer before creating a new one.
-    old = anim.nla_tracks.get("Overlapper_Overlap")
-    if old is not None:
-        anim.nla_tracks.remove(old)
+def add_overlap_nla_layer(
+        id_obj,
+        action,
+        frame_start,
+        action_slot=None
+):
+    """
+    The generated action contains FINAL LOCAL TRANSFORM VALUES.
+
+    Therefore the NLA strip must REPLACE those channels.
+
+    This avoids:
+        - quaternion component addition
+        - Euler offset ambiguity
+        - double evaluation
+        - additive quaternion corruption
+    """
+
+    anim = ensure_animation_data(id_obj)
+
+    old_track = anim.nla_tracks.get(
+        "Overlapper_Overlap"
+    )
+
+    if old_track is not None:
+        anim.nla_tracks.remove(
+            old_track
+        )
+
+    source_start, source_end = map(
+        float,
+        action.frame_range
+    )
+
+    source_end = max(
+        source_end,
+        source_start + 1.0
+    )
 
     track = anim.nla_tracks.new()
     track.name = "Overlapper_Overlap"
-    strip = track.strips.new(action.name, int(frame_start), action)
-    strip.blend_type = 'ADD'
-    strip.extrapolation = 'NOTHING'
+
+    strip = track.strips.new(
+        action.name,
+        math.floor(source_start),
+        action
+    )
+
     strip.name = "Overlap"
+
+    assign_strip_action_slot(
+        strip,
+        action_slot
+    )
+
+    strip.action_frame_start = source_start
+    strip.action_frame_end = source_end
+
+    strip.repeat = 1.0
+    strip.scale = 1.0
+
+    strip.frame_start = source_start
+    strip.frame_end = source_end
+
+    # CRITICAL:
+    # The generated action already contains final local transforms.
+    strip.blend_type = 'REPLACE'
+    strip.influence = 1.0
+    strip.extrapolation = 'NOTHING'
+
+    try:
+        strip.use_auto_blend = False
+    except AttributeError:
+        pass
+
+    try:
+        strip.blend_in = 0.0
+        strip.blend_out = 0.0
+    except AttributeError:
+        pass
+
+    anim.action = None
+
+    return strip
 
 
 def restore_nla(id_obj):
+    """
+    Restore the original action from Overlapper_Base.
+
+    If there was no original action, the generated layer is
+    simply removed.
+    """
+
     anim = id_obj.animation_data
+
     if anim is None:
         return False
 
-    base_track = anim.nla_tracks.get("Overlapper_Base")
-    if base_track is None or not base_track.strips:
+    base_track = anim.nla_tracks.get(
+        "Overlapper_Base"
+    )
+
+    overlap_track = anim.nla_tracks.get(
+        "Overlapper_Overlap"
+    )
+
+    if (
+        base_track is None
+        and overlap_track is None
+    ):
         return False
 
-    base_action = base_track.strips[0].action
-    anim.action = base_action
+    base_action = None
+    base_slot = None
 
-    overlap_track = anim.nla_tracks.get("Overlapper_Overlap")
+    if (
+        base_track is not None
+        and base_track.strips
+    ):
+        base_strip = base_track.strips[0]
+
+        base_action = base_strip.action
+        base_slot = get_strip_action_slot(
+            base_strip
+        )
+
+    if base_action is not None:
+        anim.action = base_action
+
+        assign_action_slot(
+            anim,
+            base_slot
+        )
+
     if overlap_track is not None:
-        anim.nla_tracks.remove(overlap_track)
+        anim.nla_tracks.remove(
+            overlap_track
+        )
 
-    anim.nla_tracks.remove(base_track)
+    if base_track is not None:
+        anim.nla_tracks.remove(
+            base_track
+        )
+
     return True
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Direct-bake backup / restore
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-def backup_fcurve(id_obj, fc):
-    store = _BACKUP_STORE.setdefault(id_obj.name, {})
-    fid = (fc.data_path, fc.array_index)
+def backup_fcurve(
+        id_obj,
+        fc
+):
+    store = _BACKUP_STORE.setdefault(
+        id_obj.name,
+        {}
+    )
+
+    fid = (
+        fc.data_path,
+        fc.array_index
+    )
+
     if fid in store:
         return
+
     store[fid] = [
-        (kp.co[0], kp.co[1], kp.interpolation)
+        (
+            kp.co[0],
+            kp.co[1],
+            kp.interpolation
+        )
         for kp in fc.keyframe_points
     ]
 
 
-def backup_channel_if_needed(id_obj, action, data_path, index):
-    # get_fcurve works identically on 4.x and 5.x (it's the same call used
-    # to write later), so snapshotting through it - rather than through a
-    # separate "find without create" - can't silently miss existing keys.
-    # A channel that's genuinely new just yields an empty snapshot, which
-    # restore_fcurve already treats correctly as "nothing to put back".
-    fc = get_fcurve(id_obj, action, data_path, index)
-    backup_fcurve(id_obj, fc)
+def backup_channel_if_needed(
+        id_obj,
+        action,
+        data_path,
+        index
+):
+    fc = get_fcurve(
+        id_obj,
+        action,
+        data_path,
+        index
+    )
+
+    backup_fcurve(
+        id_obj,
+        fc
+    )
 
 
-def restore_fcurve(id_obj, action, data_path, index, points):
-    fc = get_fcurve(id_obj, action, data_path, index)
+def restore_fcurve(
+        id_obj,
+        action,
+        data_path,
+        index,
+        points
+):
+    fc = get_fcurve(
+        id_obj,
+        action,
+        data_path,
+        index
+    )
 
     if not points:
-        # Channel didn't exist before Overlapper touched it - drop it.
         try:
-            action.fcurves.remove(fc)
-        except (AttributeError, RuntimeError):
+            action.fcurves.remove(
+                fc
+            )
+        except (
+            AttributeError,
+            RuntimeError
+        ):
             pass
+
         return
 
     fc.keyframe_points.clear()
 
     for frame, value, interp in points:
-        kp = fc.keyframe_points.insert(frame, value, options={'FAST'})
+        kp = fc.keyframe_points.insert(
+            frame,
+            value,
+            options={'FAST'}
+        )
+
         kp.interpolation = interp
 
     fc.update()
@@ -326,37 +792,83 @@ def restore_fcurve(id_obj, action, data_path, index, points):
 def restore_all_backups(context):
     restored = set()
 
+    # Restore NLA-based animations first.
     for obj in bpy.data.objects:
         if restore_nla(obj):
-            restored.add(obj.name)
+            restored.add(
+                obj.name
+            )
 
-    for obj_name, curves in list(_BACKUP_STORE.items()):
-        id_obj = bpy.data.objects.get(obj_name)
+    # Restore direct-baked curves.
+    for obj_name, curves in list(
+        _BACKUP_STORE.items()
+    ):
+        id_obj = bpy.data.objects.get(
+            obj_name
+        )
+
         if id_obj is None:
             continue
 
-        action = ensure_action(id_obj)
+        action = ensure_action(
+            id_obj
+        )
 
-        for (data_path, index), points in curves.items():
-            restore_fcurve(id_obj, action, data_path, index, points)
+        for (
+            data_path,
+            index
+        ), points in curves.items():
 
-        restored.add(obj_name)
+            restore_fcurve(
+                id_obj,
+                action,
+                data_path,
+                index,
+                points
+            )
+
+        restored.add(
+            obj_name
+        )
 
     _BACKUP_STORE.clear()
-    context.scene.frame_set(context.scene.frame_current)
+
+    context.scene.frame_set(
+        context.scene.frame_current
+    )
+
     return len(restored)
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Curve evaluation
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-def evaluate_curves(loc_fcurves, rot_fcurves, frame,
-                    frame_start, frame_end, cyclic, cycle_len):
+def evaluate_curves(
+        loc_fcurves,
+        rot_fcurves,
+        frame,
+        frame_start,
+        frame_end,
+        cyclic,
+        cycle_len
+):
     if cyclic and cycle_len > 0:
-        frame = frame_start + ((frame - frame_start) % cycle_len)
+        frame = (
+            frame_start
+            + (
+                (frame - frame_start)
+                % cycle_len
+            )
+        )
     else:
-        frame = max(frame_start, min(frame_end, frame))
+        frame = max(
+            frame_start,
+            min(
+                frame_end,
+                frame
+            )
+        )
 
     loc = Vector((
         loc_fcurves[0].evaluate(frame),
@@ -374,253 +886,760 @@ def evaluate_curves(loc_fcurves, rot_fcurves, frame,
     if quat.magnitude > 1e-8:
         quat.normalize()
     else:
-        quat = Quaternion((1, 0, 0, 0))
+        quat = Quaternion(
+            (1, 0, 0, 0)
+        )
 
     return loc, quat
 
 
-def wind_offset(frame, speed, seed):
-    phase = (seed * 12.9898) % (2 * math.pi)
-    t = frame * 0.15 * max(speed, 0.0001) + phase
+def wind_offset(
+        frame,
+        speed,
+        seed
+):
+    phase = (
+        seed * 12.9898
+    ) % (
+        2 * math.pi
+    )
 
-    y = math.sin(t) + 0.5 * math.sin(t * 2.13 + 1.0)
-    z = math.cos(t * 0.87 + 1.3) + 0.5 * math.cos(t * 1.9 + 0.4)
+    t = (
+        frame
+        * 0.15
+        * max(
+            speed,
+            0.0001
+        )
+        + phase
+    )
+
+    y = (
+        math.sin(t)
+        + 0.5
+        * math.sin(
+            t * 2.13 + 1.0
+        )
+    )
+
+    z = (
+        math.cos(
+            t * 0.87 + 1.3
+        )
+        + 0.5
+        * math.cos(
+            t * 1.9 + 0.4
+        )
+    )
 
     return y, z
 
 
-def simplify_fcurves(fcurves, tolerance=0.0001):
+def simplify_fcurves(
+        fcurves,
+        tolerance=0.0001
+):
     for fc in fcurves:
         pts = fc.keyframe_points
+
         if len(pts) < 3:
             continue
 
         to_remove = []
 
-        for idx in range(1, len(pts) - 1):
-            prev_v = pts[idx - 1].co[1]
-            cur_v = pts[idx].co[1]
-            next_v = pts[idx + 1].co[1]
+        for idx in range(
+            1,
+            len(pts) - 1
+        ):
+            prev_v = pts[
+                idx - 1
+            ].co[1]
+
+            cur_v = pts[
+                idx
+            ].co[1]
+
+            next_v = pts[
+                idx + 1
+            ].co[1]
 
             if (
-                abs(cur_v - prev_v) < tolerance
-                and abs(cur_v - next_v) < tolerance
+                abs(
+                    cur_v - prev_v
+                ) < tolerance
+                and
+                abs(
+                    cur_v - next_v
+                ) < tolerance
             ):
-                to_remove.append(idx)
+                to_remove.append(
+                    idx
+                )
 
-        for idx in reversed(to_remove):
-            pts.remove(pts[idx])
+        for idx in reversed(
+            to_remove
+        ):
+            pts.remove(
+                pts[idx]
+            )
 
         fc.update()
 
 
-def add_to_selection_set(chain):
-    object_items = [it for it in chain if it.kind == 'OBJECT']
-    bone_items = [it for it in chain if it.kind == 'BONE']
+def add_to_selection_set(
+        chain
+):
+    object_items = [
+        it
+        for it in chain
+        if it.kind == 'OBJECT'
+    ]
+
+    bone_items = [
+        it
+        for it in chain
+        if it.kind == 'BONE'
+    ]
 
     if object_items:
-        coll = get_or_create_collection(RESULT_COLLECTION_NAME)
+        coll = get_or_create_collection(
+            RESULT_COLLECTION_NAME
+        )
 
         for it in object_items:
             if it.id_obj.name not in coll.objects:
-                coll.objects.link(it.id_obj)
+                coll.objects.link(
+                    it.id_obj
+                )
 
     if bone_items:
         by_armature = {}
 
         for it in bone_items:
-            by_armature.setdefault(it.id_obj, []).append(it.bone_name)
+            by_armature.setdefault(
+                it.id_obj,
+                []
+            ).append(
+                it.bone_name
+            )
 
-        for armature_obj, bone_names in by_armature.items():
+        for (
+            armature_obj,
+            bone_names
+        ) in by_armature.items():
+
             try:
                 arm_data = armature_obj.data
-                bcoll = arm_data.collections.get(RESULT_COLLECTION_NAME)
+
+                bcoll = arm_data.collections.get(
+                    RESULT_COLLECTION_NAME
+                )
 
                 if bcoll is None:
-                    bcoll = arm_data.collections.new(RESULT_COLLECTION_NAME)
+                    bcoll = arm_data.collections.new(
+                        RESULT_COLLECTION_NAME
+                    )
 
                 for bname in bone_names:
-                    bone = arm_data.bones.get(bname)
+                    bone = arm_data.bones.get(
+                        bname
+                    )
+
                     if bone is not None:
-                        bcoll.assign(bone)
+                        bcoll.assign(
+                            bone
+                        )
+
             except AttributeError:
                 pass
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Rotation helpers
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def get_rotation_settings(item):
     mode = item.rotation_mode()
 
     if mode == 'QUATERNION':
-        return "rotation_quaternion", 4, 'XYZ'
+        return (
+            "rotation_quaternion",
+            4,
+            'XYZ'
+        )
 
     if mode == 'AXIS_ANGLE':
-        return "rotation_axis_angle", 4, 'XYZ'
+        return (
+            "rotation_axis_angle",
+            4,
+            'XYZ'
+        )
 
-    order = mode if mode in VALID_EULER_ORDERS else 'XYZ'
-    return "rotation_euler", 3, order
+    order = (
+        mode
+        if mode in VALID_EULER_ORDERS
+        else 'XYZ'
+    )
+
+    return (
+        "rotation_euler",
+        3,
+        order
+    )
 
 
-def rotation_delta_to_euler(delta_local, euler_order):
-    return delta_local.to_euler(euler_order)
+def rotation_delta_to_euler(
+        delta_local,
+        euler_order
+):
+    return delta_local.to_euler(
+        euler_order
+    )
 
 
-def clamp_euler_delta(delta, max_degrees):
+def clamp_euler_delta(
+        delta,
+        max_degrees
+):
     if max_degrees <= 0:
         return delta
 
-    maximum = math.radians(max_degrees)
+    maximum = math.radians(
+        max_degrees
+    )
 
-    return Euler((
-        clamp(delta.x, -maximum, maximum),
-        clamp(delta.y, -maximum, maximum),
-        clamp(delta.z, -maximum, maximum),
-    ), delta.order)
+    return Euler(
+        (
+            clamp(
+                delta.x,
+                -maximum,
+                maximum
+            ),
+            clamp(
+                delta.y,
+                -maximum,
+                maximum
+            ),
+            clamp(
+                delta.z,
+                -maximum,
+                maximum
+            ),
+        ),
+        delta.order
+    )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Translation-space helper
+# ============================================================================
+
+def world_to_location_basis(
+        item,
+        world_matrix
+):
+    """
+    Convert a WORLD-space displacement into the local
+    location-channel basis.
+
+    Object:
+        world_delta =
+            parent_world @ matrix_parent_inverse
+            @ local_delta
+
+    Bone:
+        Blender's convert_space() is used so the displacement
+        follows the bone's local transform space.
+    """
+
+    # ------------------------------------------------------------
+    # OBJECT
+    # ------------------------------------------------------------
+
+    if item.kind == 'OBJECT':
+        obj = item.id_obj
+
+        if obj.parent is None:
+            return Matrix.Identity(3)
+
+        try:
+            parent_basis = (
+                obj.parent.matrix_world
+                @ obj.matrix_parent_inverse
+            )
+
+            basis = parent_basis.to_3x3()
+
+            if abs(basis.determinant()) < 1e-10:
+                return Matrix.Identity(3)
+
+            return basis.inverted()
+
+        except (
+            AttributeError,
+            ValueError,
+            ZeroDivisionError
+        ):
+            return Matrix.Identity(3)
+
+    # ------------------------------------------------------------
+    # BONE
+    # ------------------------------------------------------------
+
+    armature = item.id_obj
+    pose_bone = item.pose_bone
+
+    try:
+        local_matrix = armature.convert_space(
+            pose_bone=pose_bone,
+            matrix=world_matrix,
+            from_space='WORLD',
+            to_space='LOCAL'
+        )
+
+        origin = local_matrix.translation
+
+        columns = []
+
+        for axis in (
+            Vector((1.0, 0.0, 0.0)),
+            Vector((0.0, 1.0, 0.0)),
+            Vector((0.0, 0.0, 1.0))
+        ):
+            shifted_world = world_matrix.copy()
+
+            shifted_world.translation = (
+                world_matrix.translation
+                + axis
+            )
+
+            shifted_local = armature.convert_space(
+                pose_bone=pose_bone,
+                matrix=shifted_world,
+                from_space='WORLD',
+                to_space='LOCAL'
+            )
+
+            columns.append(
+                shifted_local.translation
+                - origin
+            )
+
+        basis = Matrix(
+            columns
+        ).transposed()
+
+        if abs(basis.determinant()) < 1e-10:
+            return Matrix.Identity(3)
+
+        return basis
+
+    except (
+        AttributeError,
+        ValueError,
+        RuntimeError,
+        ZeroDivisionError
+    ):
+        return Matrix.Identity(3)
+
+
+# ============================================================================
 # Core algorithm
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-def run_overlapper(context, props):
+def run_overlapper(
+        context,
+        props
+):
     scene = context.scene
-    chain = get_selected_chain(context)
+
+    chain = get_selected_chain(
+        context
+    )
 
     if props.hierarchy_mode:
-        chain = expand_hierarchy(chain)
+        chain = expand_hierarchy(
+            chain
+        )
 
-    chain = order_chain(chain)
+    chain = order_chain(
+        chain
+    )
 
     if len(chain) < 2:
-        return False, "Select at least two controls (objects, or pose bones in Pose Mode)."
+        return (
+            False,
+            "Select at least two controls "
+            "(objects, or pose bones in Pose Mode)."
+        )
 
-    frame_start, frame_end = get_frame_range(context)
-    frame_start = int(frame_start)
-    frame_end = int(frame_end)
+    frame_start, frame_end = get_frame_range(
+        context
+    )
+
+    frame_start = int(
+        frame_start
+    )
+
+    frame_end = int(
+        frame_end
+    )
 
     if frame_end <= frame_start:
-        return False, "Invalid frame range."
+        return (
+            False,
+            "Invalid frame range."
+        )
 
-    cycle_len = frame_end - frame_start
+    cycle_len = (
+        frame_end
+        - frame_start
+    )
+
     cyclic = props.cycle_mode
 
-    start_index = 1 if props.dont_use_first else 0
+    start_index = (
+        1
+        if props.dont_use_first
+        else 0
+    )
 
-    if len(chain) - start_index < 1:
-        return False, "Not enough controls after 'Don't use first controls'."
+    if (
+        len(chain)
+        - start_index
+        < 1
+    ):
+        return (
+            False,
+            "Not enough controls after "
+            "'Don't use first controls'."
+        )
 
-    original_frame = scene.frame_current
+    original_frame = (
+        scene.frame_current
+    )
 
-    # A fresh run gets a fresh direct-bake backup.
+    original_subframe = (
+        scene.frame_subframe
+    )
+
+    # ========================================================================
+    # Validate affected objects BEFORE changing animation.
+    # ========================================================================
+
+    affected_ids = {
+        item.id_obj.name: item.id_obj
+        for item in chain[start_index:]
+    }
+
+    for id_obj in affected_ids.values():
+
+        # Prevent repeated direct-bake overwriting.
+        if (
+            not props.bake_new_layer
+            and id_obj.name in _BACKUP_STORE
+        ):
+            return (
+                False,
+                "Restore the previous direct bake "
+                "before running Overlapper again."
+            )
+
+        anim = id_obj.animation_data
+
+        if anim is None:
+            continue
+
+        if getattr(
+            anim,
+            "use_tweak_mode",
+            False
+        ):
+            return (
+                False,
+                "Exit NLA Tweak Mode before "
+                "running Overlapper."
+            )
+
+        if props.bake_new_layer:
+
+            if not getattr(
+                anim,
+                "use_nla",
+                True
+            ):
+                return (
+                    False,
+                    "Enable NLA evaluation before "
+                    "baking an overlap layer."
+                )
+
+            if any(
+                track.is_solo
+                for track in anim.nla_tracks
+            ):
+                return (
+                    False,
+                    "Disable NLA Solo tracks before "
+                    "baking an overlap layer."
+                )
+
+    # ========================================================================
+    # CRITICAL:
+    #
+    # If an Overlapper layer already exists, restore its base BEFORE
+    # sampling the source animation.
+    #
+    # This prevents the previous overlap from becoming the input for the
+    # next overlap.
+    # ========================================================================
+
+    for id_obj in affected_ids.values():
+        restore_nla(
+            id_obj
+        )
+
+    # ========================================================================
+    # Fresh direct-bake backup.
+    # ========================================================================
+
     if not props.bake_new_layer:
         _BACKUP_STORE.clear()
 
-    helper_coll = get_or_create_collection(HELPER_COLLECTION_NAME)
+    helper_coll = get_or_create_collection(
+        HELPER_COLLECTION_NAME
+    )
 
-    # -----------------------------------------------------------------------
+    # ========================================================================
     # STEP 1 - Bake exact world-space followers.
-    # -----------------------------------------------------------------------
+    # ========================================================================
 
     follower_curves = []
 
     for i, item in enumerate(chain):
+
         empty = create_empty(
-            f"{HELPER_PREFIX}{i:02d}_{item.name}",
+            (
+                f"{HELPER_PREFIX}"
+                f"{i:02d}_"
+                f"{item.name}"
+            ),
             helper_coll
         )
 
-        action = ensure_action(empty)
+        action = ensure_action(
+            empty
+        )
 
         loc_fcs = [
-            get_fcurve(empty, action, "location", c)
+            get_fcurve(
+                empty,
+                action,
+                "location",
+                c
+            )
             for c in range(3)
         ]
 
         rot_fcs = [
-            get_fcurve(empty, action, "rotation_quaternion", c)
+            get_fcurve(
+                empty,
+                action,
+                "rotation_quaternion",
+                c
+            )
             for c in range(4)
         ]
 
-        follower_curves.append((loc_fcs, rot_fcs))
+        follower_curves.append(
+            (
+                loc_fcs,
+                rot_fcs
+            )
+        )
 
-    # Baselines are required for direct bake.
-    need_baseline = not props.bake_new_layer
+    # ========================================================================
+    # Baselines.
+    #
+    # BOTH NLA and direct bake require the ORIGINAL local transforms.
+    # ========================================================================
 
-    baseline_rot = (
-        {i: [] for i in range(start_index, len(chain))}
-        if need_baseline else None
-    )
+    need_baseline = True
+
+    baseline_rot = {
+        i: []
+        for i in range(
+            start_index,
+            len(chain)
+        )
+    }
 
     baseline_loc = (
-        {i: [] for i in range(start_index, len(chain))}
-        if (need_baseline and props.add_translate) else None
+        {
+            i: []
+            for i in range(
+                start_index,
+                len(chain)
+            )
+        }
+        if props.add_translate
+        else None
+    )
+
+    translation_bases = (
+        {
+            i: []
+            for i in range(
+                start_index,
+                len(chain)
+            )
+        }
+        if props.add_translate
+        else None
     )
 
     spacing_samples = []
 
+    previous_sample_quats = [
+        None
+        for _ in chain
+    ]
+
+    # ========================================================================
     # One scene evaluation pass.
-    for f in range(frame_start, frame_end + 1):
-        scene.frame_set(f)
+    # ========================================================================
+
+    for f in range(
+        frame_start,
+        frame_end + 1
+    ):
+        scene.frame_set(
+            f
+        )
 
         prev_loc = None
 
         for i, item in enumerate(chain):
-            mat = item.world_matrix()
-            loc, quat, _scale = mat.decompose()
 
-            loc_fcs, rot_fcs = follower_curves[i]
+            matrix = item.world_matrix()
+
+            loc, quat, _scale = (
+                matrix.decompose()
+            )
+
+            # ------------------------------------------------------------
+            # Quaternion hemisphere correction.
+            #
+            # q and -q represent the same rotation, but interpolation
+            # between them is different.
+            # ------------------------------------------------------------
+
+            previous_quat = (
+                previous_sample_quats[i]
+            )
+
+            if previous_quat is not None:
+                quat.make_compatible(
+                    previous_quat
+                )
+
+            previous_sample_quats[i] = (
+                quat.copy()
+            )
+
+            loc_fcs, rot_fcs = (
+                follower_curves[i]
+            )
 
             for c in range(3):
                 loc_fcs[c].keyframe_points.insert(
-                    f, loc[c], options={'FAST'}
+                    f,
+                    loc[c],
+                    options={'FAST'}
                 )
 
             for c in range(4):
                 rot_fcs[c].keyframe_points.insert(
-                    f, quat[c], options={'FAST'}
+                    f,
+                    quat[c],
+                    options={'FAST'}
                 )
 
             if prev_loc is not None:
-                spacing_samples.append((loc - prev_loc).length)
+                spacing_samples.append(
+                    (
+                        loc
+                        - prev_loc
+                    ).length
+                )
 
             prev_loc = loc
 
-            if need_baseline and i >= start_index:
+            # ------------------------------------------------------------
+            # Original local baseline.
+            # ------------------------------------------------------------
+
+            if i >= start_index:
+
                 order = item.rotation_mode()
-                order = (
-                    order
-                    if order in VALID_EULER_ORDERS
-                    else 'XYZ'
-                )
+
+                if order not in VALID_EULER_ORDERS:
+                    order = 'XYZ'
 
                 baseline_rot[i].append(
-                    item.read_rotation_euler(order)
+                    item.read_rotation_euler(
+                        order
+                    )
                 )
 
-                if baseline_loc is not None:
+                if (
+                    baseline_loc is not None
+                ):
                     baseline_loc[i].append(
                         item.read_location()
                     )
 
-    for loc_fcs, rot_fcs in follower_curves:
-        for fc in loc_fcs + rot_fcs:
+                    translation_bases[i].append(
+                        world_to_location_basis(
+                            item,
+                            matrix
+                        )
+                    )
+
+    # ========================================================================
+    # Linear helper curves.
+    # ========================================================================
+
+    for (
+        loc_fcs,
+        rot_fcs
+    ) in follower_curves:
+
+        for fc in (
+            loc_fcs
+            + rot_fcs
+        ):
             for kp in fc.keyframe_points:
                 kp.interpolation = 'LINEAR'
+
             fc.update()
 
-    scene.frame_set(original_frame)
+    scene.frame_set(
+        original_frame,
+        subframe=original_subframe
+    )
 
-    # -----------------------------------------------------------------------
+    # ========================================================================
     # STEP 2 - Bind directions.
-    # -----------------------------------------------------------------------
+    # ========================================================================
 
     bind_pos = []
     bind_quat = []
 
-    for i in range(len(chain)):
+    for i in range(
+        len(chain)
+    ):
+
         p, q = evaluate_curves(
             *follower_curves[i],
             frame_start,
@@ -629,45 +1648,89 @@ def run_overlapper(context, props):
             False,
             0
         )
+
         bind_pos.append(p)
         bind_quat.append(q)
 
     bind_local_dir = []
 
-    for i in range(len(chain)):
+    for i in range(
+        len(chain)
+    ):
+
         if i < len(chain) - 1:
-            world_dir = bind_pos[i + 1] - bind_pos[i]
+
+            world_dir = (
+                bind_pos[i + 1]
+                - bind_pos[i]
+            )
+
         elif i > 0:
-            world_dir = bind_pos[i] - bind_pos[i - 1]
+
+            world_dir = (
+                bind_pos[i]
+                - bind_pos[i - 1]
+            )
+
         else:
-            world_dir = Vector((1.0, 0.0, 0.0))
 
-        world_dir = safe_normalized(world_dir)
+            world_dir = Vector(
+                (1.0, 0.0, 0.0)
+            )
 
-        local_dir = bind_quat[i].inverted() @ world_dir
-        bind_local_dir.append(safe_normalized(local_dir))
+        world_dir = safe_normalized(
+            world_dir
+        )
 
-    # -----------------------------------------------------------------------
+        local_dir = (
+            bind_quat[i].inverted()
+            @ world_dir
+        )
+
+        bind_local_dir.append(
+            safe_normalized(
+                local_dir
+            )
+        )
+
+    # ========================================================================
     # STEP 3 - Scale / spacing.
-    # -----------------------------------------------------------------------
+    # ========================================================================
 
-    intensity = max(props.scale, 0.0001)
+    intensity = max(
+        props.scale,
+        0.0001
+    )
 
-    if props.adaptive_scale and spacing_samples:
-        avg_spacing = sum(spacing_samples) / len(spacing_samples)
+    if (
+        props.adaptive_scale
+        and spacing_samples
+    ):
+        avg_spacing = (
+            sum(spacing_samples)
+            / len(spacing_samples)
+        )
+
     else:
         avg_spacing = 1.0
 
-    whisker_length = max(avg_spacing, 0.0001) / intensity
+    whisker_length = max(
+        avg_spacing,
+        0.0001
+    ) / intensity
 
-    # -----------------------------------------------------------------------
+    # ========================================================================
     # STEP 4 - Build groups.
-    # -----------------------------------------------------------------------
+    # ========================================================================
 
     groups = {}
     order = []
 
-    for i in range(start_index, len(chain)):
+    for i in range(
+        start_index,
+        len(chain)
+    ):
+
         item = chain[i]
         key = item.id_obj.name
 
@@ -675,51 +1738,116 @@ def run_overlapper(context, props):
             groups[key] = []
             order.append(key)
 
-        groups[key].append(i)
+        groups[key].append(
+            i
+        )
 
-    # -----------------------------------------------------------------------
+    # ========================================================================
     # STEP 5 - Bake overlap.
-    # -----------------------------------------------------------------------
+    # ========================================================================
 
     for key in order:
+
         entries = groups[key]
-        id_obj = chain[entries[0]].id_obj
+
+        id_obj = chain[
+            entries[0]
+        ].id_obj
+
+        # ====================================================================
+        # NLA MODE
+        # ====================================================================
 
         if props.bake_new_layer:
-            # If the previous generated layer exists, restore its base first.
-            restore_nla(id_obj)
 
-            push_base_action_to_nla(id_obj, frame_start)
+            # ------------------------------------------------------------
+            # Source animation should already have been restored above.
+            # ------------------------------------------------------------
 
-            target_action = bpy.data.actions.new(
-                name=f"{id_obj.name}_Overlap"
+            base_strip = push_base_action_to_nla(
+                id_obj,
+                frame_start
             )
 
-            id_obj.animation_data.action = target_action
-            additive_only = True
+            target_action = bpy.data.actions.new(
+                name=(
+                    f"{id_obj.name}"
+                    f"_Overlap"
+                )
+            )
 
-        else:
-            target_action = ensure_action(id_obj)
+            # Assign generated action as active action while creating
+            # its f-curves.
+            anim = ensure_animation_data(
+                id_obj
+            )
+
+            anim.action = target_action
+
+            action_slot = get_action_slot(
+                anim
+            )
+
             additive_only = False
 
+        # ====================================================================
+        # DIRECT BAKE MODE
+        # ====================================================================
+
+        else:
+
+            target_action = ensure_action(
+                id_obj
+            )
+
+            action_slot = None
+
+            additive_only = False
+
+        # ====================================================================
+        # Per-control bake.
+        # ====================================================================
+
         for i in entries:
+
             item = chain[i]
-            follower_curve = follower_curves[i]
-            local_dir = bind_local_dir[i]
 
-            rot_prop, rot_channels, euler_order = get_rotation_settings(item)
+            follower_curve = (
+                follower_curves[i]
+            )
 
-            rot_path = item.data_path(rot_prop)
+            local_dir = (
+                bind_local_dir[i]
+            )
 
-            # For direct baking, explicitly back up the channels before
-            # creating/overwriting them.
+            rot_prop, rot_channels, euler_order = (
+                get_rotation_settings(
+                    item
+                )
+            )
+
+            rot_path = item.data_path(
+                rot_prop
+            )
+
+            # ------------------------------------------------------------
+            # Rotation curves.
+            # ------------------------------------------------------------
+
             rot_fcurves = []
 
-            for c in range(rot_channels):
+            for c in range(
+                rot_channels
+            ):
+
                 if not additive_only:
                     backup_channel_if_needed(
-                        id_obj, target_action, rot_path, c
+                        id_obj,
+                        target_action,
+                        rot_path,
+                        c
                     )
+
                 rot_fcurves.append(
                     get_fcurve(
                         id_obj,
@@ -729,17 +1857,28 @@ def run_overlapper(context, props):
                     )
                 )
 
+            # ------------------------------------------------------------
+            # Translation curves.
+            # ------------------------------------------------------------
+
             loc_fcurves = None
 
             if props.add_translate:
+
                 loc_fcurves = []
 
+                path = item.data_path(
+                    "location"
+                )
+
                 for c in range(3):
-                    path = item.data_path("location")
 
                     if not additive_only:
                         backup_channel_if_needed(
-                            id_obj, target_action, path, c
+                            id_obj,
+                            target_action,
+                            path,
+                            c
                         )
 
                     loc_fcurves.append(
@@ -751,96 +1890,194 @@ def run_overlapper(context, props):
                         )
                     )
 
-            # ----------------------------------------------------------------
-            # Per-link delay.
-            #
-            # softness remains the original base delay.
-            # delay_falloff=0 -> same delay on every link.
-            # delay_falloff=1 -> linearly increasing delay to the tip.
-            # tip_delay_multiplier > 1 can exaggerate the tip.
-            # ----------------------------------------------------------------
+            # =================================================================
+            # Delay.
+            # =================================================================
 
-            chain_span = max(1, len(chain) - 1)
+            chain_span = max(
+                1,
+                len(chain) - 1
+            )
 
-            normalized_link = i / chain_span
+            normalized_link = (
+                i / chain_span
+            )
 
             delay = (
-                max(props.softness, 0.0)
+                max(
+                    props.softness,
+                    0.0
+                )
                 * (
                     1.0
-                    + props.delay_falloff * normalized_link
+                    + props.delay_falloff
+                    * normalized_link
                 )
             )
 
-            if props.tip_delay_multiplier > 0:
-                tip_weight = normalized_link ** max(
+            # Tip delay.
+            tip_weight = (
+                normalized_link
+                ** max(
                     props.tip_falloff_power,
                     0.01
                 )
-                delay *= (
-                    1.0
-                    + (props.tip_delay_multiplier - 1.0)
-                    * tip_weight
+            )
+
+            delay *= (
+                1.0
+                + (
+                    props.tip_delay_multiplier
+                    - 1.0
                 )
+                * tip_weight
+            )
 
-            delay = max(delay, 0.0)
+            delay = max(
+                delay,
+                0.0
+            )
 
-            # Rotation/translation strength can be weighted toward the tip.
-            falloff_power = max(props.falloff_power, 0.01)
+            # =================================================================
+            # Root-to-tip strength.
+            # =================================================================
 
-            if props.root_strength == props.tip_strength:
-                link_strength = props.root_strength
-            else:
-                t = normalized_link ** falloff_power
+            falloff_power = max(
+                props.falloff_power,
+                0.01
+            )
+
+            if (
+                props.root_strength
+                == props.tip_strength
+            ):
                 link_strength = (
                     props.root_strength
-                    + (props.tip_strength - props.root_strength) * t
                 )
 
-            seed = (i + 1) * 7.13
+            else:
+
+                t = (
+                    normalized_link
+                    ** falloff_power
+                )
+
+                link_strength = (
+                    props.root_strength
+                    + (
+                        props.tip_strength
+                        - props.root_strength
+                    )
+                    * t
+                )
+
+            seed = (
+                (i + 1)
+                * 7.13
+            )
+
+            # =================================================================
+            # Previous output quaternion/euler.
+            # =================================================================
+
+            previous_output_quat = None
+            previous_output_euler = None
+
+            # =================================================================
+            # Frame bake.
+            # =================================================================
 
             for f_index, f in enumerate(
-                range(frame_start, frame_end + 1)
+                range(
+                    frame_start,
+                    frame_end + 1
+                )
             ):
-                own_pos, own_quat = evaluate_curves(
-                    *follower_curve,
-                    f,
-                    frame_start,
-                    frame_end,
-                    cyclic,
-                    cycle_len
+
+                # ------------------------------------------------------------
+                # Current source.
+                # ------------------------------------------------------------
+
+                own_pos, own_quat = (
+                    evaluate_curves(
+                        *follower_curve,
+                        f,
+                        frame_start,
+                        frame_end,
+                        cyclic,
+                        cycle_len
+                    )
                 )
 
-                delayed_frame = f - delay
+                # ------------------------------------------------------------
+                # Delayed source.
+                # ------------------------------------------------------------
 
-                d_pos, d_quat = evaluate_curves(
-                    *follower_curve,
-                    delayed_frame,
-                    frame_start,
-                    frame_end,
-                    cyclic,
-                    cycle_len
+                delayed_frame = (
+                    f - delay
                 )
+
+                d_pos, d_quat = (
+                    evaluate_curves(
+                        *follower_curve,
+                        delayed_frame,
+                        frame_start,
+                        frame_end,
+                        cyclic,
+                        cycle_len
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # Current aim.
+                # ------------------------------------------------------------
 
                 aim_now = safe_normalized(
-                    own_quat @ local_dir
+                    own_quat
+                    @ local_dir
                 )
 
+                # ------------------------------------------------------------
+                # Delayed direction.
+                # ------------------------------------------------------------
+
                 whisker_delayed_dir = safe_normalized(
-                    d_quat @ local_dir
+                    d_quat
+                    @ local_dir
                 )
 
                 delayed_target = (
                     d_pos
-                    + whisker_delayed_dir * whisker_length
+                    + whisker_delayed_dir
+                    * whisker_length
                 )
 
+                # ------------------------------------------------------------
+                # Optional wind.
+                # ------------------------------------------------------------
+
                 if props.use_wind:
+
                     up1 = safe_normalized(
-                        d_quat @ Vector((0.0, 1.0, 0.0))
+                        d_quat
+                        @ Vector(
+                            (
+                                0.0,
+                                1.0,
+                                0.0
+                            )
+                        )
                     )
+
                     up2 = safe_normalized(
-                        d_quat @ Vector((0.0, 0.0, 1.0))
+                        d_quat
+                        @ Vector(
+                            (
+                                0.0,
+                                0.0,
+                                1.0
+                            )
+                        )
                     )
 
                     wy, wz = wind_offset(
@@ -857,71 +2094,157 @@ def run_overlapper(context, props):
                     )
 
                     delayed_target += (
-                        up1 * (wy * wind_amp)
-                        + up2 * (wz * wind_amp)
+                        up1
+                        * (
+                            wy
+                            * wind_amp
+                        )
+                        +
+                        up2
+                        * (
+                            wz
+                            * wind_amp
+                        )
                     )
 
-                aim_dir = delayed_target - own_pos
+                # ------------------------------------------------------------
+                # Aim direction.
+                # ------------------------------------------------------------
+
+                aim_dir = (
+                    delayed_target
+                    - own_pos
+                )
 
                 if aim_dir.length < 1e-6:
                     aim_dir = aim_now.copy()
+
                 else:
                     aim_dir.normalize()
 
-                swing = aim_now.rotation_difference(aim_dir)
+                # ------------------------------------------------------------
+                # World-space swing.
+                # ------------------------------------------------------------
 
-                # Convert world swing into local space.
+                swing = (
+                    aim_now.rotation_difference(
+                        aim_dir
+                    )
+                )
+
+                # ------------------------------------------------------------
+                # Convert world swing to local space.
+                # ------------------------------------------------------------
+
                 delta_local = (
                     own_quat.inverted()
                     @ swing
                     @ own_quat
                 )
 
+                # ------------------------------------------------------------
+                # Convert local swing to Euler only for clamping and
+                # strength processing.
+                # ------------------------------------------------------------
+
                 d_rot = rotation_delta_to_euler(
                     delta_local,
                     euler_order
                 )
 
-                # Apply overlap strength.
-                d_rot = Euler((
-                    d_rot.x * link_strength,
-                    d_rot.y * link_strength,
-                    d_rot.z * link_strength,
-                ), euler_order)
+                d_rot = Euler(
+                    (
+                        d_rot.x
+                        * link_strength,
 
-                # Optional maximum rotation per frame.
+                        d_rot.y
+                        * link_strength,
+
+                        d_rot.z
+                        * link_strength,
+                    ),
+                    euler_order
+                )
+
                 d_rot = clamp_euler_delta(
                     d_rot,
                     props.max_rotation
                 )
 
-                if additive_only:
-                    final_rot_euler = d_rot
-                else:
-                    base_euler = baseline_rot[i][f_index]
+                # =================================================================
+                # FINAL ROTATION COMPOSITION
+                #
+                # IMPORTANT:
+                #
+                # Do NOT:
+                #
+                #     base_euler + d_rot
+                #
+                # and do NOT:
+                #
+                #     quaternion_component + quaternion_component
+                #
+                # Instead:
+                #
+                #     final_quat = base_quat @ delta_quat
+                #
+                # This composes the actual rotations.
+                # =================================================================
 
-                    final_rot_euler = Euler((
-                        base_euler.x + d_rot.x,
-                        base_euler.y + d_rot.y,
-                        base_euler.z + d_rot.z,
-                    ), euler_order)
+                base_euler = (
+                    baseline_rot[i][f_index]
+                )
+
+                base_quat = (
+                    base_euler.to_quaternion()
+                )
+
+                delta_quat = (
+                    d_rot.to_quaternion()
+                )
+
+                final_quat = (
+                    base_quat
+                    @ delta_quat
+                )
+
+                final_quat.normalize()
+
+                # Quaternion hemisphere compatibility.
+                if previous_output_quat is not None:
+                    final_quat.make_compatible(
+                        previous_output_quat
+                    )
+
+                previous_output_quat = (
+                    final_quat.copy()
+                )
+
+                # ------------------------------------------------------------
+                # Convert final quaternion to the target's actual rotation
+                # representation.
+                # ------------------------------------------------------------
 
                 if rot_prop == "rotation_quaternion":
-                    q = final_rot_euler.to_quaternion()
 
-                    for c in range(4):
-                        rot_fcurves[c].keyframe_points.insert(
-                            f,
-                            q[c],
-                            options={'FAST'}
-                        )
+                    values = tuple(
+                        final_quat
+                    )
 
                 elif rot_prop == "rotation_axis_angle":
-                    q = final_rot_euler.to_quaternion()
-                    axis, angle = q.to_axis_angle()
+
+                    axis, angle = (
+                        final_quat.to_axis_angle()
+                    )
 
                     if axis.length < 1e-8:
-                        axis = Vector((0.0, 1.0, 0.0))
+                        axis = Vector(
+                            (
+                                0.0,
+                                1.0,
+                                0.0
+                            )
+                        )
 
                     values = (
                         angle,
@@ -930,51 +2253,127 @@ def run_overlapper(context, props):
                         axis.z
                     )
 
-                    for c in range(4):
-                        rot_fcurves[c].keyframe_points.insert(
-                            f,
-                            values[c],
-                            options={'FAST'}
+                else:
+
+                    if previous_output_euler is not None:
+                        compatible_euler = (
+                            previous_output_euler
                         )
 
-                else:
-                    for c in range(3):
-                        rot_fcurves[c].keyframe_points.insert(
+                    else:
+                        compatible_euler = (
+                            base_euler
+                        )
+
+                    try:
+                        final_euler = (
+                            final_quat.to_euler(
+                                euler_order,
+                                compatible_euler
+                            )
+                        )
+                    except TypeError:
+                        final_euler = (
+                            final_quat.to_euler(
+                                euler_order
+                            )
+                        )
+
+                    previous_output_euler = (
+                        final_euler.copy()
+                    )
+
+                    values = tuple(
+                        final_euler
+                    )
+
+                # ------------------------------------------------------------
+                # Write rotation.
+                # ------------------------------------------------------------
+
+                for channel, value in enumerate(
+                    values
+                ):
+
+                    kp = (
+                        rot_fcurves[
+                            channel
+                        ]
+                        .keyframe_points
+                        .insert(
                             f,
-                            final_rot_euler[c],
+                            value,
                             options={'FAST'}
                         )
+                    )
+
+                    kp.interpolation = 'LINEAR'
+
+                # =================================================================
+                # TRANSLATION
+                # =================================================================
 
                 if loc_fcurves is not None:
-                    d_loc = d_pos - own_pos
 
-                    # Translation strength can be independent from rotation.
+                    # World-space delayed displacement.
+                    d_loc = (
+                        d_pos
+                        - own_pos
+                    )
+
+                    # Translation strength.
                     d_loc *= (
                         props.translate_strength
                         * link_strength
                     )
 
+                    # Maximum world-space translation.
                     if props.max_translation > 0:
+
                         length = d_loc.length
-                        maximum = props.max_translation
+
+                        maximum = (
+                            props.max_translation
+                        )
 
                         if length > maximum:
-                            d_loc *= maximum / length
+                            d_loc *= (
+                                maximum
+                                / length
+                            )
 
-                    if additive_only:
-                        final_loc = d_loc
-                    else:
-                        final_loc = (
-                            baseline_loc[i][f_index]
-                            + d_loc
-                        )
+                    # ------------------------------------------------------------
+                    # Convert WORLD displacement to LOCAL location-channel
+                    # displacement.
+                    # ------------------------------------------------------------
+
+                    local_delta = (
+                        translation_bases[i][f_index]
+                        @ d_loc
+                    )
+
+                    final_loc = (
+                        baseline_loc[i][f_index]
+                        + local_delta
+                    )
 
                     for c in range(3):
-                        loc_fcurves[c].keyframe_points.insert(
-                            f,
-                            final_loc[c],
-                            options={'FAST'}
+
+                        kp = (
+                            loc_fcurves[c]
+                            .keyframe_points
+                            .insert(
+                                f,
+                                final_loc[c],
+                                options={'FAST'}
+                            )
                         )
+
+                        kp.interpolation = 'LINEAR'
+
+            # =================================================================
+            # Update curves.
+            # =================================================================
 
             for fc in rot_fcurves:
                 fc.update()
@@ -983,38 +2382,78 @@ def run_overlapper(context, props):
                 for fc in loc_fcurves:
                     fc.update()
 
+            # =================================================================
+            # Optional redundant-key cleanup.
+            # =================================================================
+
             if props.delete_redundant:
+
                 simplify_fcurves(
-                    rot_fcurves + (loc_fcurves or []),
+                    rot_fcurves
+                    + (
+                        loc_fcurves
+                        or []
+                    ),
                     props.redundant_tolerance
                 )
 
+        # ====================================================================
+        # Add generated action to NLA.
+        # ====================================================================
+
         if props.bake_new_layer:
+
             add_overlap_nla_layer(
                 id_obj,
                 target_action,
-                frame_start
+                frame_start,
+                action_slot
             )
 
+    # ========================================================================
+    # Selection set.
+    # ========================================================================
+
     if props.create_selection_set:
-        add_to_selection_set(chain[start_index:])
+        add_to_selection_set(
+            chain[start_index:]
+        )
+
+    # ========================================================================
+    # Helper cleanup.
+    # ========================================================================
 
     if not props.debug_mode:
-        remove_collection(HELPER_COLLECTION_NAME)
+        remove_collection(
+            HELPER_COLLECTION_NAME
+        )
 
-    scene.frame_set(original_frame)
+    # ========================================================================
+    # Restore timeline.
+    # ========================================================================
+
+    scene.frame_set(
+        original_frame,
+        subframe=original_subframe
+    )
 
     return (
         True,
-        f"Overlap applied to {len(chain) - start_index} control(s)."
+        (
+            f"Overlap applied to "
+            f"{len(chain) - start_index} "
+            f"control(s)."
+        )
     )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Properties
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-class OverlapperProperties(bpy.types.PropertyGroup):
+class OverlapperProperties(
+        bpy.types.PropertyGroup
+):
 
     softness: bpy.props.FloatProperty(
         name="Softness",
@@ -1029,7 +2468,9 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     scale: bpy.props.FloatProperty(
         name="Scale",
-        description="Overlap amplitude. Higher = more overlap motion.",
+        description=(
+            "Overlap amplitude. Higher = more overlap motion."
+        ),
         default=1.0,
         min=0.0001,
         soft_max=10.0,
@@ -1037,7 +2478,9 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     root_strength: bpy.props.FloatProperty(
         name="Root Strength",
-        description="Overlap strength at the root side of the chain.",
+        description=(
+            "Overlap strength at the root side of the chain."
+        ),
         default=1.0,
         min=0.0,
         soft_max=3.0,
@@ -1045,7 +2488,10 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     tip_strength: bpy.props.FloatProperty(
         name="Tip Strength",
-        description="Overlap strength at the tip. Higher values exaggerate follow-through.",
+        description=(
+            "Overlap strength at the tip. Higher values "
+            "exaggerate follow-through."
+        ),
         default=1.0,
         min=0.0,
         soft_max=5.0,
@@ -1053,7 +2499,9 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     falloff_power: bpy.props.FloatProperty(
         name="Falloff Power",
-        description="Shape of root-to-tip strength interpolation.",
+        description=(
+            "Shape of root-to-tip strength interpolation."
+        ),
         default=1.0,
         min=0.01,
         soft_max=5.0,
@@ -1083,7 +2531,9 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     tip_falloff_power: bpy.props.FloatProperty(
         name="Tip Falloff",
-        description="Controls how quickly the tip delay multiplier ramps up.",
+        description=(
+            "Controls how quickly the tip delay multiplier ramps up."
+        ),
         default=1.0,
         min=0.01,
         soft_max=5.0,
@@ -1091,7 +2541,9 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     translate_strength: bpy.props.FloatProperty(
         name="Translate Strength",
-        description="Amount of delayed positional motion added to translation.",
+        description=(
+            "Amount of delayed positional motion added to translation."
+        ),
         default=1.0,
         min=0.0,
         soft_max=5.0,
@@ -1099,7 +2551,10 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     max_rotation: bpy.props.FloatProperty(
         name="Max Rotation",
-        description="Maximum overlap rotation per frame in degrees. 0 = unlimited.",
+        description=(
+            "Maximum overlap rotation per frame in degrees. "
+            "0 = unlimited."
+        ),
         default=0.0,
         min=0.0,
         soft_max=180.0,
@@ -1107,7 +2562,10 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     max_translation: bpy.props.FloatProperty(
         name="Max Translation",
-        description="Maximum overlap translation distance. 0 = unlimited.",
+        description=(
+            "Maximum overlap translation distance. "
+            "0 = unlimited."
+        ),
         default=0.0,
         min=0.0,
         soft_max=10.0,
@@ -1137,7 +2595,9 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     wind_strength: bpy.props.FloatProperty(
         name="Strength",
-        description="Additional multiplier for wind contribution.",
+        description=(
+            "Additional multiplier for wind contribution."
+        ),
         default=1.0,
         min=0.0,
         soft_max=5.0,
@@ -1150,183 +2610,368 @@ class OverlapperProperties(bpy.types.PropertyGroup):
 
     dont_use_first: bpy.props.BoolProperty(
         name="Don't use first controls",
-        description="Don't use the first root control in the selected chain.",
+        description=(
+            "Don't use the first root control in the selected chain."
+        ),
         default=False,
     )
 
     add_translate: bpy.props.BoolProperty(
         name="Add translate",
-        description="Also create overlapping translation.",
+        description=(
+            "Also create overlapping translation."
+        ),
         default=False,
     )
 
     hierarchy_mode: bpy.props.BoolProperty(
         name="Hierarchy",
-        description="Automatically include child objects / child bones.",
+        description=(
+            "Automatically include child objects / child bones."
+        ),
         default=False,
     )
 
     cycle_mode: bpy.props.BoolProperty(
         name="Cycle",
-        description="Evaluate delayed motion cyclically over the selected range.",
+        description=(
+            "Evaluate delayed motion cyclically over the selected range."
+        ),
         default=False,
     )
 
     debug_mode: bpy.props.BoolProperty(
         name="Debug mode",
-        description="Keep helper objects after baking.",
+        description=(
+            "Keep helper objects after baking."
+        ),
         default=False,
     )
 
     bake_new_layer: bpy.props.BoolProperty(
         name="Bake on anim layer",
         description=(
-            "Bake overlap onto a separate Add-blended NLA track. "
-            "The original action remains available underneath."
+            "Preserve the source animation and bake final local "
+            "transforms onto a separate Replace-blended NLA track."
         ),
         default=True,
     )
 
     adaptive_scale: bpy.props.BoolProperty(
         name="Adaptive scale",
-        description="Base whisker length on selected-control spacing.",
+        description=(
+            "Base whisker length on selected-control spacing."
+        ),
         default=True,
     )
 
     create_selection_set: bpy.props.BoolProperty(
         name="Create selection set",
-        description="Add overlapped controls to OverlapperSet.",
+        description=(
+            "Add overlapped controls to OverlapperSet."
+        ),
         default=True,
     )
 
     delete_redundant: bpy.props.BoolProperty(
         name="Delete redundant",
-        description="Remove redundant nearly-identical keys.",
+        description=(
+            "Remove redundant nearly-identical keys."
+        ),
         default=False,
     )
 
     redundant_tolerance: bpy.props.FloatProperty(
         name="Tolerance",
-        description="Tolerance used by Delete redundant.",
+        description=(
+            "Tolerance used by Delete redundant."
+        ),
         default=0.0001,
         min=0.0,
         soft_max=0.1,
     )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Operators
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-class OVERLAPPER_OT_run(bpy.types.Operator):
+class OVERLAPPER_OT_run(
+        bpy.types.Operator
+):
     bl_idname = "overlapper.run"
     bl_label = "Overlap"
-    bl_description = "Create overlapping / follow-through animation."
-    bl_options = {'REGISTER', 'UNDO'}
+
+    bl_description = (
+        "Create overlapping / follow-through animation."
+    )
+
+    bl_options = {
+        'REGISTER',
+        'UNDO'
+    }
 
     @classmethod
     def poll(cls, context):
-        if context.mode == 'POSE':
-            return bool(context.selected_pose_bones)
-        return len(context.selected_objects) >= 1
 
-    def execute(self, context):
+        if context.mode == 'POSE':
+            return bool(
+                context.selected_pose_bones
+            )
+
+        return (
+            len(
+                context.selected_objects
+            ) >= 1
+        )
+
+    def execute(
+            self,
+            context
+    ):
         import time
 
-        props = context.scene.overlapper_props
+        props = (
+            context.scene.overlapper_props
+        )
+
+        original_frame = (
+            context.scene.frame_current
+        )
+
+        original_subframe = (
+            context.scene.frame_subframe
+        )
+
         t0 = time.time()
 
         try:
-            ok, message = run_overlapper(context, props)
+
+            ok, message = run_overlapper(
+                context,
+                props
+            )
+
         except Exception as exc:
-            self.report({'ERROR'}, f"Overlapper failed: {exc}")
-            return {'CANCELLED'}
+
+            import traceback
+
+            traceback.print_exc()
+
+            try:
+                context.scene.frame_set(
+                    original_frame,
+                    subframe=original_subframe
+                )
+            except Exception:
+                pass
+
+            self.report(
+                {'ERROR'},
+                (
+                    f"Overlapper failed: "
+                    f"{type(exc).__name__}: "
+                    f"{exc}"
+                )
+            )
+
+            return {
+                'CANCELLED'
+            }
+
+        finally:
+
+            try:
+                context.scene.frame_set(
+                    original_frame,
+                    subframe=original_subframe
+                )
+            except Exception:
+                pass
 
         if not ok:
-            self.report({'WARNING'}, message)
-            return {'CANCELLED'}
 
-        elapsed = time.time() - t0
+            self.report(
+                {'WARNING'},
+                message
+            )
+
+            return {
+                'CANCELLED'
+            }
+
+        elapsed = (
+            time.time()
+            - t0
+        )
 
         self.report(
             {'INFO'},
-            f"{message} ({elapsed:.2f}s)"
+            (
+                f"{message} "
+                f"({elapsed:.2f}s)"
+            )
         )
 
-        return {'FINISHED'}
+        return {
+            'FINISHED'
+        }
 
 
-class OVERLAPPER_OT_reset(bpy.types.Operator):
+class OVERLAPPER_OT_reset(
+        bpy.types.Operator
+):
     bl_idname = "overlapper.reset"
     bl_label = "Reset Values"
-    bl_description = "Reset Overlapper settings."
-    bl_options = {'REGISTER', 'UNDO'}
 
-    def execute(self, context):
-        props = context.scene.overlapper_props
+    bl_description = (
+        "Reset Overlapper settings."
+    )
 
-        for key in props.rna_type.properties.keys():
-            if key in ('rna_type', 'name'):
+    bl_options = {
+        'REGISTER',
+        'UNDO'
+    }
+
+    def execute(
+            self,
+            context
+    ):
+        props = (
+            context.scene.overlapper_props
+        )
+
+        for key in (
+            props.rna_type.properties.keys()
+        ):
+
+            if key in (
+                'rna_type',
+                'name'
+            ):
                 continue
-            props.property_unset(key)
+
+            props.property_unset(
+                key
+            )
 
         self.report(
             {'INFO'},
-            "Overlapper settings reset to defaults."
+            (
+                "Overlapper settings "
+                "reset to defaults."
+            )
         )
 
-        return {'FINISHED'}
+        return {
+            'FINISHED'
+        }
 
 
-class OVERLAPPER_OT_restore(bpy.types.Operator):
+class OVERLAPPER_OT_restore(
+        bpy.types.Operator
+):
     bl_idname = "overlapper.restore"
     bl_label = "Restore Original Pose"
-    bl_description = "Undo the most recent Overlap bake."
-    bl_options = {'REGISTER', 'UNDO'}
+
+    bl_description = (
+        "Undo the most recent Overlap bake."
+    )
+
+    bl_options = {
+        'REGISTER',
+        'UNDO'
+    }
 
     @classmethod
     def poll(cls, context):
+
         if _BACKUP_STORE:
             return True
 
         for obj in bpy.data.objects:
+
+            anim = obj.animation_data
+
+            if anim is None:
+                continue
+
             if (
-                obj.animation_data
-                and obj.animation_data.nla_tracks.get("Overlapper_Base")
+                anim.nla_tracks.get(
+                    "Overlapper_Base"
+                ) is not None
+                or
+                anim.nla_tracks.get(
+                    "Overlapper_Overlap"
+                ) is not None
             ):
                 return True
 
         return False
 
-    def execute(self, context):
-        count = restore_all_backups(context)
+    def execute(
+            self,
+            context
+    ):
+        count = restore_all_backups(
+            context
+        )
 
         if count == 0:
+
             self.report(
                 {'WARNING'},
                 "Nothing to restore."
             )
-            return {'CANCELLED'}
+
+            return {
+                'CANCELLED'
+            }
 
         self.report(
             {'INFO'},
-            f"Restored original animation on {count} object(s)."
+            (
+                "Restored original animation "
+                f"on {count} object(s)."
+            )
         )
 
-        return {'FINISHED'}
+        return {
+            'FINISHED'
+        }
 
 
-class OVERLAPPER_OT_cleanup(bpy.types.Operator):
+class OVERLAPPER_OT_cleanup(
+        bpy.types.Operator
+):
     bl_idname = "overlapper.cleanup"
     bl_label = "CleanUp"
-    bl_description = "Delete all Overlapper helper objects."
-    bl_options = {'REGISTER', 'UNDO'}
 
-    def execute(self, context):
-        remove_collection(HELPER_COLLECTION_NAME)
+    bl_description = (
+        "Delete all Overlapper helper objects."
+    )
 
-        for obj in list(bpy.data.objects):
-            if obj.name.startswith(HELPER_PREFIX):
+    bl_options = {
+        'REGISTER',
+        'UNDO'
+    }
+
+    def execute(
+            self,
+            context
+    ):
+        remove_collection(
+            HELPER_COLLECTION_NAME
+        )
+
+        for obj in list(
+            bpy.data.objects
+        ):
+
+            if obj.name.startswith(
+                HELPER_PREFIX
+            ):
+
                 bpy.data.objects.remove(
                     obj,
                     do_unlink=True
@@ -1334,82 +2979,170 @@ class OVERLAPPER_OT_cleanup(bpy.types.Operator):
 
         self.report(
             {'INFO'},
-            "Overlapper helpers cleaned up."
+            (
+                "Overlapper helpers "
+                "cleaned up."
+            )
         )
 
-        return {'FINISHED'}
+        return {
+            'FINISHED'
+        }
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # UI
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-class OVERLAPPER_PT_panel(bpy.types.Panel):
+class OVERLAPPER_PT_panel(
+        bpy.types.Panel
+):
     bl_label = "Overlapper"
     bl_idname = "OVERLAPPER_PT_panel"
+
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = "Overlapper"
 
-    def draw(self, context):
+    def draw(
+            self,
+            context
+    ):
         layout = self.layout
-        props = context.scene.overlapper_props
 
+        props = (
+            context.scene.overlapper_props
+        )
+
+        # ====================================================================
         # Main controls
-        col = layout.column(align=True)
-        col.prop(props, "softness")
-        col.prop(props, "scale")
+        # ====================================================================
 
+        col = layout.column(
+            align=True
+        )
+
+        col.prop(
+            props,
+            "softness"
+        )
+
+        col.prop(
+            props,
+            "scale"
+        )
+
+        # ====================================================================
         # Wind
+        # ====================================================================
+
         box = layout.box()
-        box.prop(props, "use_wind")
+
+        box.prop(
+            props,
+            "use_wind"
+        )
 
         if props.use_wind:
-            row = box.row(align=True)
-            row.prop(props, "wind_scale")
-            row.prop(props, "wind_speed")
-            box.prop(props, "wind_strength")
 
+            row = box.row(
+                align=True
+            )
+
+            row.prop(
+                props,
+                "wind_scale"
+            )
+
+            row.prop(
+                props,
+                "wind_speed"
+            )
+
+            box.prop(
+                props,
+                "wind_strength"
+            )
+
+        # ====================================================================
         # Existing options
+        # ====================================================================
+
         box = layout.box()
 
         row = box.row()
+
         row.prop(
             props,
             "show_options",
-            icon='TRIA_DOWN' if props.show_options else 'TRIA_RIGHT',
+            icon=(
+                'TRIA_DOWN'
+                if props.show_options
+                else 'TRIA_RIGHT'
+            ),
             emboss=False
         )
 
         if props.show_options:
-            box.prop(props, "dont_use_first")
-            box.prop(props, "add_translate")
-            box.prop(props, "hierarchy_mode")
-            box.prop(props, "cycle_mode")
+
+            box.prop(
+                props,
+                "dont_use_first"
+            )
+
+            box.prop(
+                props,
+                "add_translate"
+            )
+
+            box.prop(
+                props,
+                "hierarchy_mode"
+            )
+
+            box.prop(
+                props,
+                "cycle_mode"
+            )
 
         layout.separator()
 
-        row = layout.row(align=True)
+        # ====================================================================
+        # Main buttons
+        # ====================================================================
+
+        row = layout.row(
+            align=True
+        )
+
         row.operator(
             "overlapper.run",
             icon='MOD_DYNAMICPAINT'
         )
+
         row.operator(
             "overlapper.reset",
             icon='LOOP_BACK',
             text=""
         )
 
-        row = layout.row(align=True)
+        # ====================================================================
+        # Restore
+        # ====================================================================
+
+        row = layout.row(
+            align=True
+        )
+
         row.operator(
             "overlapper.restore",
             icon='RECOVER_LAST'
         )
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Registration
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 classes = (
     OverlapperProperties,
@@ -1422,20 +3155,33 @@ classes = (
 
 
 def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
 
-    bpy.types.Scene.overlapper_props = bpy.props.PointerProperty(
-        type=OverlapperProperties
+    for cls in classes:
+        bpy.utils.register_class(
+            cls
+        )
+
+    bpy.types.Scene.overlapper_props = (
+        bpy.props.PointerProperty(
+            type=OverlapperProperties
+        )
     )
 
 
 def unregister():
-    if hasattr(bpy.types.Scene, "overlapper_props"):
+
+    if hasattr(
+        bpy.types.Scene,
+        "overlapper_props"
+    ):
         del bpy.types.Scene.overlapper_props
 
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    for cls in reversed(
+        classes
+    ):
+        bpy.utils.unregister_class(
+            cls
+        )
 
 
 if __name__ == "__main__":
