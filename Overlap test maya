@@ -1148,11 +1148,6 @@ class OverlapperProperties(bpy.types.PropertyGroup):
         default=True
     )
 
-    show_advanced: bpy.props.BoolProperty(
-        name="Advanced",
-        default=False
-    )
-
     dont_use_first: bpy.props.BoolProperty(
         name="Don't use first controls",
         description="Don't use the first root control in the selected chain.",
@@ -1391,57 +1386,6 @@ class OVERLAPPER_PT_panel(bpy.types.Panel):
             box.prop(props, "add_translate")
             box.prop(props, "hierarchy_mode")
             box.prop(props, "cycle_mode")
-
-        # Advanced
-        box = layout.box()
-
-        row = box.row()
-        row.prop(
-            props,
-            "show_advanced",
-            icon='TRIA_DOWN' if props.show_advanced else 'TRIA_RIGHT',
-            emboss=False
-        )
-
-        if props.show_advanced:
-            box.label(text="Follow Through")
-            row = box.row(align=True)
-            row.prop(props, "root_strength")
-            row.prop(props, "tip_strength")
-
-            box.prop(props, "falloff_power")
-
-            row = box.row(align=True)
-            row.prop(props, "delay_falloff")
-            row.prop(props, "tip_delay_multiplier")
-
-            box.prop(props, "tip_falloff_power")
-
-            box.separator()
-            box.label(text="Translation / Limits")
-
-            box.prop(props, "translate_strength")
-            box.prop(props, "max_rotation")
-            box.prop(props, "max_translation")
-
-            box.separator()
-            box.label(text="Bake")
-
-            box.prop(props, "bake_new_layer")
-            box.prop(props, "adaptive_scale")
-            box.prop(props, "create_selection_set")
-            box.prop(props, "delete_redundant")
-
-            if props.delete_redundant:
-                box.prop(props, "redundant_tolerance")
-
-            box.prop(props, "debug_mode")
-
-            box.separator()
-            box.operator(
-                "overlapper.cleanup",
-                icon='TRASH'
-            )
 
         layout.separator()
 
