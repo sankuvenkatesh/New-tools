@@ -1,0 +1,2345 @@
+# ##### BEGIN GPL LICENSE BLOCK #####
+#
+#  This program is free software; you can redistribute it and/or
+#  modify it under the terms of the GNU General Public License
+#  as published by the Free Software Foundation; either version 2
+#  of the License, or (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+# ##### END GPL LICENSE BLOCK #####
+
+bl_info = {
+    "name": "Perfect Overlap",
+    "author": "Sanku Venkatesh / CaptainHansode",
+    "version": (1, 8, 2),
+    # Targeting Blender 5.1. The slotted-Action fcurve lookup below has a
+    # graceful fallback for older APIs, but this build is written and
+    # tested against 5.1's Action/channelbag layout specifically -- do not
+    # lower this without re-checking that fallback path still behaves.
+    "blender": (5, 1, 0),
+    "location": "View3D > Sidebar > SJT > Perfect Overlap",
+    "description": "Overlap and follow-through animation for bone chains",
+    "category": "Animation",
+}
+
+__author__ = "Sanku Venkatesh"
+__license__ = "GPL"
+__status__ = "Production"
+
+import bpy
+import math
+import mathutils
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+NON_CONTROL_PREFIXES = (
+    "def-", "def_", "def.",
+    "org-", "org_", "org.",
+    "mch-", "mch_", "mch.",
+    "wgt-", "wgt_", "wgt.",
+    "vis-", "vis_", "vis.",
+)
+
+EPS = 1.0e-6
+ZERO = mathutils.Vector((0.0, 0.0, 0.0))
+BONE_AXIS = mathutils.Vector((0.0, 1.0, 0.0))
+
+MAX_LAG_ANGLE = math.radians(150.0)
+MAX_HEAD_DRIFT = 2.0
+
+
+# =============================================================================
+# PERFECT OVERLAP SOLVER
+# =============================================================================
+
+class SJPhaserModule:
+
+    def __init__(self):
+        self.delay = 3.0
+        self.recursion = 5.0
+        self.strength = 1.0
+        self.threshold = 0.001
+
+        self.sf = 0
+        self.ef = 100
+
+        self.debug = False
+        self.animate_translate = False
+
+        self.passes_run = 0
+        self.translate_skipped = []
+
+    # -------------------------------------------------------------------------
+    # SOLVER PARAMETERS
+    # -------------------------------------------------------------------------
+
+    def solver_params(self):
+
+        k = 1.0 / max(self.delay, 1.0)
+        k = min(max(k, 0.05), 0.9)
+
+        rec = min(max(self.recursion, 0.0), 10.0)
+
+        zeta = 1.15 - (rec / 10.0) * 0.8
+
+        c = 2.0 * zeta * math.sqrt(k)
+
+        c = min(
+            max(c, 0.0),
+            min(1.9, (4.0 - k) * 0.5 * 0.95)
+        )
+
+        amp = 1.0 + (
+            min(max(self.strength, 1.0), 10.0) - 1.0
+        ) / 9.0
+
+        return k, c, amp
+
+    # -------------------------------------------------------------------------
+    # VECTOR LIMIT
+    # -------------------------------------------------------------------------
+
+    def _limit_dir(self, base, vec, max_angle):
+
+        if base.length < EPS:
+            return vec.normalized()
+
+        if vec.length < EPS:
+            return base.normalized()
+
+        base = base.normalized()
+        vec = vec.normalized()
+
+        dot = min(max(base.dot(vec), -1.0), 1.0)
+
+        angle = math.acos(dot)
+
+        if angle <= max_angle or angle < EPS:
+            return vec
+
+        t = max_angle / angle
+
+        sin_angle = math.sin(angle)
+
+        # Antiparallel (or numerically indistinguishable from it): any
+        # perpendicular axis is as good as another. Pick one deterministically
+        # and rotate `max_angle` from `base` around it.
+        if sin_angle < EPS:
+
+            perp = base.orthogonal()
+
+            if perp.length < EPS:
+                perp = mathutils.Vector((1.0, 0.0, 0.0))
+
+            perp.normalize()
+
+            return (
+                base * math.cos(max_angle)
+                + perp * math.sin(max_angle)
+            ).normalized()
+
+        out = (
+            base * math.sin((1.0 - t) * angle)
+            + vec * math.sin(t * angle)
+        ) / sin_angle
+
+        return out.normalized()
+
+    # =========================================================================
+    # RIG INSPECTION
+    # =========================================================================
+
+    def _bone_visible(self, pbn):
+
+        bone = pbn.bone
+
+        if bone.hide:
+            return False
+
+        colls = getattr(bone, "collections", None)
+
+        if colls:
+
+            for c in colls:
+
+                visible = getattr(
+                    c,
+                    "is_visible_effectively",
+                    getattr(c, "is_visible", True)
+                )
+
+                if visible:
+                    return True
+
+            return False
+
+        return True
+
+    def is_control_bone(self, pbn):
+
+        if pbn.name.lower().startswith(NON_CONTROL_PREFIXES):
+            return False
+
+        return self._bone_visible(pbn)
+
+    def control_children(self, pbn, _depth=0):
+
+        result = []
+
+        for child in pbn.children:
+
+            if self.is_control_bone(child):
+
+                result.append(child)
+
+            elif _depth < 8:
+
+                result.extend(
+                    self.control_children(
+                        child,
+                        _depth + 1
+                    )
+                )
+
+        return result
+
+    def next_in_chain(self, pbn, candidates):
+
+        if not candidates:
+            return None
+
+        if len(candidates) == 1:
+            return candidates[0]
+
+        for child in candidates:
+
+            if child.bone.use_connect:
+                return child
+
+        tail = pbn.tail
+
+        direction = pbn.tail - pbn.head
+
+        if direction.length > EPS:
+            direction.normalize()
+        else:
+            direction = BONE_AXIS.copy()
+
+        scale = max(pbn.length, EPS)
+
+        best = None
+        best_score = None
+
+        for child in candidates:
+
+            distance = (
+                (child.head - tail).length / scale
+            )
+
+            child_direction = child.tail - child.head
+
+            if child_direction.length > EPS:
+                alignment = (
+                    child_direction.normalized().dot(direction)
+                )
+            else:
+                alignment = -1.0
+
+            score = distance - alignment
+
+            if best_score is None or score < best_score:
+
+                best_score = score
+                best = child
+
+        return best
+
+    # =========================================================================
+    # TRANSLATION
+    # =========================================================================
+
+    def translate_axes(self, pbn):
+
+        if not self.animate_translate:
+            return []
+
+        if pbn.bone.use_connect:
+            return []
+
+        return [
+            axis
+            for axis in range(3)
+            if not pbn.lock_location[axis]
+        ]
+
+    def can_translate(self, pbn):
+
+        return bool(self.translate_axes(pbn))
+
+    # =========================================================================
+    # SELECTION / CHAINS
+    # =========================================================================
+
+    def get_selection(self):
+
+        return list(
+            bpy.context.selected_pose_bones or []
+        )
+
+    def get_hierarchy_count(self, obj):
+
+        count = 0
+
+        obj = obj.parent
+
+        while obj is not None:
+
+            obj = obj.parent
+            count += 1
+
+        return count
+
+    def get_default_data_table(self):
+
+        return {
+            "obj_list": [],
+            "offset": [],
+            "length": [],
+            "state": [],
+        }
+
+    def get_tree_list(self):
+
+        selected = self.get_selection()
+
+        selected_names = {
+            pbn.name for pbn in selected
+        }
+
+        ordered = sorted(
+            selected,
+            key=self.get_hierarchy_count
+        )
+
+        trees = {}
+        used = set()
+        tree_index = 0
+
+        for pbn in ordered:
+
+            if pbn.name in used:
+                continue
+
+            if pbn.parent is None:
+                continue
+
+            chain = [pbn]
+
+            used.add(pbn.name)
+
+            current = pbn
+
+            while True:
+
+                candidates = [
+                    child
+                    for child in self.control_children(current)
+                    if (
+                        child.name in selected_names
+                        and child.name not in used
+                    )
+                ]
+
+                next_bone = self.next_in_chain(
+                    current,
+                    candidates
+                )
+
+                if next_bone is None:
+                    break
+
+                chain.append(next_bone)
+
+                used.add(next_bone.name)
+
+                current = next_bone
+
+            depth = self.get_hierarchy_count(pbn)
+
+            if depth not in trees:
+                trees[depth] = {}
+
+            name = "tree{}".format(tree_index)
+
+            trees[depth][name] = (
+                self.get_default_data_table()
+            )
+
+            trees[depth][name]["obj_list"] = chain
+
+            tree_index += 1
+
+        return trees
+
+    def iter_chains(self, trees):
+
+        for depth in sorted(trees.keys()):
+
+            for name in sorted(trees[depth].keys()):
+
+                yield trees[depth][name]
+
+    def iter_bones(self, trees):
+
+        for chain in self.iter_chains(trees):
+
+            for pbn in chain["obj_list"]:
+
+                yield pbn
+
+    # =========================================================================
+    # TRANSFORMS
+    # =========================================================================
+
+    def world_matrix(self, pbn):
+
+        obj = bpy.context.active_object
+
+        return obj.matrix_world @ pbn.matrix
+
+    def _tip_of(self, matrix, length):
+
+        return matrix @ mathutils.Vector(
+            (0.0, length, 0.0)
+        )
+
+    # =========================================================================
+    # INITIAL STATE
+    # =========================================================================
+
+    def set_pre_data(self, trees):
+
+        self.translate_skipped = []
+
+        for chain in self.iter_chains(trees):
+
+            bones = chain["obj_list"]
+
+            chain["offset"] = []
+            chain["length"] = []
+            chain["state"] = []
+
+            for index, pbn in enumerate(bones):
+
+                if index > 0:
+                    reference = bones[index - 1]
+                else:
+                    reference = pbn.parent
+
+                reference_matrix = self.world_matrix(reference)
+
+                bone_matrix = self.world_matrix(pbn)
+
+                offset = (
+                    reference_matrix.inverted()
+                    @ bone_matrix
+                )
+
+                chain["offset"].append(offset)
+
+                length = max(pbn.length, EPS)
+
+                chain["length"].append(length)
+
+                chain["state"].append({
+                    "head": bone_matrix.translation.copy(),
+                    "head_vel": ZERO.copy(),
+
+                    "tip": self._tip_of(
+                        bone_matrix,
+                        length
+                    ),
+
+                    "tip_vel": ZERO.copy(),
+
+                    "prev_quat":
+                        pbn.rotation_quaternion.copy(),
+
+                    "prev_euler":
+                        pbn.rotation_euler.copy(),
+                })
+
+                if (
+                    self.animate_translate
+                    and not self.can_translate(pbn)
+                ):
+                    self.translate_skipped.append(
+                        pbn.name
+                    )
+
+        return trees
+
+    # =========================================================================
+    # ROTATION
+    # =========================================================================
+
+    def rotation_data_path(self, pbn):
+
+        if pbn.rotation_mode == 'QUATERNION':
+            return 'rotation_quaternion'
+
+        if pbn.rotation_mode == 'AXIS_ANGLE':
+            return 'rotation_axis_angle'
+
+        return 'rotation_euler'
+
+    def make_rotation_continuous(self, pbn, state):
+
+        mode = pbn.rotation_mode
+
+        if mode == 'QUATERNION':
+
+            quat = pbn.rotation_quaternion.copy()
+
+            previous = state.get("prev_quat")
+
+            if previous is not None:
+
+                if quat.dot(previous) < 0.0:
+
+                    quat = mathutils.Quaternion(
+                        (
+                            -quat.w,
+                            -quat.x,
+                            -quat.y,
+                            -quat.z
+                        )
+                    )
+
+                    pbn.rotation_quaternion = quat
+
+            state["prev_quat"] = quat.copy()
+
+        elif mode == 'AXIS_ANGLE':
+
+            # Axis-angle values are already generated from the resulting
+            # matrix. Keep them untouched to avoid changing the user's mode.
+            pass
+
+        else:
+
+            euler = pbn.rotation_euler.copy()
+
+            previous = state.get("prev_euler")
+
+            if previous is not None:
+
+                euler.make_compatible(previous)
+
+                pbn.rotation_euler = euler
+
+            state["prev_euler"] = euler.copy()
+
+    # =========================================================================
+    # KEYFRAME
+    # =========================================================================
+
+    def set_animkey(self, pbn):
+
+        frame = bpy.context.scene.frame_current
+
+        for axis in self.translate_axes(pbn):
+
+            pbn.keyframe_insert(
+                data_path="location",
+                index=axis,
+                frame=frame
+            )
+
+        pbn.keyframe_insert(
+            data_path=self.rotation_data_path(pbn),
+            frame=frame
+        )
+
+    # =========================================================================
+    # POSE SNAPSHOT
+    # =========================================================================
+
+    def capture_pose(self, trees):
+
+        snapshot = {}
+
+        for pbn in self.iter_bones(trees):
+
+            snapshot[pbn.name] = {
+                "location": pbn.location.copy(),
+                "rotation_quaternion":
+                    pbn.rotation_quaternion.copy(),
+                "rotation_euler":
+                    pbn.rotation_euler.copy(),
+                "rotation_axis_angle":
+                    list(pbn.rotation_axis_angle),
+                "scale": pbn.scale.copy(),
+            }
+
+        return snapshot
+
+    def restore_pose(self, trees, snapshot):
+
+        if not snapshot:
+            return
+
+        for pbn in self.iter_bones(trees):
+
+            values = snapshot.get(pbn.name)
+
+            if values is None:
+                continue
+
+            pbn.location = values["location"].copy()
+
+            pbn.rotation_quaternion = (
+                values["rotation_quaternion"].copy()
+            )
+
+            old_euler = values["rotation_euler"]
+
+            pbn.rotation_euler = mathutils.Euler(
+                (
+                    old_euler[0],
+                    old_euler[1],
+                    old_euler[2]
+                ),
+                old_euler.order
+            )
+
+            pbn.rotation_axis_angle = (
+                values["rotation_axis_angle"]
+            )
+
+            pbn.scale = values["scale"].copy()
+
+        bpy.context.view_layer.update()
+
+    # =========================================================================
+    # BLENDER 4.4+ / 5.x ACTION API
+    # =========================================================================
+
+    def _fcurve_container(self, id_data):
+
+        animation_data = id_data.animation_data
+
+        if animation_data is None:
+            return None
+
+        action = animation_data.action
+
+        if action is None:
+            return None
+
+        # Blender 5.1's slotted Action API.
+        #
+        # On 5.0+ Action.fcurves was removed entirely, so the legacy fallback
+        # below must use getattr() rather than a bare attribute access -- a
+        # missing attribute there would raise and take the whole bake down.
+        # If the helper itself is renamed in a future build we degrade to
+        # "no keys touched" instead of crashing.
+        try:
+            from bpy_extras import anim_utils
+        except ImportError:
+            return getattr(action, "fcurves", None)
+
+        get_bag = getattr(
+            anim_utils,
+            "action_get_channelbag_for_slot",
+            None
+        )
+
+        if get_bag is None:
+            return getattr(action, "fcurves", None)
+
+        slot = getattr(
+            animation_data,
+            "action_slot",
+            None
+        )
+
+        if slot is not None:
+
+            try:
+                channelbag = get_bag(action, slot)
+            except (AttributeError, RuntimeError, TypeError):
+                channelbag = None
+
+            if channelbag is not None:
+                return channelbag.fcurves
+
+        # Legacy fallback (a slot-less action, e.g. one authored on <= 4.3
+        # and never re-saved under the slotted layout).
+        return getattr(action, "fcurves", None)
+
+    def _get_fcurves(self, id_data):
+
+        container = self._fcurve_container(id_data)
+
+        if container is None:
+            return []
+
+        return list(container)
+
+    # =========================================================================
+    # F-CURVE MAPPING
+    # =========================================================================
+
+    def _chain_fcurve_map(self, trees):
+
+        armature = bpy.context.active_object
+
+        bones = {
+            pbn.path_from_id(): pbn
+            for pbn in self.iter_bones(trees)
+        }
+
+        result = []
+
+        for fcurve in self._get_fcurves(armature):
+
+            for prefix, pbn in bones.items():
+
+                if fcurve.data_path.startswith(
+                    prefix + "."
+                ):
+
+                    channel = (
+                        fcurve.data_path[
+                            len(prefix) + 1:
+                        ]
+                    )
+
+                    result.append(
+                        (
+                            fcurve,
+                            pbn,
+                            channel
+                        )
+                    )
+
+                    break
+
+        return result
+
+    def _baked_channels(self, trees):
+
+        groups = {}
+
+        for fcurve, pbn, channel in self._chain_fcurve_map(trees):
+
+            if channel == self.rotation_data_path(pbn):
+
+                pass
+
+            elif (
+                channel == "location"
+                and fcurve.array_index
+                in self.translate_axes(pbn)
+            ):
+
+                pass
+
+            else:
+
+                continue
+
+            key = (
+                pbn.name,
+                channel
+            )
+
+            groups.setdefault(
+                key,
+                []
+            ).append(
+                (fcurve, pbn)
+            )
+
+        return groups
+
+    def _baked_fcurves(self, trees):
+
+        result = []
+
+        for curves in self._baked_channels(trees).values():
+
+            result.extend(curves)
+
+        return result
+
+    # =========================================================================
+    # REMOVE KEYS
+    # =========================================================================
+
+    def del_animkey(
+        self,
+        trees,
+        pose_snapshot=None
+    ):
+
+        container = self._fcurve_container(
+            bpy.context.active_object
+        )
+
+        emptied = []
+
+        for (
+            fcurve,
+            pbn,
+            channel
+        ) in self._chain_fcurve_map(trees):
+
+            if channel == "location":
+
+                if (
+                    fcurve.array_index
+                    not in self.translate_axes(pbn)
+                ):
+                    continue
+
+            elif channel not in (
+                "rotation_euler",
+                "rotation_quaternion",
+                "rotation_axis_angle",
+                "scale"
+            ):
+
+                continue
+
+            points = fcurve.keyframe_points
+
+            remove_indices = [
+                index
+                for index, point in enumerate(points)
+                if (
+                    self.sf
+                    <= point.co[0]
+                    <= self.ef
+                )
+            ]
+
+            for index in reversed(remove_indices):
+
+                points.remove(
+                    points[index],
+                    fast=True
+                )
+
+            fcurve.update()
+
+            if len(points) == 0:
+
+                emptied.append(fcurve)
+
+        if container is not None:
+
+            for fcurve in emptied:
+
+                try:
+                    container.remove(fcurve)
+
+                except (
+                    RuntimeError,
+                    ReferenceError
+                ):
+                    pass
+
+        bpy.context.view_layer.update()
+
+        self.restore_pose(
+            trees,
+            pose_snapshot
+        )
+
+        frame = self.sf
+
+        for pbn in self.iter_bones(trees):
+
+            for axis in self.translate_axes(pbn):
+
+                pbn.keyframe_insert(
+                    data_path="location",
+                    index=axis,
+                    frame=frame
+                )
+
+            pbn.keyframe_insert(
+                data_path=self.rotation_data_path(pbn),
+                frame=frame
+            )
+
+        self.remove_cyclic_modifiers(trees)
+
+    # =========================================================================
+    # CYCLE MODIFIERS
+    # =========================================================================
+
+    def add_cyclic_modifiers(self, trees):
+
+        for fcurve, _bone in self._baked_fcurves(trees):
+
+            if not any(
+                modifier.type == "CYCLES"
+                for modifier in fcurve.modifiers
+            ):
+
+                # Keyword form: positional .new("CYCLES") is deprecated in
+                # 4.4+ and gone in 5.0.
+                fcurve.modifiers.new(
+                    type="CYCLES"
+                )
+
+    def remove_cyclic_modifiers(self, trees=None):
+        r"""Remove every CYCLES F-Curve modifier from the armature.
+
+        `trees` is accepted for call-site compatibility but deliberately
+        ignored: a selection-scoped sweep only touches the curves of bones
+        that happen to be selected *right now*, so changing the selection
+        after a cycle bake leaves the modifiers running on the curves they
+        were added to. Walking the whole action is the only way to actually
+        stop a cycle -- which matters for both "tick Cycle off, Calculate"
+        and "Delete Keyframe" after a cycle bake."""
+
+        armature = bpy.context.active_object
+
+        if armature is None:
+            return 0
+
+        removed = 0
+
+        for fcurve in self._get_fcurves(armature):
+
+            for modifier in list(fcurve.modifiers):
+
+                if modifier.type == "CYCLES":
+
+                    fcurve.modifiers.remove(modifier)
+
+                    removed += 1
+
+        return removed
+
+    # =========================================================================
+    # KEY CLEANUP
+    # =========================================================================
+
+    def cleanup_keys(self, trees):
+
+        tolerance = max(
+            self.threshold,
+            1.0e-6
+        )
+
+        removed = 0
+
+        for curves in self._baked_channels(
+            trees
+        ).values():
+
+            fcurves = [
+                fc
+                for fc, _bone in curves
+            ]
+
+            if not fcurves:
+                continue
+
+            frame_sets = []
+
+            for fc in fcurves:
+
+                frame_sets.append(
+                    {
+                        kp.co[0]
+                        for kp in fc.keyframe_points
+                        if (
+                            self.sf
+                            <= kp.co[0]
+                            <= self.ef
+                        )
+                    }
+                )
+
+            if not frame_sets:
+                continue
+
+            common_frames = set.intersection(
+                *frame_sets
+            )
+
+            frames = sorted(common_frames)
+
+            if len(frames) <= 2:
+
+                self._smooth(fcurves)
+
+                continue
+
+            lookup_values = []
+
+            for fc in fcurves:
+
+                lookup = {
+                    kp.co[0]: kp.co[1]
+                    for kp in fc.keyframe_points
+                }
+
+                lookup_values.append(
+                    [
+                        lookup[frame]
+                        for frame in frames
+                    ]
+                )
+
+            drop_frames = set()
+
+            previous = 0
+
+            for index in range(
+                1,
+                len(frames) - 1
+            ):
+
+                f0 = frames[previous]
+                f1 = frames[index]
+                f2 = frames[index + 1]
+
+                if abs(f2 - f0) < EPS:
+                    continue
+
+                ratio = (
+                    (f1 - f0)
+                    / (f2 - f0)
+                )
+
+                redundant = True
+
+                for values in lookup_values:
+
+                    interpolated = (
+                        values[previous]
+                        + (
+                            values[index + 1]
+                            - values[previous]
+                        ) * ratio
+                    )
+
+                    if abs(
+                        values[index]
+                        - interpolated
+                    ) > tolerance:
+
+                        redundant = False
+                        break
+
+                if redundant:
+
+                    drop_frames.add(f1)
+
+                else:
+
+                    previous = index
+
+            for fc in fcurves:
+
+                points = fc.keyframe_points
+
+                indices = [
+                    index
+                    for index, kp
+                    in enumerate(points)
+                    if kp.co[0] in drop_frames
+                ]
+
+                for index in reversed(indices):
+
+                    points.remove(
+                        points[index],
+                        fast=True
+                    )
+
+                    removed += 1
+
+                fc.update()
+
+            self._smooth(fcurves)
+
+        return removed
+
+    def _smooth(self, fcurves):
+
+        for fcurve in fcurves:
+
+            for kp in fcurve.keyframe_points:
+
+                if (
+                    self.sf
+                    <= kp.co[0]
+                    <= self.ef
+                ):
+
+                    kp.interpolation = "BEZIER"
+
+                    kp.handle_left_type = (
+                        "AUTO_CLAMPED"
+                    )
+
+                    kp.handle_right_type = (
+                        "AUTO_CLAMPED"
+                    )
+
+            fcurve.update()
+
+    # =========================================================================
+    # CYCLE ANALYSIS
+    # =========================================================================
+
+    def cycle_residual(self, trees):
+
+        worst = 0.0
+        worst_name = ""
+
+        for fcurve, pbn in self._baked_fcurves(trees):
+
+            start_value = fcurve.evaluate(
+                self.sf
+            )
+
+            end_value = fcurve.evaluate(
+                self.ef
+            )
+
+            difference = abs(
+                end_value - start_value
+            )
+
+            if difference > worst:
+
+                worst = difference
+                worst_name = pbn.name
+
+        return worst_name, worst
+
+    def _seam_keys(self, fcurve):
+
+        first = None
+        last = None
+
+        for kp in fcurve.keyframe_points:
+
+            frame = int(
+                round(kp.co[0])
+            )
+
+            if frame == self.sf:
+                first = kp
+
+            elif frame == self.ef:
+                last = kp
+
+        return first, last
+
+    def enforce_cycle_seam(self, trees):
+
+        for fcurve, _bone in self._baked_fcurves(trees):
+
+            first, last = self._seam_keys(
+                fcurve
+            )
+
+            if (
+                first is None
+                or last is None
+                or first is last
+            ):
+                continue
+
+            last.co[1] = first.co[1]
+
+            fcurve.update()
+
+    def set_cycle_seam_tangents(self, trees):
+
+        for fcurve, _bone in self._baked_fcurves(trees):
+
+            first, last = self._seam_keys(
+                fcurve
+            )
+
+            if (
+                first is None
+                or last is None
+                or first is last
+            ):
+                continue
+
+            after = None
+            before = None
+
+            for kp in fcurve.keyframe_points:
+
+                frame = kp.co[0]
+
+                if (
+                    first.co[0]
+                    < frame
+                    <= last.co[0]
+                ):
+
+                    if after is None:
+                        after = kp
+
+                    if frame < last.co[0]:
+                        before = kp
+
+            if (
+                after is None
+                or before is None
+                or after is last
+                or before is first
+            ):
+                continue
+
+            dt_a = (
+                after.co[0]
+                - first.co[0]
+            )
+
+            dt_b = (
+                last.co[0]
+                - before.co[0]
+            )
+
+            if dt_a + dt_b < EPS:
+                continue
+
+            slope = (
+                after.co[1]
+                - before.co[1]
+            ) / (
+                dt_a + dt_b
+            )
+
+            first.interpolation = "BEZIER"
+            last.interpolation = "BEZIER"
+
+            first.handle_left_type = "FREE"
+            first.handle_right_type = "FREE"
+
+            last.handle_left_type = "FREE"
+            last.handle_right_type = "FREE"
+
+            first.handle_left = (
+                first.co[0] - dt_b / 3.0,
+                first.co[1] - slope * dt_b / 3.0
+            )
+
+            first.handle_right = (
+                first.co[0] + dt_a / 3.0,
+                first.co[1] + slope * dt_a / 3.0
+            )
+
+            last.handle_left = (
+                last.co[0] - dt_b / 3.0,
+                last.co[1] - slope * dt_b / 3.0
+            )
+
+            last.handle_right = (
+                last.co[0] + dt_a / 3.0,
+                last.co[1] + slope * dt_a / 3.0
+            )
+
+            fcurve.update()
+
+    # =========================================================================
+    # SOLVER
+    # =========================================================================
+
+    def solve_bone(
+        self,
+        chain,
+        index,
+        driver_matrix,
+        k,
+        c,
+        amp
+    ):
+
+        pbn = chain["obj_list"][index]
+
+        state = chain["state"][index]
+
+        target_matrix = (
+            driver_matrix
+            @ chain["offset"][index]
+        )
+
+        target_quat = (
+            target_matrix
+            .to_quaternion()
+            .normalized()
+        )
+
+        target_head = (
+            target_matrix.translation.copy()
+        )
+
+        length = max(
+            chain["length"][index],
+            EPS
+        )
+
+        target_tip = self._tip_of(
+            target_matrix,
+            length
+        )
+
+        target_segment = (
+            target_tip
+            - target_head
+        )
+
+        if target_segment.length < EPS:
+
+            target_direction = (
+                target_quat
+                @ BONE_AXIS
+            ).normalized()
+
+            target_tip = (
+                target_head
+                + target_direction * length
+            )
+
+        target_direction = (
+            target_tip
+            - target_head
+        ).normalized()
+
+        # ---------------------------------------------------------------------
+        # HEAD / TRANSLATION
+        # ---------------------------------------------------------------------
+
+        if self.can_translate(pbn):
+
+            head_velocity = (
+                state["head_vel"] * (1.0 - c)
+                + (
+                    target_head
+                    - state["head"]
+                ) * k
+            )
+
+            if head_velocity.length < self.threshold:
+
+                head_velocity = ZERO.copy()
+
+            state["head_vel"] = head_velocity
+
+            state["head"] += head_velocity
+
+            drift = (
+                state["head"]
+                - target_head
+            )
+
+            if drift.length > (
+                length * MAX_HEAD_DRIFT
+            ):
+
+                state["head"] = (
+                    target_head
+                    + drift.normalized()
+                    * length
+                    * MAX_HEAD_DRIFT
+                )
+
+                state["head_vel"] = ZERO.copy()
+
+            output_head = (
+                target_head
+                + (
+                    state["head"]
+                    - target_head
+                ) * amp
+            )
+
+        else:
+
+            state["head"] = target_head.copy()
+            state["head_vel"] = ZERO.copy()
+
+            output_head = target_head.copy()
+
+        # ---------------------------------------------------------------------
+        # TIP SOLVER
+        # ---------------------------------------------------------------------
+
+        tip_velocity = (
+            state["tip_vel"] * (1.0 - c)
+            + (
+                target_tip
+                - state["tip"]
+            ) * k
+        )
+
+        if tip_velocity.length < self.threshold:
+
+            tip_velocity = ZERO.copy()
+
+        state["tip_vel"] = tip_velocity
+
+        state["tip"] += tip_velocity
+
+        # Preserve exact bone length.
+        span = (
+            state["tip"]
+            - state["head"]
+        )
+
+        if span.length < EPS:
+
+            span = target_direction.copy()
+
+        state["tip"] = (
+            state["head"]
+            + span.normalized()
+            * length
+        )
+
+        simulated_direction = (
+            state["tip"]
+            - state["head"]
+        ).normalized()
+
+        # ---------------------------------------------------------------------
+        # STRENGTH
+        # ---------------------------------------------------------------------
+
+        if amp > 1.0:
+
+            output_direction = (
+                target_direction
+                + (
+                    simulated_direction
+                    - target_direction
+                ) * amp
+            )
+
+            if output_direction.length > EPS:
+
+                output_direction.normalize()
+
+            else:
+
+                output_direction = (
+                    simulated_direction
+                )
+
+        else:
+
+            output_direction = (
+                simulated_direction
+            )
+
+        output_direction = self._limit_dir(
+            target_direction,
+            output_direction,
+            MAX_LAG_ANGLE
+        )
+
+        # Preserve rig roll.
+        output_quaternion = (
+            target_direction.rotation_difference(
+                output_direction
+            )
+            @ target_quat
+        )
+
+        output_quaternion.normalize()
+
+        return (
+            mathutils.Matrix.Translation(
+                output_head
+            )
+            @ output_quaternion.to_matrix().to_4x4()
+        )
+
+    # =========================================================================
+    # SOLVE CHAIN
+    # =========================================================================
+
+    def solve_chain(
+        self,
+        chain,
+        k,
+        c,
+        amp,
+        write
+    ):
+
+        armature = bpy.context.active_object
+
+        armature_inverse = (
+            armature.matrix_world.inverted()
+        )
+
+        bones = chain["obj_list"]
+
+        if not bones:
+            return
+
+        driver_matrix = self.world_matrix(
+            bones[0].parent
+        )
+
+        for index, pbn in enumerate(bones):
+
+            original_location = (
+                pbn.location.copy()
+            )
+
+            original_scale = (
+                pbn.scale.copy()
+            )
+
+            should_translate = (
+                self.can_translate(pbn)
+            )
+
+            solved_world = self.solve_bone(
+                chain,
+                index,
+                driver_matrix,
+                k,
+                c,
+                amp
+            )
+
+            # World -> pose space.
+            solved_pose = (
+                armature_inverse
+                @ solved_world
+            )
+
+            pbn.matrix = solved_pose
+
+            # Never allow solver to alter scale.
+            pbn.scale = original_scale
+
+            # Connected / locked translation must remain untouched.
+            if not should_translate:
+
+                pbn.location = (
+                    original_location
+                )
+
+            else:
+
+                for axis in range(3):
+
+                    if pbn.lock_location[axis]:
+
+                        pbn.location[axis] = (
+                            original_location[axis]
+                        )
+
+            self.make_rotation_continuous(
+                pbn,
+                chain["state"][index]
+            )
+
+            # CRITICAL: PoseBone.matrix's setter writes only chan_mat, not
+            # pose_mat -- pose_mat is written by depsgraph evaluation. The
+            # next bone in this chain reads its driver through world_matrix(),
+            # which reads pose_mat, so without this update the whole chain
+            # would solve against the pre-solve parent transform every frame.
+            # (No-op for a chain with a single bone, but a real cost on long
+            # chains -- profile before removing.)
+            bpy.context.view_layer.update()
+
+            if write:
+
+                self.set_animkey(pbn)
+
+            # The next bone follows the ACTUAL resulting transform,
+            # constraints and locks included.
+            driver_matrix = self.world_matrix(
+                pbn
+            )
+
+    # =========================================================================
+    # EXECUTION
+    # =========================================================================
+
+    def execute(
+        self,
+        trees,
+        write=True,
+        include_start=False
+    ):
+
+        k, c, amp = self.solver_params()
+
+        scene = bpy.context.scene
+
+        first_frame = (
+            self.sf
+            if include_start
+            else self.sf + 1
+        )
+
+        for frame in range(
+            first_frame,
+            self.ef + 1
+        ):
+
+            scene.frame_set(frame)
+
+            for chain in self.iter_chains(trees):
+
+                self.solve_chain(
+                    chain,
+                    k,
+                    c,
+                    amp,
+                    write
+                )
+
+        self.passes_run += 1
+
+        return True
+
+    # =========================================================================
+    # CYCLIC SOLVER
+    # =========================================================================
+
+    def solve_cycle(
+        self,
+        trees,
+        preroll
+    ):
+
+        self.passes_run = 0
+
+        passes = max(
+            1,
+            int(preroll)
+        )
+
+        for _ in range(passes):
+
+            self.execute(
+                trees,
+                write=False,
+                include_start=True
+            )
+
+        self.execute(
+            trees,
+            write=True,
+            include_start=True
+        )
+
+        return passes
+
+    # =========================================================================
+    # MESSAGE
+    # =========================================================================
+
+    def message_box(
+        self,
+        message="",
+        title="Message",
+        icon="INFO"
+    ):
+
+        def draw(self, context):
+
+            self.layout.label(
+                text=message
+            )
+
+        bpy.context.window_manager.popup_menu(
+            draw,
+            title=title,
+            icon=icon
+        )
+
+
+# =============================================================================
+# PROPERTIES
+# =============================================================================
+
+class PERFECTOVERLAP_PG_props(
+    bpy.types.PropertyGroup
+):
+
+    start_frame: bpy.props.IntProperty(
+        name="Start Frame",
+        default=0,
+        min=0
+    )
+
+    end_frame: bpy.props.IntProperty(
+        name="End Frame",
+        default=100,
+        min=1
+    )
+
+    delay: bpy.props.FloatProperty(
+        name="Delay",
+        default=3.0,
+        min=1.0,
+        max=10.0,
+        description=(
+            "How far the chain lags behind the "
+            "control driving it"
+        )
+    )
+
+    recursion: bpy.props.FloatProperty(
+        name="Recursion",
+        default=5.0,
+        min=0.0,
+        max=10.0,
+        description=(
+            "How much momentum carries through"
+        )
+    )
+
+    strength: bpy.props.FloatProperty(
+        name="Strength",
+        default=1.0,
+        min=1.0,
+        max=10.0,
+        description=(
+            "Exaggerates the overlap offset"
+        )
+    )
+
+    threshold: bpy.props.FloatProperty(
+        name="Threshold",
+        default=0.001,
+        min=0.00001,
+        max=0.1,
+        step=0.01,
+        precision=4,
+        description=(
+            "Motion smaller than this is ignored"
+        )
+    )
+
+    debug: bpy.props.BoolProperty(
+        name="Debug",
+        default=False
+    )
+
+    animate_translate: bpy.props.BoolProperty(
+        name="Translation",
+        default=False,
+        description=(
+            "Also overlap unlocked translation axes"
+        )
+    )
+
+    cycle: bpy.props.BoolProperty(
+        name="Cycle",
+        default=False,
+        description=(
+            "Solve the range as a continuous loop"
+        )
+    )
+
+    cycle_preroll: bpy.props.IntProperty(
+        name="Pre-roll Passes",
+        default=2,
+        min=1,
+        max=6,
+        description=(
+            "Number of cyclic settling passes"
+        )
+    )
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+def _configure(module, props):
+
+    module.sf = props.start_frame
+    module.ef = props.end_frame
+
+    module.debug = props.debug
+
+    module.delay = props.delay
+    module.recursion = props.recursion
+    module.strength = props.strength
+    module.threshold = props.threshold
+
+    module.animate_translate = (
+        props.animate_translate
+    )
+
+    return module
+
+
+def _frame_range_ok(operator, props):
+
+    if props.start_frame < props.end_frame:
+
+        return True
+
+    message = (
+        "Make the start frame smaller than "
+        "the end frame."
+    )
+
+    # operator.report alone already surfaces in the status bar / info log.
+    # A popup on top of that would show the same message twice.
+    operator.report(
+        {"INFO"},
+        message
+    )
+
+    return False
+
+
+# =============================================================================
+# CALCULATE OPERATOR
+# =============================================================================
+
+class PERFECTOVERLAP_OT_calculate(
+    bpy.types.Operator
+):
+
+    bl_idname = "perfect_overlap.calculate"
+    bl_label = "Calculate"
+    bl_description = (
+        "Calculate overlapping follow-through animation"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+
+        return (
+            context.active_object is not None
+            and context.active_object.type == "ARMATURE"
+        )
+
+    def execute(self, context):
+
+        props = (
+            context.scene.perfect_overlap_props
+        )
+
+        module = _configure(
+            SJPhaserModule(),
+            props
+        )
+
+        if not _frame_range_ok(
+            self,
+            props
+        ):
+
+            return {"CANCELLED"}
+
+        scene = context.scene
+
+        scene.frame_set(
+            props.start_frame
+        )
+
+        bpy.ops.wm.redraw_timer(
+            type="DRAW_WIN_SWAP",
+            iterations=1
+        )
+
+        trees = module.get_tree_list()
+
+        if not trees:
+
+            message = (
+                "No usable control chain. "
+                "Select the controls to overlap."
+            )
+
+            self.report(
+                {"WARNING"},
+                message
+            )
+
+            return {"CANCELLED"}
+
+        # Capture BEFORE modifying animation.
+        start_pose = module.capture_pose(
+            trees
+        )
+
+        # del_animkey() ends with restore_pose(trees, pose_snapshot), so the
+        # pose is already back to the user's start pose once this returns.
+        module.del_animkey(
+            trees,
+            start_pose
+        )
+
+        scene.frame_set(
+            props.start_frame
+        )
+
+        module.set_pre_data(
+            trees
+        )
+
+        # ---------------------------------------------------------------------
+        # NORMAL
+        # ---------------------------------------------------------------------
+
+        if not props.cycle:
+
+            module.execute(
+                trees,
+                write=True,
+                include_start=False
+            )
+
+            module.cleanup_keys(
+                trees
+            )
+
+            module.remove_cyclic_modifiers(
+                trees
+            )
+
+        # ---------------------------------------------------------------------
+        # CYCLE
+        # ---------------------------------------------------------------------
+
+        else:
+
+            passes = module.solve_cycle(
+                trees,
+                props.cycle_preroll
+            )
+
+            name, difference = (
+                module.cycle_residual(
+                    trees
+                )
+            )
+
+            module.cleanup_keys(
+                trees
+            )
+
+            module.enforce_cycle_seam(
+                trees
+            )
+
+            module.set_cycle_seam_tangents(
+                trees
+            )
+
+            module.add_cyclic_modifiers(
+                trees
+            )
+
+            if difference > 0.01:
+
+                self.report(
+                    {"WARNING"},
+                    (
+                        "Cycle drift {:.4f} on '{}'. "
+                        "Increase Pre-roll Passes."
+                    ).format(
+                        difference,
+                        name
+                    )
+                )
+
+            else:
+
+                self.report(
+                    {"INFO"},
+                    (
+                        "Cycle solved. "
+                        "Pre-roll: {}. "
+                        "Drift: {:.5f}"
+                    ).format(
+                        passes,
+                        difference
+                    )
+                )
+
+        # ---------------------------------------------------------------------
+        # TRANSLATION REPORT
+        # ---------------------------------------------------------------------
+
+        if (
+            props.animate_translate
+            and module.translate_skipped
+        ):
+
+            self.report(
+                {"WARNING"},
+                (
+                    "Translation skipped on {} "
+                    "control(s) because they are "
+                    "connected or location-locked."
+                ).format(
+                    len(
+                        module.translate_skipped
+                    )
+                )
+            )
+
+        scene.frame_set(
+            props.start_frame
+        )
+
+        bpy.ops.wm.redraw_timer(
+            type="DRAW_WIN_SWAP",
+            iterations=1
+        )
+
+        return {"FINISHED"}
+
+
+# =============================================================================
+# DELETE OPERATOR
+# =============================================================================
+
+class PERFECTOVERLAP_OT_del_anim(
+    bpy.types.Operator
+):
+
+    bl_idname = "perfect_overlap.del_anim"
+    bl_label = "Delete Keyframe"
+    bl_description = (
+        "Delete the overlap animation keys"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+
+        return (
+            context.active_object is not None
+            and context.active_object.type == "ARMATURE"
+        )
+
+    def execute(self, context):
+
+        props = (
+            context.scene.perfect_overlap_props
+        )
+
+        module = _configure(
+            SJPhaserModule(),
+            props
+        )
+
+        if not _frame_range_ok(
+            self,
+            props
+        ):
+
+            return {"CANCELLED"}
+
+        context.scene.frame_set(
+            props.start_frame
+        )
+
+        bpy.ops.wm.redraw_timer(
+            type="DRAW_WIN_SWAP",
+            iterations=1
+        )
+
+        trees = module.get_tree_list()
+
+        if not trees:
+
+            self.report(
+                {"WARNING"},
+                "No selected overlap chain."
+            )
+
+            return {"CANCELLED"}
+
+        start_pose = module.capture_pose(
+            trees
+        )
+
+        # del_animkey() restores the captured pose at the end and clears
+        # every CYCLES modifier on the action, so a cycle baked with a
+        # previous selection is stopped here too.
+        module.del_animkey(
+            trees,
+            start_pose
+        )
+
+        bpy.ops.wm.redraw_timer(
+            type="DRAW_WIN_SWAP",
+            iterations=1
+        )
+
+        return {"FINISHED"}
+
+
+# =============================================================================
+# RESET
+# =============================================================================
+
+class PERFECTOVERLAP_OT_reset_settings(
+    bpy.types.Operator
+):
+
+    bl_idname = "perfect_overlap.reset_settings"
+    bl_label = "Reset Settings"
+    bl_description = (
+        "Reset Perfect Overlap settings"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+
+        props = (
+            context.scene.perfect_overlap_props
+        )
+
+        for prop in props.bl_rna.properties:
+
+            if prop.identifier in {
+                "rna_type",
+                "name"
+            }:
+                continue
+
+            try:
+                props.property_unset(
+                    prop.identifier
+                )
+            except Exception:
+                pass
+
+        self.report(
+            {"INFO"},
+            "Perfect Overlap settings reset"
+        )
+
+        return {"FINISHED"}
+
+
+# =============================================================================
+# UI
+# =============================================================================
+
+class PERFECTOVERLAP_PT_panel(
+    bpy.types.Panel
+):
+
+    bl_label = "Perfect Overlap"
+    bl_idname = "PERFECTOVERLAP_PT_panel"
+
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_context = "posemode"
+
+    bl_category = "SJT"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+
+        layout = self.layout
+
+        props = (
+            context.scene.perfect_overlap_props
+        )
+
+        # ---------------------------------------------------------------------
+        # FRAME
+        # ---------------------------------------------------------------------
+
+        layout.label(
+            text="Frame"
+        )
+
+        row = layout.row()
+
+        row.prop(
+            props,
+            "start_frame"
+        )
+
+        row.prop(
+            props,
+            "end_frame"
+        )
+
+        # ---------------------------------------------------------------------
+        # PROPERTIES
+        # ---------------------------------------------------------------------
+
+        layout.label(
+            text="Properties"
+        )
+
+        row = layout.row(
+            align=True
+        )
+
+        row.prop(
+            props,
+            "delay"
+        )
+
+        row.prop(
+            props,
+            "recursion"
+        )
+
+        row.prop(
+            props,
+            "strength"
+        )
+
+        row = layout.row()
+
+        row.prop(
+            props,
+            "threshold"
+        )
+
+        # ---------------------------------------------------------------------
+        # OPTIONS
+        # ---------------------------------------------------------------------
+
+        layout.label(
+            text="Options"
+        )
+
+        box = layout.box()
+
+        col = box.column(
+            align=True
+        )
+
+        col.prop(
+            props,
+            "animate_translate"
+        )
+
+        cycle_box = layout.box()
+
+        cycle_box.prop(
+            props,
+            "cycle"
+        )
+
+        if props.cycle:
+
+            col = cycle_box.column(
+                align=True
+            )
+
+            col.prop(
+                props,
+                "cycle_preroll"
+            )
+
+        # ---------------------------------------------------------------------
+        # MAIN
+        # ---------------------------------------------------------------------
+
+        layout.label(
+            text="Main"
+        )
+
+        row = layout.row()
+
+        row.scale_y = 1.8
+
+        row.operator(
+            "perfect_overlap.calculate",
+            icon="KEYTYPE_KEYFRAME_VEC"
+        )
+
+        row = layout.row()
+
+        row.operator(
+            "perfect_overlap.del_anim",
+            icon="KEYFRAME"
+        )
+
+        row = layout.row()
+
+        row.operator(
+            "perfect_overlap.reset_settings",
+            icon="LOOP_BACK"
+        )
+
+
+# =============================================================================
+# REGISTER
+# =============================================================================
+
+classes = (
+    PERFECTOVERLAP_PG_props,
+    PERFECTOVERLAP_OT_calculate,
+    PERFECTOVERLAP_OT_del_anim,
+    PERFECTOVERLAP_OT_reset_settings,
+    PERFECTOVERLAP_PT_panel,
+)
+
+
+def register():
+
+    for cls in classes:
+
+        bpy.utils.register_class(
+            cls
+        )
+
+    bpy.types.Scene.perfect_overlap_props = (
+        bpy.props.PointerProperty(
+            type=PERFECTOVERLAP_PG_props
+        )
+    )
+
+
+def unregister():
+
+    if hasattr(
+        bpy.types.Scene,
+        "perfect_overlap_props"
+    ):
+
+        del bpy.types.Scene.perfect_overlap_props
+
+    for cls in reversed(classes):
+
+        bpy.utils.unregister_class(
+            cls
+        )
+
+
+if __name__ == "__main__":
+
+    register()
