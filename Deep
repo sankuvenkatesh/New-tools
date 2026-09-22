@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
-    "version": (5, 2, 3),
+    "version": (5, 2, 5),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-panel) > Overlapper",
     "description": "Automatic overlapping / follow-through secondary animation for chains of objects or bones.",
@@ -27,6 +27,13 @@ VALID_EULER_ORDERS = {
 }
 
 _BACKUP_STORE = {}
+
+_PROGRESS_STATE = {
+    "label": "Overlapper",
+    "cancelled": False,
+    "restore_frame": None,
+    "restore_subframe": 0.0,
+}
 
 
 # ============================================================================
@@ -79,11 +86,6 @@ def ensure_animation_data(id_obj):
 
 
 def get_action_slot(anim):
-    """
-    Blender 4.4+ introduced Action Slots.
-
-    Return the currently assigned slot when available.
-    """
     try:
         return anim.action_slot
     except AttributeError:
@@ -91,9 +93,6 @@ def get_action_slot(anim):
 
 
 def assign_action_slot(anim, slot):
-    """
-    Restore an Action Slot when Blender exposes the API.
-    """
     if slot is None:
         return
 
@@ -145,6 +144,42 @@ def depsgraph_update(context):
     try:
         dg = context.evaluated_depsgraph_get()
         dg.update()
+    except Exception:
+        pass
+
+
+# ============================================================================
+# Progress bar helpers
+# ============================================================================
+
+def begin_progress(context, total, label="Overlapper"):
+    try:
+        wm = context.window_manager
+        wm.progress_begin(0, max(int(total), 1))
+        wm.progress_update(0)
+        _PROGRESS_STATE["label"] = label
+        _PROGRESS_STATE["cancelled"] = False
+    except Exception:
+        pass
+
+
+def update_progress(context, current, total, extra=""):
+    try:
+        wm = context.window_manager
+        wm.progress_update(int(current))
+
+        # Best-effort cancel detection.  Blender does not expose a
+        # documented cancel flag on WindowManager; some builds expose
+        # `progress_cancel`, others do not.  Silently ignore if absent.
+        if getattr(wm, "progress_cancel", False):
+            _PROGRESS_STATE["cancelled"] = True
+    except Exception:
+        pass
+
+
+def end_progress(context):
+    try:
+        context.window_manager.progress_end()
     except Exception:
         pass
 
@@ -476,12 +511,6 @@ def push_base_action_to_nla(
         id_obj,
         _frame_start=None
 ):
-    """
-    Preserve the source action in an NLA Base track.
-
-    The source action keeps its original action frame range.
-    """
-
     anim = ensure_animation_data(id_obj)
 
     if anim.action is None:
@@ -500,7 +529,6 @@ def push_base_action_to_nla(
         source_start + 1.0
     )
 
-    # Remove stale base track.
     old_base = anim.nla_tracks.get(
         "Overlapper_Base"
     )
@@ -533,7 +561,6 @@ def push_base_action_to_nla(
     strip.frame_start = source_start
     strip.frame_end = source_end
 
-    # Preserve normal source-action behavior.
     try:
         strip.blend_type = anim.action_blend_type
     except (AttributeError, TypeError, RuntimeError):
@@ -560,8 +587,6 @@ def push_base_action_to_nla(
     except AttributeError:
         pass
 
-    # Prevent the source action from also being evaluated
-    # as the active action.
     anim.action = None
 
     return strip
@@ -573,18 +598,6 @@ def add_overlap_nla_layer(
         frame_start,
         action_slot=None
 ):
-    """
-    The generated action contains FINAL LOCAL TRANSFORM VALUES.
-
-    Therefore the NLA strip must REPLACE those channels.
-
-    This avoids:
-        - quaternion component addition
-        - Euler offset ambiguity
-        - double evaluation
-        - additive quaternion corruption
-    """
-
     anim = ensure_animation_data(id_obj)
 
     old_track = anim.nla_tracks.get(
@@ -631,8 +644,6 @@ def add_overlap_nla_layer(
     strip.frame_start = source_start
     strip.frame_end = source_end
 
-    # CRITICAL:
-    # The generated action already contains final local transforms.
     strip.blend_type = 'REPLACE'
     strip.influence = 1.0
     strip.extrapolation = 'NOTHING'
@@ -654,13 +665,6 @@ def add_overlap_nla_layer(
 
 
 def restore_nla(id_obj):
-    """
-    Restore the original action from Overlapper_Base.
-
-    If there was no original action, the generated layer is
-    simply removed.
-    """
-
     anim = id_obj.animation_data
 
     if anim is None:
@@ -809,14 +813,12 @@ def restore_fcurve(
 def restore_all_backups(context):
     restored = set()
 
-    # Restore NLA-based animations first.
     for obj in bpy.data.objects:
         if restore_nla(obj):
             restored.add(
                 obj.name
             )
 
-    # Restore direct-baked curves.
     for obj_name, curves in list(
         _BACKUP_STORE.items()
     ):
@@ -850,9 +852,26 @@ def restore_all_backups(context):
 
     _BACKUP_STORE.clear()
 
-    context.scene.frame_set(
-        context.scene.frame_current
+    # Restore the timeline to the frame the user was on when the
+    # most recent bake started.  OVERLAPPER_OT_run stashes it in
+    # _PROGRESS_STATE before calling us; fall back to the current
+    # frame if not set.
+    restore_frame = _PROGRESS_STATE.get("restore_frame")
+    restore_subframe = _PROGRESS_STATE.get(
+        "restore_subframe", 0.0
     )
+
+    if restore_frame is not None:
+        context.scene.frame_set(
+            restore_frame,
+            subframe=restore_subframe
+        )
+        _PROGRESS_STATE.pop("restore_frame", None)
+        _PROGRESS_STATE.pop("restore_subframe", None)
+    else:
+        context.scene.frame_set(
+            context.scene.frame_current
+        )
 
     return len(restored)
 
@@ -910,44 +929,85 @@ def evaluate_curves(
     return loc, quat
 
 
+# ============================================================================
+# Wind  —  Maya-faithful port
+# ============================================================================
+#
+# Original MEL:
+#
+#     float $windMultiply = 0.07 * $overlapIntensityMult * $windScaleValue;
+#     float $speedMultiply = 20 / $windSpeedValue;
+#
+#     bakeResults -sampleBy $speedMultiply ...
+#
+#     for each key:
+#         float $RandomizerValue = `rand -1 1`;
+#         keyframe -vc ($value + $windMultiply * $RandomizerValue) ...
+#
+# Result:
+#   * One wind key every  speedMultiply = 20 / windSpeed  frames.
+#   * Each key gets a random offset in [-windMultiply, +windMultiply].
+#   * Maya's default spline tangents smoothly interpolate between them.
+#
+# We reproduce that here with a deterministic pseudo-random per-segment
+# value and a smoothstep interpolation between segment boundaries.
+# ----------------------------------------------------------------------------
+
+def _wind_rand(segment_index, channel, seed):
+    """
+    Deterministic pseudo-random value in [-1, 1] for a given
+    segment / channel / seed.  Mirrors Maya's `rand -1 1`
+    but reproducible across runs.
+    """
+    x = math.sin(
+        segment_index * 12.9898
+        + channel * 78.233
+        + seed * 37.719
+    ) * 43758.5453
+
+    return (x - math.floor(x)) * 2.0 - 1.0
+
+
 def wind_offset(
         frame,
         speed,
-        seed
+        seed,
+        frame_start=0.0
 ):
-    phase = (
-        seed * 12.9898
-    ) % (
-        2 * math.pi
-    )
+    """
+    Maya-style wind:
 
-    t = (
-        frame
-        * 0.15
-        * max(
-            speed,
-            0.0001
-        )
-        + phase
-    )
+        speedMultiply = 20 / windSpeed   (segment length in frames)
 
-    y = (
-        math.sin(t)
-        + 0.5
-        * math.sin(
-            t * 2.13 + 1.0
-        )
-    )
+    Each segment gets a fixed random value in [-1, 1].
+    Segments are joined with a smoothstep so the curve is smooth,
+    matching Maya's default spline interpolation between sparse keys.
+    """
+    speed = max(speed, 0.0001)
 
-    z = (
-        math.cos(
-            t * 0.87 + 1.3
-        )
-        + 0.5
-        * math.cos(
-            t * 1.9 + 0.4
-        )
-    )
+    step = 20.0 / speed
+
+    if step < 1.0:
+        step = 1.0
+
+    t = (frame - frame_start) / step
+
+    seg0 = int(math.floor(t))
+    seg1 = seg0 + 1
+
+    frac = t - math.floor(t)
+
+    # Smoothstep  ≈  Maya's default spline tangent look.
+    s = frac * frac * (3.0 - 2.0 * frac)
+
+    y0 = _wind_rand(seg0, 0, seed)
+    y1 = _wind_rand(seg1, 0, seed)
+
+    z0 = _wind_rand(seg0, 1, seed)
+    z1 = _wind_rand(seg1, 1, seed)
+
+    y = y0 * (1.0 - s) + y1 * s
+    z = z0 * (1.0 - s) + z1 * s
 
     return y, z
 
@@ -1155,24 +1215,6 @@ def world_to_location_basis(
         item,
         world_matrix
 ):
-    """
-    Convert a WORLD-space displacement into the local
-    location-channel basis.
-
-    Object:
-        world_delta =
-            parent_world @ matrix_parent_inverse
-            @ local_delta
-
-    Bone:
-        Blender's convert_space() is used so the displacement
-        follows the bone's local transform space.
-    """
-
-    # ------------------------------------------------------------
-    # OBJECT
-    # ------------------------------------------------------------
-
     if item.kind == 'OBJECT':
         obj = item.id_obj
 
@@ -1198,10 +1240,6 @@ def world_to_location_basis(
             ZeroDivisionError
         ):
             return Matrix.Identity(3)
-
-    # ------------------------------------------------------------
-    # BONE
-    # ------------------------------------------------------------
 
     armature = item.id_obj
     pose_bone = item.pose_bone
@@ -1340,10 +1378,6 @@ def run_overlapper(
         scene.frame_subframe
     )
 
-    # ========================================================================
-    # Validate affected objects BEFORE changing animation.
-    # ========================================================================
-
     affected_ids = {
         item.id_obj.name: item.id_obj
         for item in chain[start_index:]
@@ -1351,7 +1385,6 @@ def run_overlapper(
 
     for id_obj in affected_ids.values():
 
-        # Prevent repeated direct-bake overwriting.
         if (
             not props.bake_new_layer
             and id_obj.name in _BACKUP_STORE
@@ -1401,23 +1434,10 @@ def run_overlapper(
                     "baking an overlap layer."
                 )
 
-    # ========================================================================
-    # CRITICAL:
-    #
-    # If an Overlapper layer already exists, restore its base BEFORE
-    # sampling the source animation.
-    # ========================================================================
-
     for id_obj in affected_ids.values():
         restore_nla(
             id_obj
         )
-
-    # ========================================================================
-    # Fresh direct-bake backup - scoped to the objects this run will touch,
-    # so baking one object doesn't discard another object's still-pending
-    # (un-restored) direct-bake backup.
-    # ========================================================================
 
     if not props.bake_new_layer:
         for name in affected_ids:
@@ -1475,12 +1495,6 @@ def run_overlapper(
             )
         )
 
-    # ========================================================================
-    # Baselines.
-    #
-    # BOTH NLA and direct bake require the ORIGINAL local transforms.
-    # ========================================================================
-
     baseline_rot = {
         i: []
         for i in range(
@@ -1520,19 +1534,46 @@ def run_overlapper(
         for _ in chain
     ]
 
-    # ========================================================================
-    # One scene evaluation pass.
-    # ========================================================================
+    # ------------------------------------------------------------------------
+    # Progress-aware sampling loop.
+    # ------------------------------------------------------------------------
 
-    for f in range(
-        frame_start,
-        frame_end + 1
+    total_frames = (frame_end - frame_start + 1)
+
+    begin_progress(
+        context,
+        total_frames,
+        "Overlapper: sampling"
+    )
+
+    for f_index, f in enumerate(
+        range(
+            frame_start,
+            frame_end + 1
+        )
     ):
         scene.frame_set(f)
 
-        # FIX: force depsgraph refresh so pose bones and constraints
-        # reflect the current frame BEFORE we sample their matrices.
         depsgraph_update(context)
+
+        update_progress(
+            context,
+            f_index,
+            total_frames
+        )
+
+        if _PROGRESS_STATE["cancelled"]:
+            end_progress(context)
+
+            scene.frame_set(
+                original_frame,
+                subframe=original_subframe
+            )
+
+            return (
+                False,
+                "Cancelled by user."
+            )
 
         prev_loc = None
 
@@ -1543,10 +1584,6 @@ def run_overlapper(
             loc, quat, _scale = (
                 matrix.decompose()
             )
-
-            # ------------------------------------------------------------
-            # Quaternion hemisphere correction.
-            # ------------------------------------------------------------
 
             previous_quat = (
                 previous_sample_quats[i]
@@ -1589,10 +1626,6 @@ def run_overlapper(
 
             prev_loc = loc
 
-            # ------------------------------------------------------------
-            # Original local baseline.
-            # ------------------------------------------------------------
-
             if i >= start_index:
 
                 order = item.rotation_mode()
@@ -1620,9 +1653,7 @@ def run_overlapper(
                         )
                     )
 
-    # ========================================================================
-    # Linear helper curves.
-    # ========================================================================
+    end_progress(context)
 
     for (
         loc_fcs,
@@ -1730,8 +1761,6 @@ def run_overlapper(
     else:
         avg_spacing = 1.0
 
-    # FIX: whisker length must GROW with scale, not shrink.
-    # Previously: `avg_spacing / intensity` — inverted the slider.
     whisker_length = (
         max(avg_spacing, 0.0001)
         * intensity
@@ -1842,10 +1871,6 @@ def run_overlapper(
                 rot_prop
             )
 
-            # ------------------------------------------------------------
-            # Rotation curves.
-            # ------------------------------------------------------------
-
             rot_fcurves = []
 
             for c in range(
@@ -1868,10 +1893,6 @@ def run_overlapper(
                         c
                     )
                 )
-
-            # ------------------------------------------------------------
-            # Translation curves.
-            # ------------------------------------------------------------
 
             loc_fcurves = None
 
@@ -1988,6 +2009,20 @@ def run_overlapper(
             )
 
             # =================================================================
+            # Maya-faithful wind amplitude.
+            # =================================================================
+
+            wind_amp = 0.0
+
+            if props.use_wind:
+                wind_amp = (
+                    0.07
+                    * whisker_length
+                    * props.wind_scale
+                    * props.wind_strength
+                )
+
+            # =================================================================
             # Previous output quaternion/euler.
             # =================================================================
 
@@ -2005,10 +2040,6 @@ def run_overlapper(
                 )
             ):
 
-                # ------------------------------------------------------------
-                # Current source.
-                # ------------------------------------------------------------
-
                 own_pos, own_quat = (
                     evaluate_curves(
                         *follower_curve,
@@ -2019,10 +2050,6 @@ def run_overlapper(
                         cycle_len
                     )
                 )
-
-                # ------------------------------------------------------------
-                # Delayed source.
-                # ------------------------------------------------------------
 
                 delayed_frame = (
                     f - delay
@@ -2039,18 +2066,10 @@ def run_overlapper(
                     )
                 )
 
-                # ------------------------------------------------------------
-                # Current aim.
-                # ------------------------------------------------------------
-
                 aim_now = safe_normalized(
                     own_quat
                     @ local_dir
                 )
-
-                # ------------------------------------------------------------
-                # Delayed direction.
-                # ------------------------------------------------------------
 
                 whisker_delayed_dir = safe_normalized(
                     d_quat
@@ -2064,58 +2083,35 @@ def run_overlapper(
                 )
 
                 # ------------------------------------------------------------
-                # Optional wind.
+                # Maya-faithful wind.
                 # ------------------------------------------------------------
 
-                if props.use_wind:
+                if props.use_wind and wind_amp > 0.0:
 
                     up1 = safe_normalized(
                         d_quat
                         @ Vector(
-                            (
-                                0.0,
-                                1.0,
-                                0.0
-                            )
+                            (0.0, 1.0, 0.0)
                         )
                     )
 
                     up2 = safe_normalized(
                         d_quat
                         @ Vector(
-                            (
-                                0.0,
-                                0.0,
-                                1.0
-                            )
+                            (0.0, 0.0, 1.0)
                         )
                     )
 
                     wy, wz = wind_offset(
                         f,
                         props.wind_speed,
-                        seed
-                    )
-
-                    wind_amp = (
-                        0.07
-                        * whisker_length
-                        * props.wind_scale
-                        * props.wind_strength
+                        seed,
+                        frame_start
                     )
 
                     delayed_target += (
-                        up1
-                        * (
-                            wy
-                            * wind_amp
-                        )
-                        +
-                        up2
-                        * (
-                            wz
-                            * wind_amp
-                        )
+                        up1 * (wy * wind_amp)
+                        + up2 * (wz * wind_amp)
                     )
 
                 # ------------------------------------------------------------
@@ -2133,30 +2129,17 @@ def run_overlapper(
                 else:
                     aim_dir.normalize()
 
-                # ------------------------------------------------------------
-                # World-space swing.
-                # ------------------------------------------------------------
-
                 swing = (
                     aim_now.rotation_difference(
                         aim_dir
                     )
                 )
 
-                # ------------------------------------------------------------
-                # Convert world swing to local space.
-                # ------------------------------------------------------------
-
                 delta_local = (
                     own_quat.inverted()
                     @ swing
                     @ own_quat
                 )
-
-                # ------------------------------------------------------------
-                # Convert local swing to Euler only for clamping and
-                # strength processing.
-                # ------------------------------------------------------------
 
                 d_rot = rotation_delta_to_euler(
                     delta_local,
@@ -2181,10 +2164,6 @@ def run_overlapper(
                     d_rot,
                     props.max_rotation
                 )
-
-                # =================================================================
-                # FINAL ROTATION COMPOSITION
-                # =================================================================
 
                 base_euler = (
                     baseline_rot[i][f_index]
@@ -2213,11 +2192,6 @@ def run_overlapper(
                 previous_output_quat = (
                     final_quat.copy()
                 )
-
-                # ------------------------------------------------------------
-                # Convert final quaternion to the target's actual rotation
-                # representation.
-                # ------------------------------------------------------------
 
                 if rot_prop == "rotation_quaternion":
 
@@ -2280,10 +2254,6 @@ def run_overlapper(
                     values = tuple(
                         final_euler
                     )
-
-                # ------------------------------------------------------------
-                # Write rotation.
-                # ------------------------------------------------------------
 
                 for channel, value in enumerate(
                     values
@@ -2357,20 +2327,12 @@ def run_overlapper(
 
                         kp.interpolation = 'LINEAR'
 
-            # =================================================================
-            # Update curves.
-            # =================================================================
-
             for fc in rot_fcurves:
                 fc.update()
 
             if loc_fcurves is not None:
                 for fc in loc_fcurves:
                     fc.update()
-
-            # =================================================================
-            # Optional redundant-key cleanup.
-            # =================================================================
 
             if props.delete_redundant:
 
@@ -2383,10 +2345,6 @@ def run_overlapper(
                     props.redundant_tolerance
                 )
 
-        # ====================================================================
-        # Add generated action to NLA.
-        # ====================================================================
-
         if props.bake_new_layer:
 
             add_overlap_nla_layer(
@@ -2396,27 +2354,15 @@ def run_overlapper(
                 action_slot
             )
 
-    # ========================================================================
-    # Selection set.
-    # ========================================================================
-
     if props.create_selection_set:
         add_to_selection_set(
             chain[start_index:]
         )
 
-    # ========================================================================
-    # Helper cleanup.
-    # ========================================================================
-
     if not props.debug_mode:
         remove_collection(
             HELPER_COLLECTION_NAME
         )
-
-    # ========================================================================
-    # Restore timeline.
-    # ========================================================================
 
     scene.frame_set(
         original_frame,
@@ -2451,6 +2397,7 @@ class OverlapperProperties(
         ),
         default=3.0,
         min=0.0,
+        max=120.0,
         soft_max=30.0,
     )
 
@@ -2461,6 +2408,7 @@ class OverlapperProperties(
         ),
         default=1.0,
         min=0.0001,
+        max=50.0,
         soft_max=10.0,
     )
 
@@ -2567,17 +2515,24 @@ class OverlapperProperties(
 
     wind_scale: bpy.props.FloatProperty(
         name="Scale",
-        description="Wind amplitude.",
+        description=(
+            "Wind amplitude. Maya: $windScaleValue "
+            "(amplitude = 0.07 * whisker * scale)."
+        ),
         default=1.0,
         min=0.0,
+        max=50.0,
         soft_max=10.0,
     )
 
     wind_speed: bpy.props.FloatProperty(
         name="Speed",
-        description="Wind frequency.",
+        description=(
+            "Wind frequency. Maya: key step = 20 / speed frames."
+        ),
         default=1.0,
         min=0.0001,
+        max=50.0,
         soft_max=10.0,
     )
 
@@ -2731,6 +2686,10 @@ class OVERLAPPER_OT_run(
             context.scene.frame_subframe
         )
 
+        # Stash the pre-bake timeline so Restore can return to it.
+        _PROGRESS_STATE["restore_frame"] = original_frame
+        _PROGRESS_STATE["restore_subframe"] = original_subframe
+
         t0 = time.time()
 
         try:
@@ -2768,6 +2727,8 @@ class OVERLAPPER_OT_run(
             }
 
         finally:
+
+            end_progress(context)
 
             try:
                 context.scene.frame_set(
@@ -2813,7 +2774,7 @@ class OVERLAPPER_OT_reset(
     bl_label = "Reset Values"
 
     bl_description = (
-        "Reset Overlapper settings."
+        "Reset all Overlapper settings to their default values."
     )
 
     bl_options = {
@@ -2829,26 +2790,39 @@ class OVERLAPPER_OT_reset(
             context.scene.overlapper_props
         )
 
-        for key in (
-            props.rna_type.properties.keys()
-        ):
+        for prop in props.bl_rna.properties:
+            ident = prop.identifier
 
-            if key in (
+            if ident in (
                 'rna_type',
                 'name'
             ):
                 continue
 
-            props.property_unset(
-                key
+            if prop.is_readonly:
+                continue
+
+            try:
+                props.property_unset(ident)
+            except Exception:
+                pass
+
+        # Force an immediate redraw of every panel so the
+        # reset is visible without moving the mouse.
+        try:
+            context.scene.frame_set(
+                context.scene.frame_current
             )
+        except Exception:
+            pass
+
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
 
         self.report(
             {'INFO'},
-            (
-                "Overlapper settings "
-                "reset to defaults."
-            )
+            "Overlapper settings reset to defaults."
         )
 
         return {
@@ -3002,9 +2976,36 @@ class OVERLAPPER_PT_panel(
             context.scene.overlapper_props
         )
 
-        # ====================================================================
-        # Main controls
-        # ====================================================================
+        # ------------------------------------------------------------
+        # Reflect OVERLAPPER_OT_run.poll() so the panel greys out
+        # when nothing valid is selected.
+        # ------------------------------------------------------------
+        if context.mode == 'POSE':
+            has_selection = bool(context.selected_pose_bones)
+        else:
+            has_selection = bool(context.selected_objects)
+
+        # ------------------------------------------------------------
+        # Hint first (drawn while still enabled, so it stays readable).
+        # ------------------------------------------------------------
+        if not has_selection:
+            hint = layout.box()
+
+            if context.mode == 'POSE':
+                hint.label(
+                    text="Select 2+ pose bones.",
+                    icon='INFO'
+                )
+            else:
+                hint.label(
+                    text="Select 2+ objects.",
+                    icon='INFO'
+                )
+
+        # ------------------------------------------------------------
+        # Everything below this line greys out when nothing is selected.
+        # ------------------------------------------------------------
+        layout.enabled = has_selection
 
         col = layout.column(
             align=True
@@ -3019,10 +3020,6 @@ class OVERLAPPER_PT_panel(
             props,
             "scale"
         )
-
-        # ====================================================================
-        # Wind
-        # ====================================================================
 
         box = layout.box()
 
@@ -3051,10 +3048,6 @@ class OVERLAPPER_PT_panel(
                 props,
                 "wind_strength"
             )
-
-        # ====================================================================
-        # Existing options
-        # ====================================================================
 
         box = layout.box()
 
@@ -3095,10 +3088,6 @@ class OVERLAPPER_PT_panel(
 
         layout.separator()
 
-        # ====================================================================
-        # Main buttons
-        # ====================================================================
-
         row = layout.row(
             align=True
         )
@@ -3108,18 +3097,13 @@ class OVERLAPPER_PT_panel(
             icon='MOD_DYNAMICPAINT'
         )
 
-        row.operator(
-            "overlapper.reset",
-            icon='LOOP_BACK',
-            text=""
-        )
-
-        # ====================================================================
-        # Restore
-        # ====================================================================
-
         row = layout.row(
             align=True
+        )
+
+        row.operator(
+            "overlapper.reset",
+            icon='LOOP_BACK'
         )
 
         row.operator(
