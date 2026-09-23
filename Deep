@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
-    "version": (5, 2, 5),
+    "version": (5, 2, 6),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-panel) > Overlapper",
     "description": "Automatic overlapping / follow-through secondary animation for chains of objects or bones.",
@@ -41,10 +41,6 @@ _PROGRESS_STATE = {
 # ============================================================================
 
 def get_fcurve(id_obj, action, data_path, index):
-    """
-    Blender 5.x uses fcurve_ensure_for_datablock().
-    Older Blender versions can fall back to fcurves.find/new().
-    """
     try:
         return action.fcurve_ensure_for_datablock(
             id_obj,
@@ -132,10 +128,6 @@ def assign_strip_action_slot(strip, slot):
 
 
 def depsgraph_update(context):
-    """
-    Force a dependency-graph refresh so that pose bones, constraints
-    and driven parents are up to date before we sample matrices.
-    """
     try:
         context.view_layer.update()
     except Exception:
@@ -168,9 +160,6 @@ def update_progress(context, current, total, extra=""):
         wm = context.window_manager
         wm.progress_update(int(current))
 
-        # Best-effort cancel detection.  Blender does not expose a
-        # documented cancel flag on WindowManager; some builds expose
-        # `progress_cancel`, others do not.  Silently ignore if absent.
         if getattr(wm, "progress_cancel", False):
             _PROGRESS_STATE["cancelled"] = True
     except Exception:
@@ -852,10 +841,6 @@ def restore_all_backups(context):
 
     _BACKUP_STORE.clear()
 
-    # Restore the timeline to the frame the user was on when the
-    # most recent bake started.  OVERLAPPER_OT_run stashes it in
-    # _PROGRESS_STATE before calling us; fall back to the current
-    # frame if not set.
     restore_frame = _PROGRESS_STATE.get("restore_frame")
     restore_subframe = _PROGRESS_STATE.get(
         "restore_subframe", 0.0
@@ -933,36 +918,34 @@ def evaluate_curves(
 # Wind  —  Maya-faithful port
 # ============================================================================
 #
-# Original MEL:
+# Maya source:
 #
-#     float $windMultiply = 0.07 * $overlapIntensityMult * $windScaleValue;
-#     float $speedMultiply = 20 / $windSpeedValue;
+#     wind_multiply   = 0.07 * overlap_intensity_mult * wind_scale_value
+#     speed_multiply  = 20.0 / wind_speed_value
+#
+#     overlap_intensity_mult = average_joint_length / overlap_intensity * 5.0
 #
 #     bakeResults -sampleBy $speedMultiply ...
 #
 #     for each key:
-#         float $RandomizerValue = `rand -1 1`;
-#         keyframe -vc ($value + $windMultiply * $RandomizerValue) ...
+#         random_value = rand(-1, 1)
+#         new_value = old_value + wind_multiply * random_value
 #
-# Result:
-#   * One wind key every  speedMultiply = 20 / windSpeed  frames.
-#   * Each key gets a random offset in [-windMultiply, +windMultiply].
-#   * Maya's default spline tangents smoothly interpolate between them.
-#
-# We reproduce that here with a deterministic pseudo-random per-segment
-# value and a smoothstep interpolation between segment boundaries.
+# Behavior:
+#   * ONE wind curve, shared by the whole chain (not per-link).
+#   * One random key every  20 / windSpeed  frames.
+#   * Segment values in [-1, +1], smoothly interpolated between
+#     segment boundaries (matches Maya's default spline tangents).
 # ----------------------------------------------------------------------------
 
-def _wind_rand(segment_index, channel, seed):
+def _wind_rand(segment_index, channel):
     """
     Deterministic pseudo-random value in [-1, 1] for a given
-    segment / channel / seed.  Mirrors Maya's `rand -1 1`
-    but reproducible across runs.
+    segment / channel.  Mirrors Maya's `rand -1 1` but reproducible.
     """
     x = math.sin(
         segment_index * 12.9898
         + channel * 78.233
-        + seed * 37.719
     ) * 43758.5453
 
     return (x - math.floor(x)) * 2.0 - 1.0
@@ -971,13 +954,12 @@ def _wind_rand(segment_index, channel, seed):
 def wind_offset(
         frame,
         speed,
-        seed,
         frame_start=0.0
 ):
     """
-    Maya-style wind:
+    Maya-style wind.
 
-        speedMultiply = 20 / windSpeed   (segment length in frames)
+        speed_multiply = 20 / windSpeed   (segment length in frames)
 
     Each segment gets a fixed random value in [-1, 1].
     Segments are joined with a smoothstep so the curve is smooth,
@@ -1000,11 +982,11 @@ def wind_offset(
     # Smoothstep  ≈  Maya's default spline tangent look.
     s = frac * frac * (3.0 - 2.0 * frac)
 
-    y0 = _wind_rand(seg0, 0, seed)
-    y1 = _wind_rand(seg1, 0, seed)
+    y0 = _wind_rand(seg0, 0)
+    y1 = _wind_rand(seg1, 0)
 
-    z0 = _wind_rand(seg0, 1, seed)
-    z1 = _wind_rand(seg1, 1, seed)
+    z0 = _wind_rand(seg0, 1)
+    z1 = _wind_rand(seg1, 1)
 
     y = y0 * (1.0 - s) + y1 * s
     z = z0 * (1.0 - s) + z1 * s
@@ -1534,10 +1516,6 @@ def run_overlapper(
         for _ in chain
     ]
 
-    # ------------------------------------------------------------------------
-    # Progress-aware sampling loop.
-    # ------------------------------------------------------------------------
-
     total_frames = (frame_end - frame_start + 1)
 
     begin_progress(
@@ -1765,6 +1743,35 @@ def run_overlapper(
         max(avg_spacing, 0.0001)
         * intensity
     )
+
+    # ========================================================================
+    # Maya-faithful wind amplitude.
+    #
+    # Maya:
+    #     overlap_intensity_mult = avg_joint_length / overlap_intensity * 5.0
+    #     wind_multiply          = 0.07 * overlap_intensity_mult * wind_scale
+    #
+    # Which, in this port's terms, is:
+    #     wind_amp = 0.07 * (avg_spacing / scale * 5.0) * wind_scale
+    #
+    # Note: this is deliberately INDEPENDENT of whisker_length, because
+    # whisker_length uses the (different) `avg * scale` formula.
+    # ========================================================================
+
+    wind_amp = 0.0
+
+    if props.use_wind:
+        overlap_intensity_mult = (
+            max(avg_spacing, 0.0001)
+            / intensity
+            * 5.0
+        )
+
+        wind_amp = (
+            0.07
+            * overlap_intensity_mult
+            * props.wind_scale
+        )
 
     # ========================================================================
     # STEP 4 - Build groups.
@@ -2003,25 +2010,6 @@ def run_overlapper(
                     * t
                 )
 
-            seed = (
-                (i + 1)
-                * 7.13
-            )
-
-            # =================================================================
-            # Maya-faithful wind amplitude.
-            # =================================================================
-
-            wind_amp = 0.0
-
-            if props.use_wind:
-                wind_amp = (
-                    0.07
-                    * whisker_length
-                    * props.wind_scale
-                    * props.wind_strength
-                )
-
             # =================================================================
             # Previous output quaternion/euler.
             # =================================================================
@@ -2084,6 +2072,10 @@ def run_overlapper(
 
                 # ------------------------------------------------------------
                 # Maya-faithful wind.
+                #
+                # One coherent wind for the whole chain — same (y, z)
+                # values on every link, expressed in each link's local
+                # frame.  Matches Maya's single shared wind locator.
                 # ------------------------------------------------------------
 
                 if props.use_wind and wind_amp > 0.0:
@@ -2105,7 +2097,6 @@ def run_overlapper(
                     wy, wz = wind_offset(
                         f,
                         props.wind_speed,
-                        seed,
                         frame_start
                     )
 
@@ -2517,7 +2508,7 @@ class OverlapperProperties(
         name="Scale",
         description=(
             "Wind amplitude. Maya: $windScaleValue "
-            "(amplitude = 0.07 * whisker * scale)."
+            "(amplitude = 0.07 * overlap_intensity_mult * scale)."
         ),
         default=1.0,
         min=0.0,
@@ -2534,16 +2525,6 @@ class OverlapperProperties(
         min=0.0001,
         max=50.0,
         soft_max=10.0,
-    )
-
-    wind_strength: bpy.props.FloatProperty(
-        name="Strength",
-        description=(
-            "Additional multiplier for wind contribution."
-        ),
-        default=1.0,
-        min=0.0,
-        soft_max=5.0,
     )
 
     show_options: bpy.props.BoolProperty(
@@ -2686,7 +2667,6 @@ class OVERLAPPER_OT_run(
             context.scene.frame_subframe
         )
 
-        # Stash the pre-bake timeline so Restore can return to it.
         _PROGRESS_STATE["restore_frame"] = original_frame
         _PROGRESS_STATE["restore_subframe"] = original_subframe
 
@@ -2807,8 +2787,6 @@ class OVERLAPPER_OT_reset(
             except Exception:
                 pass
 
-        # Force an immediate redraw of every panel so the
-        # reset is visible without moving the mouse.
         try:
             context.scene.frame_set(
                 context.scene.frame_current
@@ -2976,18 +2954,11 @@ class OVERLAPPER_PT_panel(
             context.scene.overlapper_props
         )
 
-        # ------------------------------------------------------------
-        # Reflect OVERLAPPER_OT_run.poll() so the panel greys out
-        # when nothing valid is selected.
-        # ------------------------------------------------------------
         if context.mode == 'POSE':
             has_selection = bool(context.selected_pose_bones)
         else:
             has_selection = bool(context.selected_objects)
 
-        # ------------------------------------------------------------
-        # Hint first (drawn while still enabled, so it stays readable).
-        # ------------------------------------------------------------
         if not has_selection:
             hint = layout.box()
 
@@ -3002,9 +2973,6 @@ class OVERLAPPER_PT_panel(
                     icon='INFO'
                 )
 
-        # ------------------------------------------------------------
-        # Everything below this line greys out when nothing is selected.
-        # ------------------------------------------------------------
         layout.enabled = has_selection
 
         col = layout.column(
@@ -3042,11 +3010,6 @@ class OVERLAPPER_PT_panel(
             row.prop(
                 props,
                 "wind_speed"
-            )
-
-            box.prop(
-                props,
-                "wind_strength"
             )
 
         box = layout.box()
