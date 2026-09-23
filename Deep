@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
-    "version": (5, 2, 6),
+    "version": (5, 2, 7),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-panel) > Overlapper",
     "description": "Automatic overlapping / follow-through secondary animation for chains of objects or bones.",
@@ -915,81 +915,63 @@ def evaluate_curves(
 
 
 # ============================================================================
-# Wind  —  Maya-faithful port
+# Wind  —  smooth wave-like, cyclic-friendly
 # ============================================================================
 #
-# Maya source:
+# Maya's amplitude formula is preserved:
 #
-#     wind_multiply   = 0.07 * overlap_intensity_mult * wind_scale_value
-#     speed_multiply  = 20.0 / wind_speed_value
+#     overlap_intensity_mult = avg_spacing / intensity * 5.0
+#     wind_amp               = 0.07 * overlap_intensity_mult * wind_scale
 #
-#     overlap_intensity_mult = average_joint_length / overlap_intensity * 5.0
+# The per-segment random approach produced "hold / hop / hold" motion that
+# reads as jumps rather than wind.  Wind here is instead a smooth multi-
+# octave sine wave, which:
 #
-#     bakeResults -sampleBy $speedMultiply ...
+#   * never jumps between frames (continuous, C∞),
+#   * reads as a proper gust/wave,
+#   * wraps exactly when Cycle mode is on (cycle_len becomes the period,
+#     and every harmonic completes an integer number of cycles over it).
 #
-#     for each key:
-#         random_value = rand(-1, 1)
-#         new_value = old_value + wind_multiply * random_value
-#
-# Behavior:
-#   * ONE wind curve, shared by the whole chain (not per-link).
-#   * One random key every  20 / windSpeed  frames.
-#   * Segment values in [-1, +1], smoothly interpolated between
-#     segment boundaries (matches Maya's default spline tangents).
+# wind_speed maps to frequency:  speed = 1  ->  ~60-frame base period.
 # ----------------------------------------------------------------------------
-
-def _wind_rand(segment_index, channel):
-    """
-    Deterministic pseudo-random value in [-1, 1] for a given
-    segment / channel.  Mirrors Maya's `rand -1 1` but reproducible.
-    """
-    x = math.sin(
-        segment_index * 12.9898
-        + channel * 78.233
-    ) * 43758.5453
-
-    return (x - math.floor(x)) * 2.0 - 1.0
-
 
 def wind_offset(
         frame,
         speed,
-        frame_start=0.0
+        frame_start=0.0,
+        cycle_len=0
 ):
     """
-    Maya-style wind.
+    Smooth, cyclic-friendly wind.
 
-        speed_multiply = 20 / windSpeed   (segment length in frames)
-
-    Each segment gets a fixed random value in [-1, 1].
-    Segments are joined with a smoothstep so the curve is smooth,
-    matching Maya's default spline interpolation between sparse keys.
+    Returns (y, z) each in roughly [-1, 1] before amplitude scaling.
     """
-    speed = max(speed, 0.0001)
+    t = float(frame - frame_start)
 
-    step = 20.0 / speed
+    if cycle_len and cycle_len > 0:
+        # Cyclic: the fundamental period is exactly the cycle length,
+        # and each harmonic is an integer multiple so the whole signal
+        # wraps seamlessly at frame_start + cycle_len.
+        period = float(cycle_len)
+    else:
+        # Non-cyclic: base period 60 frames at speed = 1.
+        period = 60.0 / max(speed, 0.0001)
 
-    if step < 1.0:
-        step = 1.0
+    omega = 2.0 * math.pi / period
 
-    t = (frame - frame_start) / step
+    # Two channels, phase-shifted so they don't move in lockstep.
+    # Amplitudes sum to 1.0.
+    y = (
+        0.55 * math.sin(omega * t + 0.30)
+        + 0.30 * math.sin(2.0 * omega * t + 1.70)
+        + 0.15 * math.sin(3.0 * omega * t + 3.90)
+    )
 
-    seg0 = int(math.floor(t))
-    seg1 = seg0 + 1
-
-    frac = t - math.floor(t)
-
-    # Smoothstep  ≈  Maya's default spline tangent look.
-    s = frac * frac * (3.0 - 2.0 * frac)
-
-    y0 = _wind_rand(seg0, 0)
-    y1 = _wind_rand(seg1, 0)
-
-    z0 = _wind_rand(seg0, 1)
-    z1 = _wind_rand(seg1, 1)
-
-    y = y0 * (1.0 - s) + y1 * s
-    z = z0 * (1.0 - s) + z1 * s
+    z = (
+        0.55 * math.sin(omega * t + 2.40)
+        + 0.30 * math.sin(2.0 * omega * t + 0.80)
+        + 0.15 * math.sin(3.0 * omega * t + 4.70)
+    )
 
     return y, z
 
@@ -1750,12 +1732,6 @@ def run_overlapper(
     # Maya:
     #     overlap_intensity_mult = avg_joint_length / overlap_intensity * 5.0
     #     wind_multiply          = 0.07 * overlap_intensity_mult * wind_scale
-    #
-    # Which, in this port's terms, is:
-    #     wind_amp = 0.07 * (avg_spacing / scale * 5.0) * wind_scale
-    #
-    # Note: this is deliberately INDEPENDENT of whisker_length, because
-    # whisker_length uses the (different) `avg * scale` formula.
     # ========================================================================
 
     wind_amp = 0.0
@@ -2071,11 +2047,7 @@ def run_overlapper(
                 )
 
                 # ------------------------------------------------------------
-                # Maya-faithful wind.
-                #
-                # One coherent wind for the whole chain — same (y, z)
-                # values on every link, expressed in each link's local
-                # frame.  Matches Maya's single shared wind locator.
+                # Smooth, cyclic-friendly wind.
                 # ------------------------------------------------------------
 
                 if props.use_wind and wind_amp > 0.0:
@@ -2097,7 +2069,8 @@ def run_overlapper(
                     wy, wz = wind_offset(
                         f,
                         props.wind_speed,
-                        frame_start
+                        frame_start,
+                        cycle_len if cyclic else 0
                     )
 
                     delayed_target += (
@@ -2519,7 +2492,7 @@ class OverlapperProperties(
     wind_speed: bpy.props.FloatProperty(
         name="Speed",
         description=(
-            "Wind frequency. Maya: key step = 20 / speed frames."
+            "Wind frequency. Higher = faster sway."
         ),
         default=1.0,
         min=0.0001,
