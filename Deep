@@ -1,7 +1,8 @@
+
 bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
-    "version": (5, 2, 6),
+    "version": (5, 2, 6, 1),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-panel) > Overlapper",
     "description": "Automatic overlapping / follow-through secondary animation for chains of objects or bones.",
@@ -915,47 +916,136 @@ def evaluate_curves(
 
 
 # ============================================================================
-# Wind  —  Maya-faithful port
+# Wind  —  Maya-faithful port (smooth + cycle-safe)
 # ============================================================================
+#
+# Maya's wind: one sparse random key every (20 / windSpeed) frames,
+# spline-interpolated between keys.  Blender's default spline tangent
+# matches a Catmull-Rom curve through the neighboring keys, which is
+# smooth in both value and derivative at every key — no "hold, hop"
+# flat spots.
+#
+# Cycle mode: time is wrapped modulo cycle_len, and the segment count
+# is quantized to an integer so the first and last frames of the loop
+# land on the same segment boundary with the same 4 neighbours.
+# wind_offset(frame_start) == wind_offset(frame_end) exactly.
+# ----------------------------------------------------------------------------
 
-def _wind_rand(segment_index, channel):
+def _wind_rand(segment_index, channel, seed=0):
+    """
+    Deterministic pseudo-random value in [-1, 1].
+    Mirrors Maya's `rand -1 1`, but reproducible.
+    """
     x = math.sin(
-        segment_index * 12.9898
+        (segment_index + seed) * 12.9898
         + channel * 78.233
     ) * 43758.5453
 
     return (x - math.floor(x)) * 2.0 - 1.0
 
 
+def _catmull_rom(p0, p1, p2, p3, t):
+    """
+    Catmull-Rom interpolation between p1 and p2 with p0/p3 as tangent
+    guides.  Passes through p1 at t=0 and p2 at t=1, is C1-continuous
+    at every segment boundary — matches Maya's default spline tangent
+    behaviour on sparse random keys.
+    """
+    t2 = t * t
+    t3 = t2 * t
+
+    return 0.5 * (
+        2.0 * p1
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+    )
+
+
 def wind_offset(
         frame,
         speed,
-        frame_start=0.0
+        frame_start=0.0,
+        cycle_len=0
 ):
+    """
+    Maya-style wind: sparse random keys every 20/speed frames,
+    Catmull-Rom interpolation between them (Maya's default spline
+    tangents).  Smooth in value and derivative at every frame.
+
+    When cycle_len > 0 the wind is exactly periodic over the loop:
+    segments are wrapped modulo an integer count that fits into
+    cycle_len, so frame_start and frame_end sample the same point.
+    """
     speed = max(speed, 0.0001)
 
-    step = 20.0 / speed
+    base_step = 20.0 / speed
 
-    if step < 1.0:
-        step = 1.0
+    if base_step < 1.0:
+        base_step = 1.0
 
-    t = (frame - frame_start) / step
+    t = float(frame - frame_start)
 
-    seg0 = int(math.floor(t))
-    seg1 = seg0 + 1
+    if cycle_len and cycle_len > 0:
+        cycle_len = float(cycle_len)
 
-    frac = t - math.floor(t)
+        # Fit an integer number of segments exactly into the cycle.
+        n_seg = max(
+            2,
+            int(round(cycle_len / base_step))
+        )
 
-    s = frac * frac * (3.0 - 2.0 * frac)
+        step = cycle_len / float(n_seg)
 
-    y0 = _wind_rand(seg0, 0)
-    y1 = _wind_rand(seg1, 0)
+        # Wrap time into the cycle.
+        wrapped_t = t % cycle_len
 
-    z0 = _wind_rand(seg0, 1)
-    z1 = _wind_rand(seg1, 1)
+        u = wrapped_t / step
+        seg = int(math.floor(u))
+        frac = u - float(seg)
 
-    y = y0 * (1.0 - s) + y1 * s
-    z = z0 * (1.0 - s) + z1 * s
+        # Wrap neighbour indices so the loop is seamless.
+        s_m1 = (seg - 1) % n_seg
+        s_0 = seg % n_seg
+        s_p1 = (seg + 1) % n_seg
+        s_p2 = (seg + 2) % n_seg
+
+        y = _catmull_rom(
+            _wind_rand(s_m1, 0),
+            _wind_rand(s_0, 0),
+            _wind_rand(s_p1, 0),
+            _wind_rand(s_p2, 0),
+            frac
+        )
+
+        z = _catmull_rom(
+            _wind_rand(s_m1, 1),
+            _wind_rand(s_0, 1),
+            _wind_rand(s_p1, 1),
+            _wind_rand(s_p2, 1),
+            frac
+        )
+
+    else:
+        u = t / base_step
+        seg = int(math.floor(u))
+        frac = u - float(seg)
+
+        y = _catmull_rom(
+            _wind_rand(seg - 1, 0),
+            _wind_rand(seg + 0, 0),
+            _wind_rand(seg + 1, 0),
+            _wind_rand(seg + 2, 0),
+            frac
+        )
+
+        z = _catmull_rom(
+            _wind_rand(seg - 1, 1),
+            _wind_rand(seg + 0, 1),
+            _wind_rand(seg + 1, 1),
+            _wind_rand(seg + 2, 1),
+            frac
+        )
 
     return y, z
 
@@ -2028,6 +2118,10 @@ def run_overlapper(
 
                 # ------------------------------------------------------------
                 # Maya-faithful wind.
+                #
+                # cycle_len is passed only when Cycle is on, so the wind
+                # signal is exactly periodic over the loop and
+                # wind_offset(frame_start) == wind_offset(frame_end).
                 # ------------------------------------------------------------
 
                 if props.use_wind and wind_amp > 0.0:
@@ -2049,7 +2143,8 @@ def run_overlapper(
                     wy, wz = wind_offset(
                         f,
                         props.wind_speed,
-                        frame_start
+                        frame_start,
+                        cycle_len if cyclic else 0
                     )
 
                     delayed_target += (
@@ -2925,8 +3020,6 @@ class OVERLAPPER_PT_panel(
                     icon='INFO'
                 )
 
-        layout.enabled = has_selection
-
         col = layout.column(
             align=True
         )
@@ -2939,6 +3032,61 @@ class OVERLAPPER_PT_panel(
         col.prop(
             props,
             "scale"
+        )
+
+        box = layout.box()
+
+        box.label(
+            text="Root -> Tip"
+        )
+
+        row = box.row(
+            align=True
+        )
+
+        row.prop(
+            props,
+            "root_strength"
+        )
+
+        row.prop(
+            props,
+            "tip_strength"
+        )
+
+        box.prop(
+            props,
+            "falloff_power"
+        )
+
+        box.prop(
+            props,
+            "max_rotation"
+        )
+
+        box = layout.box()
+
+        box.label(
+            text="Delay Shaping"
+        )
+
+        box.prop(
+            props,
+            "delay_falloff"
+        )
+
+        row = box.row(
+            align=True
+        )
+
+        row.prop(
+            props,
+            "tip_delay_multiplier"
+        )
+
+        row.prop(
+            props,
+            "tip_falloff_power"
         )
 
         box = layout.box()
@@ -2988,11 +3136,6 @@ class OVERLAPPER_PT_panel(
 
             box.prop(
                 props,
-                "add_translate"
-            )
-
-            box.prop(
-                props,
                 "hierarchy_mode"
             )
 
@@ -3001,13 +3144,74 @@ class OVERLAPPER_PT_panel(
                 "cycle_mode"
             )
 
+            box.prop(
+                props,
+                "adaptive_scale"
+            )
+
+            box.prop(
+                props,
+                "create_selection_set"
+            )
+
+            box.separator()
+
+            box.prop(
+                props,
+                "add_translate"
+            )
+
+            if props.add_translate:
+
+                sub = box.column(
+                    align=True
+                )
+
+                sub.prop(
+                    props,
+                    "translate_strength"
+                )
+
+                sub.prop(
+                    props,
+                    "max_translation"
+                )
+
+            box.separator()
+
+            box.prop(
+                props,
+                "delete_redundant"
+            )
+
+            if props.delete_redundant:
+
+                box.prop(
+                    props,
+                    "redundant_tolerance"
+                )
+
+            box.separator()
+
+            box.prop(
+                props,
+                "bake_new_layer"
+            )
+
+            box.prop(
+                props,
+                "debug_mode"
+            )
+
         layout.separator()
 
-        row = layout.row(
+        run_row = layout.row(
             align=True
         )
 
-        row.operator(
+        run_row.enabled = has_selection
+
+        run_row.operator(
             "overlapper.run",
             icon='MOD_DYNAMICPAINT'
         )
@@ -3022,8 +3226,18 @@ class OVERLAPPER_PT_panel(
         )
 
         row.operator(
+            # Restore
             "overlapper.restore",
             icon='RECOVER_LAST'
+        )
+
+        row = layout.row(
+            align=True
+        )
+
+        row.operator(
+            "overlapper.cleanup",
+            icon='TRASH'
         )
 
 
