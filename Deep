@@ -1,4 +1,3 @@
-
 bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
@@ -918,24 +917,8 @@ def evaluate_curves(
 # ============================================================================
 # Wind  —  Maya-faithful port (smooth + cycle-safe)
 # ============================================================================
-#
-# Maya's wind: one sparse random key every (20 / windSpeed) frames,
-# spline-interpolated between keys.  Blender's default spline tangent
-# matches a Catmull-Rom curve through the neighboring keys, which is
-# smooth in both value and derivative at every key — no "hold, hop"
-# flat spots.
-#
-# Cycle mode: time is wrapped modulo cycle_len, and the segment count
-# is quantized to an integer so the first and last frames of the loop
-# land on the same segment boundary with the same 4 neighbours.
-# wind_offset(frame_start) == wind_offset(frame_end) exactly.
-# ----------------------------------------------------------------------------
 
 def _wind_rand(segment_index, channel, seed=0):
-    """
-    Deterministic pseudo-random value in [-1, 1].
-    Mirrors Maya's `rand -1 1`, but reproducible.
-    """
     x = math.sin(
         (segment_index + seed) * 12.9898
         + channel * 78.233
@@ -945,12 +928,6 @@ def _wind_rand(segment_index, channel, seed=0):
 
 
 def _catmull_rom(p0, p1, p2, p3, t):
-    """
-    Catmull-Rom interpolation between p1 and p2 with p0/p3 as tangent
-    guides.  Passes through p1 at t=0 and p2 at t=1, is C1-continuous
-    at every segment boundary — matches Maya's default spline tangent
-    behaviour on sparse random keys.
-    """
     t2 = t * t
     t3 = t2 * t
 
@@ -968,15 +945,6 @@ def wind_offset(
         frame_start=0.0,
         cycle_len=0
 ):
-    """
-    Maya-style wind: sparse random keys every 20/speed frames,
-    Catmull-Rom interpolation between them (Maya's default spline
-    tangents).  Smooth in value and derivative at every frame.
-
-    When cycle_len > 0 the wind is exactly periodic over the loop:
-    segments are wrapped modulo an integer count that fits into
-    cycle_len, so frame_start and frame_end sample the same point.
-    """
     speed = max(speed, 0.0001)
 
     base_step = 20.0 / speed
@@ -989,7 +957,6 @@ def wind_offset(
     if cycle_len and cycle_len > 0:
         cycle_len = float(cycle_len)
 
-        # Fit an integer number of segments exactly into the cycle.
         n_seg = max(
             2,
             int(round(cycle_len / base_step))
@@ -997,14 +964,12 @@ def wind_offset(
 
         step = cycle_len / float(n_seg)
 
-        # Wrap time into the cycle.
         wrapped_t = t % cycle_len
 
         u = wrapped_t / step
         seg = int(math.floor(u))
         frac = u - float(seg)
 
-        # Wrap neighbour indices so the loop is seamless.
         s_m1 = (seg - 1) % n_seg
         s_0 = seg % n_seg
         s_p1 = (seg + 1) % n_seg
@@ -2118,10 +2083,6 @@ def run_overlapper(
 
                 # ------------------------------------------------------------
                 # Maya-faithful wind.
-                #
-                # cycle_len is passed only when Cycle is on, so the wind
-                # signal is exactly periodic over the loop and
-                # wind_offset(frame_start) == wind_offset(frame_end).
                 # ------------------------------------------------------------
 
                 if props.use_wind and wind_amp > 0.0:
@@ -2996,10 +2957,7 @@ class OVERLAPPER_PT_panel(
             context
     ):
         layout = self.layout
-
-        props = (
-            context.scene.overlapper_props
-        )
+        props = context.scene.overlapper_props
 
         if context.mode == 'POSE':
             has_selection = bool(context.selected_pose_bones)
@@ -3007,115 +2965,25 @@ class OVERLAPPER_PT_panel(
             has_selection = bool(context.selected_objects)
 
         if not has_selection:
-            hint = layout.box()
+            layout.label(
+                text="Select 2+ controls.",
+                icon='INFO'
+            )
 
-            if context.mode == 'POSE':
-                hint.label(
-                    text="Select 2+ pose bones.",
-                    icon='INFO'
-                )
-            else:
-                hint.label(
-                    text="Select 2+ objects.",
-                    icon='INFO'
-                )
-
-        col = layout.column(
-            align=True
-        )
-
-        col.prop(
-            props,
-            "softness"
-        )
-
-        col.prop(
-            props,
-            "scale"
-        )
+        col = layout.column(align=True)
+        col.prop(props, "softness")
+        col.prop(props, "scale")
 
         box = layout.box()
-
-        box.label(
-            text="Root -> Tip"
-        )
-
-        row = box.row(
-            align=True
-        )
-
-        row.prop(
-            props,
-            "root_strength"
-        )
-
-        row.prop(
-            props,
-            "tip_strength"
-        )
-
-        box.prop(
-            props,
-            "falloff_power"
-        )
-
-        box.prop(
-            props,
-            "max_rotation"
-        )
-
-        box = layout.box()
-
-        box.label(
-            text="Delay Shaping"
-        )
-
-        box.prop(
-            props,
-            "delay_falloff"
-        )
-
-        row = box.row(
-            align=True
-        )
-
-        row.prop(
-            props,
-            "tip_delay_multiplier"
-        )
-
-        row.prop(
-            props,
-            "tip_falloff_power"
-        )
-
-        box = layout.box()
-
-        box.prop(
-            props,
-            "use_wind"
-        )
+        box.prop(props, "use_wind")
 
         if props.use_wind:
-
-            row = box.row(
-                align=True
-            )
-
-            row.prop(
-                props,
-                "wind_scale"
-            )
-
-            row.prop(
-                props,
-                "wind_speed"
-            )
+            row = box.row(align=True)
+            row.prop(props, "wind_scale")
+            row.prop(props, "wind_speed")
 
         box = layout.box()
-
         row = box.row()
-
         row.prop(
             props,
             "show_options",
@@ -3128,117 +2996,23 @@ class OVERLAPPER_PT_panel(
         )
 
         if props.show_options:
-
-            box.prop(
-                props,
-                "dont_use_first"
-            )
-
-            box.prop(
-                props,
-                "hierarchy_mode"
-            )
-
-            box.prop(
-                props,
-                "cycle_mode"
-            )
-
-            box.prop(
-                props,
-                "adaptive_scale"
-            )
-
-            box.prop(
-                props,
-                "create_selection_set"
-            )
-
-            box.separator()
-
-            box.prop(
-                props,
-                "add_translate"
-            )
-
-            if props.add_translate:
-
-                sub = box.column(
-                    align=True
-                )
-
-                sub.prop(
-                    props,
-                    "translate_strength"
-                )
-
-                sub.prop(
-                    props,
-                    "max_translation"
-                )
-
-            box.separator()
-
-            box.prop(
-                props,
-                "delete_redundant"
-            )
-
-            if props.delete_redundant:
-
-                box.prop(
-                    props,
-                    "redundant_tolerance"
-                )
-
-            box.separator()
-
-            box.prop(
-                props,
-                "bake_new_layer"
-            )
-
-            box.prop(
-                props,
-                "debug_mode"
-            )
+            box.prop(props, "dont_use_first")
+            box.prop(props, "add_translate")
+            box.prop(props, "hierarchy_mode")
+            box.prop(props, "cycle_mode")
 
         layout.separator()
 
-        run_row = layout.row(
-            align=True
-        )
+        row = layout.row(align=True)
+        row.enabled = has_selection
+        row.operator("overlapper.run", icon='MOD_DYNAMICPAINT')
 
-        run_row.enabled = has_selection
+        row = layout.row(align=True)
+        row.operator("overlapper.reset", icon='LOOP_BACK')
+        row.operator("overlapper.restore", icon='RECOVER_LAST')
 
-        run_row.operator(
-            "overlapper.run",
-            icon='MOD_DYNAMICPAINT'
-        )
-
-        row = layout.row(
-            align=True
-        )
-
-        row.operator(
-            "overlapper.reset",
-            icon='LOOP_BACK'
-        )
-
-        row.operator(
-            # Restore
-            "overlapper.restore",
-            icon='RECOVER_LAST'
-        )
-
-        row = layout.row(
-            align=True
-        )
-
-        row.operator(
-            "overlapper.cleanup",
-            icon='TRASH'
-        )
+        row = layout.row(align=True)
+        row.operator("overlapper.cleanup", icon='TRASH')
 
 
 # ============================================================================
