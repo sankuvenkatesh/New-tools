@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
-    "version": (5, 2, 6, 1),
+    "version": (5, 2, 7),
     "blender": (4, 2, 0),
     "location": "View3D > Sidebar (N-panel) > Overlapper",
     "description": "Automatic overlapping / follow-through secondary animation for chains of objects or bones.",
@@ -482,20 +482,6 @@ def order_chain(chain):
 # NLA support
 # ============================================================================
 
-def remove_existing_overlap_tracks(id_obj):
-    anim = id_obj.animation_data
-
-    if anim is None:
-        return
-
-    for track in list(anim.nla_tracks):
-        if track.name in {
-            "Overlapper_Base",
-            "Overlapper_Overlap"
-        }:
-            anim.nla_tracks.remove(track)
-
-
 def push_base_action_to_nla(
         id_obj,
         _frame_start=None
@@ -915,8 +901,25 @@ def evaluate_curves(
 
 
 # ============================================================================
-# Wind  —  Maya-faithful port (smooth + cycle-safe)
+# Wind  —  smooth two-layer Maya-faithful wind (no jitter)
 # ============================================================================
+#
+# Single random-key stream (Maya's raw behavior) reads as jitter at
+# higher wind speeds because every step boundary introduces a full
+# swing between two independent random values.
+#
+# Two-layer blend solves this without losing Maya's character:
+#
+#   * slow layer  (step x 1.6, weight 0.75) — the visible base motion
+#   * fast layer  (step x 0.55, weight 0.25) — subtle shimmer on top
+#
+# Catmull-Rom through the sparse keys gives C1-continuity in both
+# layers, so the sum is smooth in value AND derivative at every frame.
+#
+# Cycle mode: each layer quantizes its segment count to an integer
+# that fits exactly into cycle_len, so both wrap seamlessly and
+# wind_offset(frame_start) == wind_offset(frame_end).
+# ----------------------------------------------------------------------------
 
 def _wind_rand(segment_index, channel, seed=0):
     x = math.sin(
@@ -939,6 +942,58 @@ def _catmull_rom(p0, p1, p2, p3, t):
     )
 
 
+def _wind_layer(
+        t,
+        step,
+        channel,
+        seed,
+        cycle_len
+):
+    if step < 1.0:
+        step = 1.0
+
+    if cycle_len and cycle_len > 0:
+        cl = float(cycle_len)
+
+        n_seg = max(
+            2,
+            int(round(cl / step))
+        )
+
+        step_eff = cl / float(n_seg)
+
+        wrapped_t = t % cl
+
+        u = wrapped_t / step_eff
+        seg = int(math.floor(u))
+        frac = u - float(seg)
+
+        s_m1 = (seg - 1) % n_seg
+        s_0 = seg % n_seg
+        s_p1 = (seg + 1) % n_seg
+        s_p2 = (seg + 2) % n_seg
+
+        return _catmull_rom(
+            _wind_rand(s_m1, channel, seed),
+            _wind_rand(s_0, channel, seed),
+            _wind_rand(s_p1, channel, seed),
+            _wind_rand(s_p2, channel, seed),
+            frac
+        )
+
+    u = t / step
+    seg = int(math.floor(u))
+    frac = u - float(seg)
+
+    return _catmull_rom(
+        _wind_rand(seg - 1, channel, seed),
+        _wind_rand(seg + 0, channel, seed),
+        _wind_rand(seg + 1, channel, seed),
+        _wind_rand(seg + 2, channel, seed),
+        frac
+    )
+
+
 def wind_offset(
         frame,
         speed,
@@ -954,63 +1009,29 @@ def wind_offset(
 
     t = float(frame - frame_start)
 
-    if cycle_len and cycle_len > 0:
-        cycle_len = float(cycle_len)
+    slow_step = base_step * 1.6
+    fast_step = base_step * 0.55
 
-        n_seg = max(
-            2,
-            int(round(cycle_len / base_step))
+    W_SLOW = 0.75
+    W_FAST = 0.25
+
+    y = (
+        W_SLOW * _wind_layer(
+            t, slow_step, 0, 0, cycle_len
         )
-
-        step = cycle_len / float(n_seg)
-
-        wrapped_t = t % cycle_len
-
-        u = wrapped_t / step
-        seg = int(math.floor(u))
-        frac = u - float(seg)
-
-        s_m1 = (seg - 1) % n_seg
-        s_0 = seg % n_seg
-        s_p1 = (seg + 1) % n_seg
-        s_p2 = (seg + 2) % n_seg
-
-        y = _catmull_rom(
-            _wind_rand(s_m1, 0),
-            _wind_rand(s_0, 0),
-            _wind_rand(s_p1, 0),
-            _wind_rand(s_p2, 0),
-            frac
+        + W_FAST * _wind_layer(
+            t, fast_step, 0, 500, cycle_len
         )
+    )
 
-        z = _catmull_rom(
-            _wind_rand(s_m1, 1),
-            _wind_rand(s_0, 1),
-            _wind_rand(s_p1, 1),
-            _wind_rand(s_p2, 1),
-            frac
+    z = (
+        W_SLOW * _wind_layer(
+            t, slow_step, 1, 0, cycle_len
         )
-
-    else:
-        u = t / base_step
-        seg = int(math.floor(u))
-        frac = u - float(seg)
-
-        y = _catmull_rom(
-            _wind_rand(seg - 1, 0),
-            _wind_rand(seg + 0, 0),
-            _wind_rand(seg + 1, 0),
-            _wind_rand(seg + 2, 0),
-            frac
+        + W_FAST * _wind_layer(
+            t, fast_step, 1, 500, cycle_len
         )
-
-        z = _catmull_rom(
-            _wind_rand(seg - 1, 1),
-            _wind_rand(seg + 0, 1),
-            _wind_rand(seg + 1, 1),
-            _wind_rand(seg + 2, 1),
-            frac
-        )
+    )
 
     return y, z
 
@@ -2082,7 +2103,7 @@ def run_overlapper(
                 )
 
                 # ------------------------------------------------------------
-                # Maya-faithful wind.
+                # Smooth two-layer Maya-faithful wind.
                 # ------------------------------------------------------------
 
                 if props.use_wind and wind_amp > 0.0:
@@ -3000,6 +3021,12 @@ class OVERLAPPER_PT_panel(
             box.prop(props, "add_translate")
             box.prop(props, "hierarchy_mode")
             box.prop(props, "cycle_mode")
+
+            box.separator()
+
+            box.prop(props, "bake_new_layer")
+            box.prop(props, "adaptive_scale")
+            box.prop(props, "delete_redundant")
 
         layout.separator()
 
