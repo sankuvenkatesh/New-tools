@@ -2,7 +2,7 @@ bl_info = {
     "name": "Overlapper",
     "author": "Blender port by Claude - original Maya tool by Dmitrii Kolpakov (2018)",
     "version": (5, 2, 7),
-    "blender": (4, 2, 0),
+    "blender": (5, 1, 0),
     "location": "View3D > Sidebar (N-panel) > Overlapper",
     "description": "Automatic overlapping / follow-through secondary animation for chains of objects or bones.",
     "category": "Animation",
