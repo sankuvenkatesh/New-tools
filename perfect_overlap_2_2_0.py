@@ -1,17 +1,16 @@
 # ##### BEGIN GPL LICENSE BLOCK #####
 #
 #  Perfect Overlap Addon
-#  Version 2.2.0: relative threshold, owned translation cleanup,
-#  channelbag diagnostics, Douglas-Peucker cleanup, negative frame support.
-#  Translation ownership is stored on the Action so generated Location keys
-#  can be safely removed later without deleting unrelated animator keys.
+#  Version 2.2.2: cosmetic cleanup on top of v2.2.1.
+#  Removed dead clear_translation_ownership() and the redundant
+#  post-del_animkey frame_set + restore_pose in both operators.
 #  Copyright 2021-2026 CaptainHansode, sakaiden.com
 #  Copyright 2026 Sanku Venkatesh
 #
 #  This program is free software; you can redistribute it and/or
 #  modify it under the terms of the GNU General Public License
-#  as published by the Free Software Foundation; either version 2
-#  of the License, or (at your option) any later version.
+#  as published by the Free Software Foundation; either version
+#  2 of the License, or (at your option) any later version.
 #
 #  This program is distributed in the hope that it will be useful,
 #  but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -23,7 +22,7 @@
 bl_info = {
     "name": "Perfect Overlap Addon",
     "author": "Sanku Venkatesh",
-    "version": (2, 2, 0),
+    "version": (2, 2, 2),
     "blender": (5, 1, 0),
     "location": "3D Viewport > Sidebar > Perfect Overlap Addon (Pose Mode)",
     "description": (
@@ -848,16 +847,22 @@ class PerfectOverlapSolver:
 
     @staticmethod
     def _ownership_entry_matches(entry, id_data, slot):
+        """Match ownership to the Action slot, not the armature name.
+
+        Ownership metadata lives on the Action itself, so the slot handle is
+        the authoritative binding. Using the object name here would orphan
+        otherwise valid ownership records whenever the armature is renamed.
+        ``owner_id`` is retained in metadata only as human-readable legacy
+        information and is intentionally not used as an identity key.
+        """
+        del id_data  # Kept in the signature for backward compatibility.
         try:
             slot_handle = int(slot.handle)
             entry_handle = int(entry.get("slot_handle", -999999))
         except (AttributeError, TypeError, ValueError):
             return False
 
-        return (
-            entry_handle == slot_handle
-            and entry.get("owner_id") == id_data.name
-        )
+        return entry_handle == slot_handle
 
     def _load_translation_ownership(self, id_data):
         action, _adt, _slot = self._assigned_action_slot(id_data)
@@ -903,66 +908,49 @@ class PerfectOverlapSolver:
             )
             return False
 
-    def clear_translation_ownership(self, id_data, obj_trees=None):
-        """Remove ownership metadata for this ID/slot.
+    def _normalized_owned_frames(self, entry):
+        """Return sorted, de-duplicated ownership frames."""
+        frames = set()
+        try:
+            raw_frames = entry.get("frames", [])
+        except AttributeError:
+            raw_frames = []
 
-        If obj_trees is supplied, only entries for those bone paths are
-        removed. This lets a new bake replace the selected controls without
-        disturbing ownership records for other controls in the same Action.
-        """
-        action, _adt, slot = self._assigned_action_slot(id_data)
-        if action is None or slot is None:
-            return 0
+        try:
+            for frame in raw_frames:
+                value = float(frame)
+                if math.isfinite(value):
+                    frames.add(round(value, 6))
+        except (TypeError, ValueError):
+            return []
 
-        entries = self._load_translation_ownership(id_data)
-        if not entries:
-            return 0
+        return sorted(frames)
 
-        selected_paths = None
-        if obj_trees is not None:
-            selected_paths = {
-                pbn.path_from_id() + ".location"
-                for pbn in self.iter_bones(obj_trees)
-            }
+    def _ownership_entry_with_frames(self, entry, frames):
+        """Copy an ownership entry while normalizing its surviving frames."""
+        normalized = sorted({round(float(frame), 6) for frame in frames})
+        if not normalized:
+            return None
 
-        kept = []
-        removed = 0
-
-        for entry in entries:
-            if not self._ownership_entry_matches(
-                entry,
-                id_data,
-                slot,
-            ):
-                kept.append(entry)
-                continue
-
-            if (
-                selected_paths is not None
-                and entry.get("data_path") not in selected_paths
-            ):
-                kept.append(entry)
-                continue
-
-            removed += 1
-
-        self._save_translation_ownership(
-            id_data,
-            kept,
-        )
-
-        return removed
+        result = dict(entry)
+        result["version"] = 3
+        result["frames"] = normalized
+        result["start"] = min(normalized)
+        result["end"] = max(normalized)
+        return result
 
     def remove_owned_translation_animation(
         self,
         id_data,
         obj_trees=None,
     ):
-        """Remove ONLY location keys previously generated by this add-on.
+        """Remove ONLY add-on-owned location keys in the current frame range.
 
-        Ownership is stored per Action+slot+ID, F-Curve path, array index and
-        generated keyframe frame. Animator-created location keys therefore
-        remain unless they occupy exactly the same generated frame.
+        Ownership metadata is Action+slot scoped. Only selected bone paths are
+        touched when ``obj_trees`` is supplied, and only owned frames inside
+        ``[sf, ef]`` are removed. Owned frames outside the range remain both in
+        the Action and in the ownership metadata so a later sub-range bake or
+        delete cannot accidentally orphan older generated keys.
         """
         action, _adt, slot = self._assigned_action_slot(id_data)
         if action is None or slot is None:
@@ -1010,48 +998,92 @@ class PerfectOverlapSolver:
             report_missing=True,
         )
 
+        # Never discard ownership metadata merely because the channelbag could
+        # not be resolved. A later retry can still find and remove it.
         if container is None:
             return 0
 
-        by_curve = {}
-        for fc in list(container):
-            by_curve[
-                (fc.data_path, int(fc.array_index))
-            ] = fc
+        by_curve = {
+            (fc.data_path, int(fc.array_index)): fc
+            for fc in list(container)
+        }
+
+        # Only curves named by target ownership entries are eligible for empty
+        # curve deletion. This prevents unrelated empty F-Curves from being
+        # deleted as collateral.
+        target_curve_keys = set()
+        retained_by_curve = {}
+        remove_frames_by_curve = {}
+
+        sf = float(self.sf)
+        ef = float(self.ef)
+
+        for entry in target_entries:
+            try:
+                array_index = int(entry.get("array_index", 0))
+            except (TypeError, ValueError):
+                continue
+
+            curve_key = (
+                entry.get("data_path", ""),
+                array_index,
+            )
+            target_curve_keys.add(curve_key)
+
+            frames = self._normalized_owned_frames(entry)
+            if not frames:
+                continue
+
+            outside = [
+                frame
+                for frame in frames
+                if frame < sf or frame > ef
+            ]
+            inside = [
+                frame
+                for frame in frames
+                if sf <= frame <= ef
+            ]
+
+            if outside:
+                retained = self._ownership_entry_with_frames(
+                    entry,
+                    outside,
+                )
+                if retained is not None:
+                    current = retained_by_curve.get(curve_key)
+                    if current is None:
+                        retained_by_curve[curve_key] = retained
+                    else:
+                        merged = sorted({
+                            *current.get("frames", []),
+                            *retained.get("frames", []),
+                        })
+                        current["frames"] = merged
+                        current["start"] = min(merged)
+                        current["end"] = max(merged)
+                        current["version"] = 3
+
+            if inside:
+                remove_frames_by_curve.setdefault(
+                    curve_key,
+                    set(),
+                ).update(inside)
 
         removed_keys = 0
 
-        for entry in target_entries:
-            key = (
-                entry.get("data_path", ""),
-                int(entry.get("array_index", 0)),
-            )
-
-            fc = by_curve.get(key)
+        for curve_key, frames in remove_frames_by_curve.items():
+            fc = by_curve.get(curve_key)
             if fc is None:
-                # The curve may already have been deleted. Treat the ownership
-                # record as stale rather than failing the entire operation.
-                continue
-
-            try:
-                frames = {
-                    round(float(frame), 6)
-                    for frame in entry.get("frames", [])
-                }
-            except (TypeError, ValueError):
-                frames = set()
-
-            if not frames:
+                # The curve may already have been deleted. Ownership records
+                # outside the requested range are still preserved below.
                 continue
 
             keys = fc.keyframe_points
             indices = []
 
             for i, keyframe in enumerate(keys):
-                frame = round(
-                    float(keyframe.co[0]),
-                    6,
-                )
+                frame = round(float(keyframe.co[0]), 6)
                 if frame in frames:
                     indices.append(i)
 
@@ -1065,20 +1097,28 @@ class PerfectOverlapSolver:
                 except (RuntimeError, ReferenceError):
                     pass
 
-            fc.update()
+            try:
+                fc.update()
+            except (RuntimeError, ReferenceError):
+                pass
 
-        # Delete a curve only if no keys remain. If animator keys still exist,
-        # the F-Curve survives.
-        for fc in list(container):
-            if (fc.data_path, int(fc.array_index)) not in by_curve:
+        # Rebuild the metadata for target entries, preserving only generated
+        # keys outside this operation's frame range. Entries for non-target
+        # paths remain untouched.
+        kept_entries.extend(retained_by_curve.values())
+
+        # Delete only now-empty curves that actually belonged to the ownership
+        # records we processed. Unrelated curves are never removed here.
+        for curve_key in target_curve_keys:
+            fc = by_curve.get(curve_key)
+            if fc is None:
                 continue
-            if len(fc.keyframe_points) == 0:
-                try:
+            try:
+                if len(fc.keyframe_points) == 0:
                     container.remove(fc)
-                except (RuntimeError, ReferenceError):
-                    pass
+            except (RuntimeError, ReferenceError):
+                pass
 
-        # All target ownership entries are now obsolete.
         self._save_translation_ownership(
             id_data,
             kept_entries,
@@ -1091,7 +1131,12 @@ class PerfectOverlapSolver:
         self,
         obj_trees,
     ):
-        """Record the exact location keyframes generated by this bake."""
+        """Record exact generated location keyframes for the current bake.
+
+        Only the current frame range is replaced. Existing ownership for the
+        selected paths outside that range is preserved, which keeps metadata
+        synchronized when users rebake a sub-range of a longer animation.
+        """
         obj = bpy.context.active_object
         if obj is None:
             return False
@@ -1100,29 +1145,67 @@ class PerfectOverlapSolver:
         if action is None or slot is None:
             return True
 
-        existing = self._load_translation_ownership(
-            obj
-        )
+        existing = self._load_translation_ownership(obj)
 
-        # Replace records for the bones just baked while preserving other
-        # Perfect Overlap-owned controls in the same Action.
         selected_paths = {
             pbn.path_from_id() + ".location"
             for pbn in self.iter_bones(obj_trees)
         }
 
-        kept = [
-            entry
-            for entry in existing
-            if not (
-                self._ownership_entry_matches(
-                    entry,
-                    obj,
-                    slot,
-                )
-                and entry.get("data_path") in selected_paths
+        sf = float(self.sf)
+        ef = float(self.ef)
+
+        # Preserve all unrelated ownership and all selected-path ownership
+        # outside the current bake range. Only frames in [sf, ef] are replaced.
+        kept = []
+        preserved_by_key = {}
+
+        for entry in existing:
+            if not self._ownership_entry_matches(
+                entry,
+                obj,
+                slot,
+            ) or entry.get("data_path") not in selected_paths:
+                kept.append(entry)
+                continue
+
+            try:
+                array_index = int(entry.get("array_index", 0))
+            except (TypeError, ValueError):
+                kept.append(entry)
+                continue
+
+            frames = self._normalized_owned_frames(entry)
+            outside = [
+                frame
+                for frame in frames
+                if frame < sf or frame > ef
+            ]
+            if not outside:
+                continue
+
+            key = (entry.get("data_path", ""), array_index)
+            preserved = self._ownership_entry_with_frames(
+                entry,
+                outside,
             )
-        ]
+            if preserved is None:
+                continue
+
+            current = preserved_by_key.get(key)
+            if current is None:
+                preserved_by_key[key] = preserved
+            else:
+                merged = sorted({
+                    *current.get("frames", []),
+                    *preserved.get("frames", []),
+                })
+                current["frames"] = merged
+                current["start"] = min(merged)
+                current["end"] = max(merged)
+                current["version"] = 3
+
+        kept.extend(preserved_by_key.values())
 
         container = self._fcurve_container(
             obj,
@@ -1136,10 +1219,12 @@ class PerfectOverlapSolver:
             for pbn in self.iter_bones(obj_trees)
         }
 
+        owner_id = obj.name
+        slot_handle = int(slot.handle)
+        slot_identifier = getattr(slot, "identifier", "")
+
         for fc in list(container):
-            pbn = selected_by_path.get(
-                fc.data_path
-            )
+            pbn = selected_by_path.get(fc.data_path)
             if pbn is None:
                 continue
 
@@ -1149,26 +1234,23 @@ class PerfectOverlapSolver:
             frames = [
                 round(float(key.co[0]), 6)
                 for key in fc.keyframe_points
-                if self.sf <= float(key.co[0]) <= self.ef
+                if sf <= float(key.co[0]) <= ef
             ]
 
             if not frames:
                 continue
 
+            deduped = sorted(set(frames))
             kept.append({
-                "version": 2,
-                "owner_id": obj.name,
-                "slot_handle": int(slot.handle),
-                "slot_identifier": getattr(
-                    slot,
-                    "identifier",
-                    "",
-                ),
+                "version": 3,
+                "owner_id": owner_id,
+                "slot_handle": slot_handle,
+                "slot_identifier": slot_identifier,
                 "data_path": fc.data_path,
                 "array_index": int(fc.array_index),
-                "frames": frames,
-                "start": int(self.sf),
-                "end": int(self.ef),
+                "frames": deduped,
+                "start": min(deduped),
+                "end": max(deduped),
             })
 
         return self._save_translation_ownership(
@@ -2100,30 +2182,30 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
             operation_snapshot = module.capture_pose(obj_trees)
 
             scene.frame_set(props.start_frame)
+
+            # Capture the actual starting pose BEFORE any ownership cleanup or
+            # key deletion can change the evaluated animation at Start Frame.
+            # This snapshot is the pose that the bake must preserve at the
+            # beginning of the requested range.
+            start_pose = module.capture_pose(obj_trees)
             _redraw()
 
             # Remove only translation keys previously generated by Perfect
-            # Overlap. When Translation is OFF this clears stale overlap from
-            # earlier Translation-ON bakes; when ON it replaces ownership for
-            # the currently selected controls. Animator location keys that are
-            # not part of our ownership record remain untouched.
-            if props.animate_translate:
-                module.remove_owned_translation_animation(
-                    obj,
-                    obj_trees,
-                )
-            else:
-                module.remove_owned_translation_animation(
-                    obj,
-                    None,
-                )
+            # Overlap, and only for the selected chain. Translation OFF must
+            # still clear stale translation generated by an earlier
+            # Translation-ON bake; it must never wipe other selected/unselected
+            # ownership records in the same Action.
+            module.remove_owned_translation_animation(
+                obj,
+                obj_trees,
+            )
 
             bpy.context.view_layer.update()
-            start_pose = module.capture_pose(obj_trees)
+
+            # del_animkey internally restores start_pose, so no extra
+            # frame_set + restore_pose is required here.
             module.del_animkey(obj_trees, start_pose)
 
-            scene.frame_set(props.start_frame)
-            module.restore_pose(obj_trees, start_pose)
             module.set_pre_data(obj_trees)
 
             if props.cycle:
@@ -2256,26 +2338,25 @@ class PERFECTOVERLAP_OT_del_anim(bpy.types.Operator):
 
             operation_snapshot = module.capture_pose(obj_trees)
             scene.frame_set(props.start_frame)
+
+            # Preserve the true evaluated Start Frame pose before deleting any
+            # keys. The delete operation must restore this pose rather than the
+            # post-cleanup state.
+            start_pose = module.capture_pose(obj_trees)
             _redraw()
 
-            # Clear only Perfect Overlap-owned translation keys. Turning the
-            # Translation option OFF therefore cannot leave an old bake playing.
-            if props.animate_translate:
-                module.remove_owned_translation_animation(
-                    obj,
-                    obj_trees,
-                )
-            else:
-                module.remove_owned_translation_animation(
-                    obj,
-                    None,
-                )
+            # Translation cleanup is always scoped to the current selected
+            # chain. This also removes stale translation generated by an older
+            # Translation-ON bake when the option is currently OFF.
+            module.remove_owned_translation_animation(
+                obj,
+                obj_trees,
+            )
 
             bpy.context.view_layer.update()
-            start_pose = module.capture_pose(obj_trees)
+
+            # del_animkey internally restores start_pose.
             module.del_animkey(obj_trees, start_pose)
-            scene.frame_set(props.start_frame)
-            module.restore_pose(obj_trees, start_pose)
 
             key_msg = _format_failures("Keying failures", module.key_failures)
             if key_msg:
