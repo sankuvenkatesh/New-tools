@@ -1,7 +1,7 @@
 # ##### BEGIN GPL LICENSE BLOCK #####
 #
 # Perfect Overlap Addon
-# Version 2.5.0 - armature-space tail-spring overlap solver.
+# Version 2.5.1 - tail-spring overlap solver (reviewed and fixed).
 #
 # Copyright 2021-2026 CaptainHansode, sakaiden.com
 # Copyright 2026 Sanku Venkatesh
@@ -12,11 +12,26 @@
 # of the License, or (at your option) any later version.
 #
 # ##### END GPL LICENSE BLOCK #####
+#
+# 2.5.1 - fixes over 2.5.0
+# ------------------------
+# * Key reduction is now Douglas-Peucker. The old greedy pass only compared
+#   the key next to the end of a segment, so the error could pile up.
+# * Cycle: only the curves this add-on writes are touched (the seam code used
+#   to overwrite unrelated channels such as scale), and the loop is solved as
+#   a true periodic state, so first frame == last frame without a pop.
+# * Armature OBJECT motion now also drives the lag (ignored in Cycle mode).
+# * Translation spring is consistent with the aim solve and tracks the value
+#   that was really applied, so locked axes cannot wind up.
+# * Model check: warns about bones whose pose cannot be reproduced exactly
+#   (constraints on the bone, non-default Inherit Rotation / Scale).
+# * "Nothing to overlap" warning when neither the chain nor its driver moves.
+# * AttributeError is no longer swallowed while sampling.
 
 bl_info = {
     "name": "Perfect Overlap",
     "author": "Sanku Venkatesh",
-    "version": (2, 5, 0),
+    "version": (2, 5, 1),
     "blender": (4, 4, 0),
     "location": "3D Viewport > Sidebar > Perfect Overlap (Pose Mode)",
     "description": (
@@ -46,9 +61,18 @@ ZERO_V = mathutils.Vector((0.0, 0.0, 0.0))
 ONE_V = mathutils.Vector((1.0, 1.0, 1.0))
 IDENTITY_Q = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
 
+# The lagged tip / head may drift at most this many bone lengths from where
+# the bone would be if it simply followed its parent (1.0 = 90 degrees swing).
 MAX_TIP_LAG_RATIO = 1.0
 MAX_HEAD_LAG_RATIO = 1.0
 MAX_SWING_ANGLE = math.radians(150.0)
+
+# Model check: evaluated pose vs. the solver's own model of the chain.
+MODEL_TOLERANCE_LENGTH = 0.02
+MODEL_TOLERANCE_ANGLE = math.radians(1.0)
+
+# Below this the result is considered "no visible overlap".
+MIN_VISIBLE_OVERLAP = math.radians(0.05)
 
 CYCLE_MODIFIER_NAME = "Perfect Overlap Cycle"
 
@@ -98,8 +122,8 @@ def safe_vector(v, fallback=None):
 
 
 def safe_quaternion(q, fallback=None):
-    """Normalize a quaternion. Uses .magnitude - mathutils.Quaternion
-    has no .length (that was the crash bug in 2.3.x)."""
+    """Normalize a quaternion. Uses .magnitude - mathutils.Quaternion has no
+    .length (that was the crash bug in 2.3.x). Never raises."""
     if fallback is None:
         fallback = IDENTITY_Q
     try:
@@ -114,6 +138,7 @@ def safe_quaternion(q, fallback=None):
 
 
 def safe_invert(m):
+    """Matrix inverse that never raises (a singular matrix becomes identity)."""
     try:
         return m.inverted()
     except (ValueError, ArithmeticError):
@@ -140,6 +165,13 @@ def axis_angle_to_quaternion(aa):
         return IDENTITY_Q.copy()
 
 
+def current_subframe(scene):
+    try:
+        return float(scene.frame_subframe)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
 # ============================================================================
 # Solver
 # ============================================================================
@@ -148,14 +180,22 @@ class PerfectOverlapSolver:
     """Spring-lagged tip overlap solver.
 
     Pipeline:
-        1. build_chains()    select the chains to overlap
-        2. sample_source()   read the source animation (read-only)
-        3. solve()           simulate overlap in pure math
-        4. delete_keys()     remove old keys from the range
+        1. build_chains()    pick the chains to overlap from the selection
+        2. sample_source()   read the source animation        (read-only)
+        3. solve()           simulate the overlap in pure maths
+        4. delete_keys()     remove old keys in the range
         5. write_results()   write the new rotation keys
 
-    All math is done in armature-object space (the space of
-    pose_bone.matrix). The armature object's own transform is never read.
+    Model: for a bone with parent P
+
+        pose = P.pose @ (P.rest^-1 @ bone.rest) @ LocRotScale(loc, rot, scale)
+
+    The tail of every selected bone is a spring-lagged point. The target of
+    that point is where the tail would be if the bone simply followed its
+    (already overlapped) parent with its authored local pose. The bone is then
+    re-aimed at the lagged tail and the aim change is converted back into a
+    plain local rotation. Parents are solved before children, so the lag
+    accumulates down the chain.
     """
 
     def __init__(self):
@@ -172,6 +212,8 @@ class PerfectOverlapSolver:
         self.lookup_failures = set()
         self.pose_failures = set()
         self.translate_skipped = []
+        self.model_mismatch = []
+        self.max_overlap_angle = 0.0
 
     # ------------------------------------------------------------------------
     # Config
@@ -198,7 +240,7 @@ class PerfectOverlapSolver:
         damping = 0.76 - (rec / 10.0) * 0.34
         damping = max(0.38, min(0.76, damping))
 
-        # Strength amplifies the tip offset before re-aim. 1 -> 1x, 10 -> 2x.
+        # Strength speeds the response up, which adds follow-through.
         strength = max(1.0, min(10.0, self.strength))
         amp = 1.0 + (strength - 1.0) / 9.0
         return k, damping, amp
@@ -207,7 +249,8 @@ class PerfectOverlapSolver:
         if self.debug:
             print("[Perfect Overlap] {}".format(msg))
 
-    def _fail(self, collection, message):
+    @staticmethod
+    def _fail(collection, message):
         if message:
             collection.add(str(message))
 
@@ -286,7 +329,7 @@ class PerfectOverlapSolver:
                     best_score, best = score, c
             except Exception:
                 continue
-        return best or candidates[0]
+        return best if best is not None else candidates[0]
 
     @staticmethod
     def _depth(pbn):
@@ -302,8 +345,8 @@ class PerfectOverlapSolver:
     # ------------------------------------------------------------------------
 
     def build_chains(self):
-        """Return a list of chains. Each chain is a list of pose bones,
-        ordered parents-first. Chains are also sorted parents-first."""
+        """Return a list of chains. Each chain is a list of pose bones ordered
+        parents-first. Chains are sorted parents-first as well."""
         obj = bpy.context.active_object
         if obj is None or obj.type != 'ARMATURE':
             return []
@@ -327,7 +370,7 @@ class PerfectOverlapSolver:
             if pbn.name in used:
                 continue
             if pbn.parent is None:
-                # A parentless control is a driver, not part of the chain.
+                # A parentless control is a driver, not part of a chain.
                 continue
             chain = [pbn]
             used.add(pbn.name)
@@ -360,12 +403,12 @@ class PerfectOverlapSolver:
                 yield pbn
 
     # ------------------------------------------------------------------------
-    # Sampling
+    # Phase 1 - sampling (read-only)
     # ------------------------------------------------------------------------
 
     @staticmethod
     def _active_quat(pbn):
-        """Read the quaternion from the bone's ACTIVE rotation channel."""
+        """Quaternion of the bone's ACTIVE rotation channel."""
         mode = pbn.rotation_mode
         try:
             if mode == 'QUATERNION':
@@ -373,25 +416,28 @@ class PerfectOverlapSolver:
             if mode == 'AXIS_ANGLE':
                 return axis_angle_to_quaternion(pbn.rotation_axis_angle)
             return safe_quaternion(pbn.rotation_euler.to_quaternion())
-        except Exception:
+        except (ValueError, ArithmeticError, TypeError):
             return IDENTITY_Q.copy()
 
     def sample_source(self, chains):
-        """Read the source animation across the frame range.
+        """Read the source animation for every frame in the range.
 
-        Returns a dict with:
-            frames       {frame: {bone_name: {"matrix", "local_loc",
-                                              "local_quat", "local_scale"}}}
-            rest_rel     {bone_name: M4}
-            chain_names  set of chain bone names
-            driver_names set of names of parents outside the chain
-        or None on failure.
+        Returns a dict:
+            frames   {frame: {"world": M4,
+                              bone: {"matrix", "local_loc", "local_quat",
+                                     "local_scale"}   (chain bones)
+                              driver: {"matrix"}}}    (parents outside chain)
+            rest_rel {bone: parent.rest^-1 @ bone.rest}
+            parent   {bone: parent name}
+            length   {bone: rest length}
+        or None when there is nothing to read. Only the current frame moves.
         """
         scene = bpy.context.scene
         obj = bpy.context.active_object
         if obj is None:
             return None
         original_frame = scene.frame_current
+        original_subframe = current_subframe(scene)
 
         bones = list(self.iter_bones(chains))
         if not bones:
@@ -399,6 +445,9 @@ class PerfectOverlapSolver:
         chain_names = {pbn.name for pbn in bones}
 
         rest_rel = {}
+        parent_of = {}
+        length = {}
+        drivers = {}
         for pbn in bones:
             parent = pbn.parent
             if parent is None:
@@ -406,270 +455,84 @@ class PerfectOverlapSolver:
             rest_rel[pbn.name] = (
                 safe_invert(parent.bone.matrix_local) @ pbn.bone.matrix_local
             )
-
-        driver_names = set()
-        for pbn in bones:
-            parent = pbn.parent
-            if parent is not None and parent.name not in chain_names:
-                driver_names.add(parent.name)
+            parent_of[pbn.name] = parent.name
+            length[pbn.name] = max(float(pbn.bone.length), EPS)
+            if parent.name not in chain_names:
+                drivers[parent.name] = parent
+        if not rest_rel:
+            return None
 
         cache = {}
         try:
             for f in range(self.sf, self.ef + 1):
                 scene.frame_set(f)
                 bpy.context.view_layer.update()
-                frame_data = {}
+                frame_data = {"world": obj.matrix_world.copy()}
                 for pbn in bones:
-                    try:
-                        frame_data[pbn.name] = {
-                            "matrix": pbn.matrix.copy(),
-                            "local_loc": safe_vector(pbn.location),
-                            "local_quat": self._active_quat(pbn),
-                            "local_scale": safe_vector(pbn.scale, ONE_V),
-                        }
-                    except (ReferenceError, AttributeError):
-                        continue
-                for name in driver_names:
-                    pbn = obj.pose.bones.get(name)
-                    if pbn is None:
-                        continue
-                    try:
-                        frame_data.setdefault(name, {})["matrix"] = (
-                            pbn.matrix.copy()
-                        )
-                    except (ReferenceError, AttributeError):
-                        pass
+                    frame_data[pbn.name] = {
+                        "matrix": pbn.matrix.copy(),
+                        "local_loc": safe_vector(pbn.location),
+                        "local_quat": self._active_quat(pbn),
+                        "local_scale": safe_vector(pbn.scale, ONE_V),
+                    }
+                for name, pbn in drivers.items():
+                    frame_data[name] = {"matrix": pbn.matrix.copy()}
                 cache[f] = frame_data
         finally:
-            scene.frame_set(original_frame)
+            scene.frame_set(original_frame, subframe=original_subframe)
             bpy.context.view_layer.update()
-
-        if not cache:
-            return None
 
         return {
             "frames": cache,
             "rest_rel": rest_rel,
-            "chain_names": chain_names,
-            "driver_names": driver_names,
-            "bones": [pbn.name for pbn in bones],
+            "parent": parent_of,
+            "length": length,
         }
 
-    # ------------------------------------------------------------------------
-    # Solving
-    # ------------------------------------------------------------------------
+    def check_model(self, source):
+        """Names of bones whose real pose differs from the solver's model.
 
-    @staticmethod
-    def _spring(pos, vel, target, k, damping, amp):
-        v = vel * damping + (target - pos) * k
-        if not is_finite_vector(v):
-            v = ZERO_V.copy()
-        new_pos = pos + v * amp
-        return new_pos, v
-
-    def _aim_quaternion(self, pose_x, source_quat, source_head,
-                        source_tail, wanted_tail):
-        """Local quaternion that re-aims the bone from its source direction
-        toward the lagged direction. The source roll is preserved."""
-        aim_now = source_tail - source_head
-        aim_new = wanted_tail - source_head
-        if aim_now.length < EPS or aim_new.length < EPS:
-            return source_quat
-        try:
-            delta = aim_now.rotation_difference(aim_new)
-            if delta.w < 0.0:
-                delta.negate()
-            angle = float(delta.angle)
-            if angle > MAX_SWING_ANGLE:
-                delta = IDENTITY_Q.slerp(delta, MAX_SWING_ANGLE / angle)
-            qx = pose_x.to_quaternion()
-            result = qx.conjugated() @ delta @ qx @ source_quat
-            result.normalize()
-            return safe_quaternion(result, source_quat)
-        except (ValueError, ArithmeticError, TypeError):
-            return source_quat
-
-    def solve(self, chains, source, cycle=False, preroll=0):
-        """Simulate overlap. Returns {frame: {bone: {"rotation", "location"}}}.
-
-        No Blender data is touched.
+        The solver assumes pose = parent_pose @ rest_offset @ local_channels.
+        That is exact for normal FK controls but not for bones with
+        constraints on them or non-default Inherit Rotation / Inherit Scale.
         """
-        frames = list(range(self.sf, self.ef + 1))
-        cache = source["frames"]
-        if frames[0] not in cache:
-            return None
-
-        k, damping, amp = self.solver_params()
-
-        # Build a table of chain bones and their static properties.
-        info = {}
-        for pbn in self.iter_bones(chains):
-            if pbn.name not in source["chain_names"]:
-                continue
-            parent = pbn.parent
-            if parent is None:
-                continue
-            axes = self._translate_axes(pbn)
-            info[pbn.name] = {
-                "bone": pbn,
-                "parent": parent.name,
-                "rest_rel": source["rest_rel"].get(pbn.name),
-                "length": max(float(pbn.length), EPS),
-                "axes": axes,
-            }
-            if self.animate_translate and not axes:
-                self.translate_skipped.append(pbn.name)
-
-        ordered = sorted(info.keys(), key=lambda n: self._depth(info[n]["bone"]))
-        if not ordered:
-            return None
-
-        # Per-bone state for the two springs (tip and optional head).
-        state = {}
-        for n in ordered:
-            state[n] = {
-                "tip": None,
-                "tip_vel": ZERO_V.copy(),
-                "head": None,
-                "head_vel": ZERO_V.copy(),
-            }
-
-        def step_frame(frame_idx, snap=False, reset_vel=False):
-            """One integration step across all bones. Returns output dict."""
-            frame_data = cache.get(frame_idx, {})
-            solved_poses = {}
-            out = {}
-
-            for name in ordered:
-                meta = info[name]
-                src = frame_data.get(name)
-                if src is None:
+        worst = {}
+        for frame_data in source["frames"].values():
+            for name, rest_rel in source["rest_rel"].items():
+                data = frame_data.get(name)
+                parent_data = frame_data.get(source["parent"][name])
+                if not data or not parent_data:
                     continue
-
-                parent_name = meta["parent"]
-                parent_pose = solved_poses.get(parent_name)
-                if parent_pose is None:
-                    # Parent is a driver: use its sampled pose.
-                    par = frame_data.get(parent_name)
-                    if par is None:
-                        continue
-                    parent_pose = par.get("matrix")
-                    if parent_pose is None:
-                        continue
-
-                rest_rel = meta["rest_rel"]
-                if rest_rel is None:
+                parent_pose = parent_data.get("matrix")
+                actual = data.get("matrix")
+                if parent_pose is None or actual is None:
                     continue
-
-                pose_x = parent_pose @ rest_rel
-                source_loc = src["local_loc"]
-                source_quat = src["local_quat"]
-                source_scale = src["local_scale"]
-
-                target_pose = pose_x @ mathutils.Matrix.LocRotScale(
-                    source_loc, source_quat, source_scale,
-                )
-                target_head = target_pose.translation.copy()
-                target_tail = target_pose @ mathutils.Vector(
-                    (0.0, meta["length"], 0.0)
-                )
-
-                st = state[name]
-
-                # --- Optional translation spring on the head ---
-                use_loc = source_loc
-                if meta["axes"]:
-                    if snap or st["head"] is None:
-                        st["head"] = target_head.copy()
-                        if reset_vel or st["head_vel"] is None:
-                            st["head_vel"] = ZERO_V.copy()
-                    else:
-                        new_head, hvel = self._spring(
-                            st["head"], st["head_vel"], target_head,
-                            k, damping, amp,
-                        )
-                        max_lag = meta["length"] * MAX_HEAD_LAG_RATIO
-                        lag = new_head - target_head
-                        if lag.length > max_lag:
-                            new_head = target_head + lag.normalized() * max_lag
-                            hvel = ZERO_V.copy()
-                        st["head"] = new_head
-                        st["head_vel"] = hvel
-
-                    try:
-                        local_head = safe_invert(pose_x) @ st["head"]
-                        delta_loc = local_head - source_loc
-                        for ax in range(3):
-                            if ax not in meta["axes"]:
-                                delta_loc[ax] = 0.0
-                        use_loc = source_loc + delta_loc
-                    except Exception:
-                        use_loc = source_loc
-                else:
-                    st["head"] = target_head.copy()
-                    st["head_vel"] = ZERO_V.copy()
-
-                # --- Rotation overlap on the tip ---
-                new_quat = source_quat
-                if snap or st["tip"] is None:
-                    st["tip"] = target_tail.copy()
-                    if reset_vel or st["tip_vel"] is None:
-                        st["tip_vel"] = ZERO_V.copy()
-                else:
-                    new_tip, tvel = self._spring(
-                        st["tip"], st["tip_vel"], target_tail,
-                        k, damping, amp,
+                predicted = (
+                    parent_pose
+                    @ rest_rel
+                    @ mathutils.Matrix.LocRotScale(
+                        data["local_loc"],
+                        data["local_quat"],
+                        data["local_scale"],
                     )
-                    max_lag = meta["length"] * MAX_TIP_LAG_RATIO
-                    lag = new_tip - target_tail
-                    if lag.length > max_lag:
-                        new_tip = target_tail + lag.normalized() * max_lag
-                        tvel = ZERO_V.copy()
-                    st["tip"] = new_tip
-                    st["tip_vel"] = tvel
-                    new_quat = self._aim_quaternion(
-                        pose_x, source_quat,
-                        target_head, target_tail, new_tip,
-                    )
-
-                out[name] = {
-                    "rotation": new_quat.copy(),
-                    "location": use_loc.copy() if meta["axes"] else None,
-                }
-
-                # The solved pose of this bone drives its children.
-                solved_poses[name] = pose_x @ mathutils.Matrix.LocRotScale(
-                    use_loc, new_quat, source_scale,
                 )
-
-            return out
-
-        if not cycle:
-            # Simple pass: snap at start, then step through the range.
-            results = {
-                frames[0]: step_frame(frames[0], snap=True, reset_vel=True),
-            }
-            for f in frames[1:]:
-                results[f] = step_frame(f)
-            self._log(
-                "solved {} bones over {} frames".format(len(ordered), len(frames))
-            )
-            return results
-
-        # Cycle mode: pre-roll to settle the momentum, then record a clean pass.
-        step_frame(frames[0], snap=True, reset_vel=True)
-        passes = max(1, int(preroll))
-        for _ in range(passes):
-            for f in frames[1:]:
-                step_frame(f)
-        # Record the full loop (state persists from the pre-roll).
-        results = {}
-        for f in frames:
-            results[f] = step_frame(f)
-        self._log(
-            "cycle: {} pre-roll passes + 1 recorded pass".format(passes)
+                pos_err = (
+                    (predicted.translation - actual.translation).length
+                    / source["length"][name]
+                )
+                ang_err = quat_angle_between(
+                    predicted.to_quaternion(), actual.to_quaternion()
+                )
+                prev = worst.get(name, (0.0, 0.0))
+                worst[name] = (max(prev[0], pos_err), max(prev[1], ang_err))
+        return sorted(
+            n for n, (pos, ang) in worst.items()
+            if pos > MODEL_TOLERANCE_LENGTH or ang > MODEL_TOLERANCE_ANGLE
         )
-        return results
+
+    # ------------------------------------------------------------------------
+    # Phase 2 - solving (pure maths)
+    # ------------------------------------------------------------------------
 
     def _translate_axes(self, pbn):
         if not self.animate_translate:
@@ -680,6 +543,252 @@ class PerfectOverlapSolver:
             return [i for i in range(3) if not pbn.lock_location[i]]
         except (AttributeError, ReferenceError):
             return []
+
+    @staticmethod
+    def _spring(pos, vel, target, k, damping, amp):
+        v = vel * damping + (target - pos) * k
+        if not is_finite_vector(v):
+            v = ZERO_V.copy()
+        return pos + v * amp, v
+
+    @staticmethod
+    def _aim_quaternion(pose_x, quat, head, tail, wanted_tail):
+        """Local rotation that turns the bone from ``tail`` toward
+        ``wanted_tail`` (both seen from ``head``).
+
+        With pose = pose_x @ basis, a world-space turn ``delta`` of the bone
+        needs the basis rotation  q' = conj(qx) @ delta @ qx @ q  where qx is
+        the rotation of pose_x. Twist about the bone axis stays as authored.
+        """
+        aim_now = tail - head
+        aim_new = wanted_tail - head
+        if aim_now.length < EPS or aim_new.length < EPS:
+            return quat
+        try:
+            delta = aim_now.rotation_difference(aim_new)
+            if delta.w < 0.0:
+                delta.negate()
+            angle = float(delta.angle)
+            if angle > MAX_SWING_ANGLE:
+                delta = IDENTITY_Q.slerp(delta, MAX_SWING_ANGLE / angle)
+            qx = pose_x.to_quaternion()
+            result = qx.conjugated() @ delta @ qx @ quat
+            return safe_quaternion(result, quat)
+        except (ValueError, ArithmeticError, TypeError):
+            return quat
+
+    def _lag_head(self, st, pose_x, loc, meta, world, world_inv, ctx,
+                  snap, reset_velocity):
+        """Spring-lag the bone head (optional Translation) as local location."""
+        head_world = world @ (pose_x @ loc)
+
+        if snap or st["head"] is None:
+            st["head"] = head_world.copy()
+            if reset_velocity:
+                st["head_vel"] = ZERO_V.copy()
+            return loc
+
+        new_head, vel = self._spring(
+            st["head"], st["head_vel"], head_world,
+            ctx["k"], ctx["damping"], ctx["amp"],
+        )
+        world_length = (
+            world.to_3x3() @ mathutils.Vector((0.0, meta["length"], 0.0))
+        ).length
+        limit = max(world_length, EPS) * MAX_HEAD_LAG_RATIO
+        lag = new_head - head_world
+        if lag.length > limit:
+            new_head = head_world + lag.normalized() * limit
+            vel = ZERO_V.copy()
+
+        # location that puts the head on the lagged point
+        wanted = safe_invert(pose_x) @ (world_inv @ new_head)
+        delta = wanted - loc
+        for ax in range(3):
+            if ax not in meta["axes"]:
+                delta[ax] = 0.0
+        result = loc + delta
+
+        # keep the spring on what was really applied (no wind-up on locks)
+        st["head"] = world @ (pose_x @ result)
+        st["head_vel"] = vel
+        return result
+
+    def _step_frame(self, frame_data, ctx, snap=False, reset_velocity=False):
+        """Advance every chain bone by one frame. Pure maths.
+
+        snap=True puts every spring exactly on its target (no lag) and returns
+        the authored pose; reset_velocity=True also clears the momentum.
+        """
+        world = ctx["identity"] if ctx["ignore_world"] else frame_data["world"]
+        world_inv = safe_invert(world)
+        solved = {}
+        out = {}
+
+        for name in ctx["order"]:
+            meta = ctx["info"][name]
+            src = frame_data.get(name)
+            parent_pose = solved.get(meta["parent"])
+            if parent_pose is None:
+                parent_data = frame_data.get(meta["parent"])
+                parent_pose = parent_data.get("matrix") if parent_data else None
+            if src is None or parent_pose is None:
+                continue
+
+            st = ctx["state"][name]
+            loc = src["local_loc"]
+            quat = src["local_quat"]
+            scale = src["local_scale"]
+            pose_x = parent_pose @ meta["rest_rel"]
+
+            use_loc = loc
+            if meta["axes"]:
+                use_loc = self._lag_head(
+                    st, pose_x, loc, meta, world, world_inv, ctx,
+                    snap, reset_velocity,
+                )
+
+            pose_t = pose_x @ mathutils.Matrix.LocRotScale(use_loc, quat, scale)
+            head = pose_t.translation.copy()
+            tail = pose_t @ mathutils.Vector((0.0, meta["length"], 0.0))
+            tail_world = world @ tail
+
+            new_quat = quat
+            if snap or st["tip"] is None:
+                st["tip"] = tail_world.copy()
+                if reset_velocity:
+                    st["tip_vel"] = ZERO_V.copy()
+            else:
+                new_tip, vel = self._spring(
+                    st["tip"], st["tip_vel"], tail_world,
+                    ctx["k"], ctx["damping"], ctx["amp"],
+                )
+                limit = max((tail_world - world @ head).length, EPS)
+                limit *= MAX_TIP_LAG_RATIO
+                lag = new_tip - tail_world
+                if lag.length > limit:
+                    new_tip = tail_world + lag.normalized() * limit
+                    vel = ZERO_V.copy()
+                st["tip"] = new_tip
+                st["tip_vel"] = vel
+                new_quat = self._aim_quaternion(
+                    pose_x, quat, head, tail, world_inv @ new_tip
+                )
+
+            out[name] = {
+                "rotation": new_quat.copy(),
+                "location": use_loc.copy() if meta["axes"] else None,
+            }
+            # the solved pose of this bone drives its children
+            solved[name] = pose_x @ mathutils.Matrix.LocRotScale(
+                use_loc, new_quat, scale
+            )
+        return out
+
+    @staticmethod
+    def _copy_frame_result(frame_result):
+        return {
+            name: {
+                "rotation": res["rotation"].copy(),
+                "location": (
+                    res["location"].copy() if res["location"] is not None else None
+                ),
+            }
+            for name, res in frame_result.items()
+        }
+
+    def solve(self, chains, source, cycle=False, preroll=0):
+        """Simulate the overlap for the whole range.
+
+        Returns {frame: {bone: {"rotation": Quaternion, "location": Vector or
+        None}}} or None when there is nothing to solve. Touches no Blender
+        data, so a failure here cannot damage the animation.
+
+        Cycle mode treats the last frame as the same pose as the first,
+        settles the momentum with pre-roll passes and records one periodic
+        pass. The armature object's own motion is ignored in Cycle mode (a
+        loop is assumed to be in place) so the wrap-around is not a teleport.
+        """
+        frames = list(range(self.sf, self.ef + 1))
+        cache = source["frames"]
+        if frames[0] not in cache:
+            return None
+
+        k, damping, amp = self.solver_params()
+        self.translate_skipped = []
+
+        info = {}
+        for pbn in self.iter_bones(chains):
+            name = pbn.name
+            parent_name = source["parent"].get(name)
+            rest_rel = source["rest_rel"].get(name)
+            if parent_name is None or rest_rel is None:
+                continue
+            axes = self._translate_axes(pbn)
+            if self.animate_translate and not axes:
+                self.translate_skipped.append(name)
+            info[name] = {
+                "parent": parent_name,
+                "rest_rel": rest_rel,
+                "length": source["length"][name],
+                "axes": axes,
+                "depth": self._depth(pbn),
+            }
+        order = sorted(info, key=lambda n: info[n]["depth"])
+        if not order:
+            return None
+
+        ctx = {
+            "order": order,
+            "info": info,
+            "state": {
+                n: {
+                    "tip": None, "tip_vel": ZERO_V.copy(),
+                    "head": None, "head_vel": ZERO_V.copy(),
+                }
+                for n in order
+            },
+            "k": k,
+            "damping": damping,
+            "amp": amp,
+            "ignore_world": bool(cycle),
+            "identity": mathutils.Matrix.Identity(4),
+        }
+
+        # The first frame is the exact source pose.
+        first = self._step_frame(
+            cache[frames[0]], ctx, snap=True, reset_velocity=True
+        )
+
+        if not cycle:
+            results = {frames[0]: first}
+            for f in frames[1:]:
+                results[f] = self._step_frame(cache[f], ctx)
+        else:
+            for _ in range(max(1, int(preroll))):
+                for f in frames[1:]:
+                    self._step_frame(cache[f], ctx)
+            results = {}
+            for f in frames[1:]:
+                results[f] = self._step_frame(cache[f], ctx)
+            # last frame == first frame in a loop
+            results[frames[0]] = self._copy_frame_result(results[frames[-1]])
+
+        worst = 0.0
+        for f, frame_result in results.items():
+            for name, res in frame_result.items():
+                src = cache[f].get(name)
+                if src is not None:
+                    worst = max(
+                        worst,
+                        quat_angle_between(res["rotation"], src["local_quat"]),
+                    )
+        self.max_overlap_angle = worst
+
+        self._log("solved {} bone(s) over {} frame(s); max offset {:.2f} deg".format(
+            len(order), len(frames), math.degrees(worst),
+        ))
+        return results
 
     # ------------------------------------------------------------------------
     # Pose capture / restore
@@ -719,7 +828,7 @@ class PerfectOverlapSolver:
     # ------------------------------------------------------------------------
 
     def _ensure_action_slot(self, id_data):
-        """Assign a slot for this ID if the Action has none yet."""
+        """Make sure the assigned Action has a slot assigned to this ID."""
         if id_data is None:
             return True
         try:
@@ -773,9 +882,7 @@ class PerfectOverlapSolver:
         try:
             from bpy_extras import anim_utils
             helper = getattr(
-                anim_utils,
-                "animdata_get_channelbag_for_assigned_slot",
-                None,
+                anim_utils, "animdata_get_channelbag_for_assigned_slot", None,
             )
             channelbag = helper(adt) if helper is not None else None
             if channelbag is None:
@@ -785,6 +892,7 @@ class PerfectOverlapSolver:
                 if fallback is not None:
                     channelbag = fallback(adt.action, slot)
             if channelbag is None:
+                # No F-Curves for this slot yet. Not an error.
                 return None
             return channelbag.fcurves
         except (ImportError, AttributeError, RuntimeError, TypeError) as exc:
@@ -805,14 +913,9 @@ class PerfectOverlapSolver:
         for fc in list(container):
             for prefix, pbn in by_prefix.items():
                 if fc.data_path.startswith(prefix + "."):
-                    channel = fc.data_path[len(prefix) + 1:]
-                    result.append((fc, pbn, channel))
+                    result.append((fc, pbn, fc.data_path[len(prefix) + 1:]))
                     break
         return result
-
-    # ------------------------------------------------------------------------
-    # Writing
-    # ------------------------------------------------------------------------
 
     @staticmethod
     def _rotation_path(pbn):
@@ -822,9 +925,26 @@ class PerfectOverlapSolver:
             return 'rotation_axis_angle'
         return 'rotation_euler'
 
+    def _baked_curves(self, chains):
+        """(fcurve, pbn, channel) for the channels this add-on writes."""
+        result = []
+        for fc, pbn, channel in self._bones_fcurve_map(chains):
+            if channel == self._rotation_path(pbn):
+                result.append((fc, pbn, channel))
+            elif (
+                channel == 'location'
+                and fc.array_index in self._translate_axes(pbn)
+            ):
+                result.append((fc, pbn, channel))
+        return result
+
+    # ------------------------------------------------------------------------
+    # Phase 3 - writing
+    # ------------------------------------------------------------------------
+
     def _apply_rotation(self, pbn, quat, tracker):
-        """Write the local rotation using the bone's active rotation mode,
-        keeping it continuous with the previous frame's representation."""
+        """Write the local rotation in the bone's active rotation mode, keeping
+        it continuous with the previous frame's representation."""
         q = safe_quaternion(quat)
         mode = pbn.rotation_mode
         try:
@@ -864,8 +984,7 @@ class PerfectOverlapSolver:
             tracker["last_euler"] = euler.copy()
         except Exception as exc:
             self._fail(
-                self.pose_failures,
-                "{}: rotation {}".format(pbn.name, exc),
+                self.pose_failures, "{}: rotation {}".format(pbn.name, exc),
             )
 
     def write_results(self, chains, results, start_pose):
@@ -875,7 +994,7 @@ class PerfectOverlapSolver:
 
         bones = {pbn.name: pbn for pbn in self.iter_bones(chains)}
 
-        # Seed one continuity tracker per bone from the start pose.
+        # one continuity tracker per bone, seeded from the authored start pose
         trackers = {}
         for name in bones:
             t = {}
@@ -888,7 +1007,7 @@ class PerfectOverlapSolver:
                         float(v) for v in seed["rotation_axis_angle"]
                     )
                 except (KeyError, AttributeError, TypeError, ValueError):
-                    pass
+                    t = {}
             trackers[name] = t
 
         self._ensure_action_slot(obj)
@@ -914,18 +1033,18 @@ class PerfectOverlapSolver:
                 self._key_bone(pbn)
             bpy.context.view_layer.update()
 
+        if not self._ensure_action_slot(obj):
+            self._fail(self.key_failures, "Action slot")
+
     def _key_bone(self, pbn):
         f = bpy.context.scene.frame_current
 
         for ax in self._translate_axes(pbn):
             try:
-                r = pbn.keyframe_insert(
-                    data_path='location', index=ax, frame=f
-                )
+                r = pbn.keyframe_insert(data_path='location', index=ax, frame=f)
                 if r is False:
                     self._fail(
-                        self.key_failures,
-                        "{} loc[{}]".format(pbn.name, ax),
+                        self.key_failures, "{} loc[{}]".format(pbn.name, ax),
                     )
             except Exception as exc:
                 self._fail(
@@ -938,12 +1057,10 @@ class PerfectOverlapSolver:
                 data_path=self._rotation_path(pbn), frame=f,
             )
             if r is False:
-                self._fail(
-                    self.key_failures, "{} rotation".format(pbn.name)
-                )
+                self._fail(self.key_failures, "{} rotation".format(pbn.name))
         except Exception as exc:
             self._fail(
-                self.key_failures, "{} rotation: {}".format(pbn.name, exc)
+                self.key_failures, "{} rotation: {}".format(pbn.name, exc),
             )
 
     # ------------------------------------------------------------------------
@@ -951,10 +1068,12 @@ class PerfectOverlapSolver:
     # ------------------------------------------------------------------------
 
     def delete_keys(self, chains):
-        """Remove rotation keys and generated translation keys in [sf, ef]."""
+        """Remove rotation keys (and location keys on the unlocked axes when
+        Translation is on) inside [start, end]. Returns the number removed."""
         obj = bpy.context.active_object
         container = self._fcurve_container(obj)
         emptied = []
+        removed = 0
 
         for fc, pbn, channel in self._bones_fcurve_map(chains):
             if channel == 'location':
@@ -970,6 +1089,7 @@ class PerfectOverlapSolver:
             for i in reversed(indices):
                 try:
                     fc.keyframe_points.remove(fc.keyframe_points[i], fast=True)
+                    removed += 1
                 except (RuntimeError, ReferenceError):
                     pass
             try:
@@ -985,96 +1105,113 @@ class PerfectOverlapSolver:
                     container.remove(fc)
                 except (RuntimeError, ReferenceError):
                     pass
+        return removed
+
+    @staticmethod
+    def _max_deviation(values, frames, left, right):
+        if right - left <= 1:
+            return 0.0, None
+        t0, t1 = frames[left], frames[right]
+        span = t1 - t0
+        if abs(span) < EPS:
+            return 0.0, None
+        worst, worst_i = -1.0, None
+        for i in range(left + 1, right):
+            ratio = (frames[i] - t0) / span
+            err = 0.0
+            for comp in values:
+                pred = comp[left] + (comp[right] - comp[left]) * ratio
+                err = max(err, abs(comp[i] - pred))
+            if err > worst:
+                worst, worst_i = err, i
+        return worst, worst_i
+
+    def _keep_indices(self, values, frames, tol):
+        """Douglas-Peucker: every dropped key stays within ``tol`` of the
+        straight line between the keys that are kept."""
+        n = len(frames)
+        if n <= 2:
+            return set(range(n))
+        keep = {0, n - 1}
+        stack = [(0, n - 1)]
+        while stack:
+            left, right = stack.pop()
+            err, idx = self._max_deviation(values, frames, left, right)
+            if idx is None or err <= tol:
+                continue
+            keep.add(idx)
+            stack.append((left, idx))
+            stack.append((idx, right))
+        return keep
 
     def reduce_keys(self, chains):
-        """Greedy per-group key reduction (rotation is treated as a group)."""
-        tol = max(self.threshold, 1.0e-6)
+        """Key reduction on the channels this add-on wrote. Returns the number
+        of keys removed."""
         groups = {}
-        for fc, pbn, channel in self._bones_fcurve_map(chains):
-            if channel == 'location':
-                if fc.array_index not in self._translate_axes(pbn):
-                    continue
-            elif channel not in ROTATION_PATHS:
-                continue
+        for fc, pbn, channel in self._baked_curves(chains):
             groups.setdefault((pbn.name, channel), []).append((fc, pbn))
 
         removed = 0
         for (name, channel), curves in groups.items():
             fcurves = [fc for fc, _ in curves]
-            all_frames = None
+            pbn = curves[0][1]
+            if channel == 'location':
+                tol = max(self.threshold * max(float(pbn.length), EPS), 1.0e-8)
+            else:
+                tol = max(self.threshold, 1.0e-6)
+
+            frames = None
             for fc in fcurves:
                 cf = [
                     float(k.co[0]) for k in fc.keyframe_points
                     if self.sf <= float(k.co[0]) <= self.ef
                 ]
-                all_frames = (
-                    cf if all_frames is None
-                    else [f for f in all_frames if f in cf]
-                )
-            if not all_frames or len(all_frames) <= 2:
+                if frames is None:
+                    frames = cf
+                else:
+                    common = set(cf)
+                    frames = [x for x in frames if x in common]
+            if not frames or len(frames) <= 2:
                 self._smooth(fcurves)
                 continue
 
             values = []
-            ok = True
+            complete = True
             for fc in fcurves:
                 lookup = {
-                    float(k.co[0]): float(k.co[1])
-                    for k in fc.keyframe_points
+                    float(k.co[0]): float(k.co[1]) for k in fc.keyframe_points
                 }
                 try:
-                    values.append([lookup[f] for f in all_frames])
+                    values.append([lookup[x] for x in frames])
                 except KeyError:
-                    ok = False
+                    complete = False
                     break
-            if not ok:
+            if not complete:
                 self._fail(
                     self.lookup_failures,
-                    "{} {} missing key".format(name, channel),
+                    "{} {} incomplete key set".format(name, channel),
                 )
                 self._smooth(fcurves)
                 continue
 
-            drop = set()
-            prev = 0
-            for i in range(1, len(all_frames) - 1):
-                t0 = all_frames[prev]
-                t1 = all_frames[i]
-                t2 = all_frames[i + 1]
-                if abs(t2 - t0) < EPS:
-                    continue
-                ratio = (t1 - t0) / (t2 - t0)
-                redundant = True
-                for comp in values:
-                    pred = comp[prev] + (comp[i + 1] - comp[prev]) * ratio
-                    if abs(comp[i] - pred) > tol:
-                        redundant = False
-                        break
-                if redundant:
-                    drop.add(t1)
-                else:
-                    prev = i
-
-            if drop:
-                for fc in fcurves:
-                    kps = fc.keyframe_points
-                    idx = [
-                        n for n, k in enumerate(kps)
-                        if float(k.co[0]) in drop
-                    ]
-                    for n in reversed(idx):
-                        try:
-                            kps.remove(kps[n], fast=True)
-                            removed += 1
-                        except (RuntimeError, ReferenceError):
-                            pass
+            keep = self._keep_indices(values, frames, tol)
+            drop = {frames[i] for i in range(len(frames)) if i not in keep}
+            for fc in fcurves:
+                kps = fc.keyframe_points
+                idx = [
+                    n for n, k in enumerate(kps) if float(k.co[0]) in drop
+                ]
+                for n in reversed(idx):
                     try:
-                        fc.update()
-                    except Exception:
+                        kps.remove(kps[n], fast=True)
+                        removed += 1
+                    except (RuntimeError, ReferenceError):
                         pass
-
+                try:
+                    fc.update()
+                except Exception:
+                    pass
             self._smooth(fcurves)
-
         return removed
 
     def _smooth(self, fcurves):
@@ -1091,49 +1228,23 @@ class PerfectOverlapSolver:
                 pass
 
     # ------------------------------------------------------------------------
-    # Cycle modifiers
+    # Cycle
     # ------------------------------------------------------------------------
 
-    def add_cycle_modifiers(self, chains):
-        for fc, pbn, channel in self._bones_fcurve_map(chains):
-            if channel == 'location':
-                if fc.array_index not in self._translate_axes(pbn):
-                    continue
-            elif channel not in ROTATION_PATHS:
-                continue
-            if any(m.type == 'CYCLES' for m in fc.modifiers):
-                continue
-            try:
-                m = fc.modifiers.new('CYCLES')
-                try:
-                    m.name = CYCLE_MODIFIER_NAME
-                except (AttributeError, RuntimeError):
-                    pass
-            except (RuntimeError, ReferenceError):
-                pass
-
-    def remove_cycle_modifiers(self, chains):
-        for fc, _pbn, _ch in self._bones_fcurve_map(chains):
-            for m in list(fc.modifiers):
-                if (
-                    m.type == 'CYCLES'
-                    and getattr(m, "name", "") == CYCLE_MODIFIER_NAME
-                ):
-                    try:
-                        fc.modifiers.remove(m)
-                    except (RuntimeError, ReferenceError):
-                        pass
+    def _seam_keys(self, fc):
+        first = last = None
+        for k in fc.keyframe_points:
+            fr = float(k.co[0])
+            if abs(fr - self.sf) < EPS:
+                first = k
+            elif abs(fr - self.ef) < EPS:
+                last = k
+        return first, last
 
     def close_cycle_seam(self, chains):
-        """Copy start-frame values onto the end frame for every baked curve."""
-        for fc, _pbn, _ch in self._bones_fcurve_map(chains):
-            first = last = None
-            for k in fc.keyframe_points:
-                fr = float(k.co[0])
-                if abs(fr - self.sf) < EPS:
-                    first = k
-                elif abs(fr - self.ef) < EPS:
-                    last = k
+        """Make the end key equal the start key on every baked curve."""
+        for fc, _pbn, _ch in self._baked_curves(chains):
+            first, last = self._seam_keys(fc)
             if first is None or last is None or first is last:
                 continue
             last.co[1] = first.co[1]
@@ -1141,6 +1252,80 @@ class PerfectOverlapSolver:
                 fc.update()
             except Exception:
                 pass
+
+    def smooth_cycle_seam(self, chains):
+        """Give the seam keys a shared tangent so the loop point is smooth."""
+        for fc, _pbn, _ch in self._baked_curves(chains):
+            first, last = self._seam_keys(fc)
+            if first is None or last is None or first is last:
+                continue
+            keys = sorted(fc.keyframe_points, key=lambda k: float(k.co[0]))
+            inner = [k for k in keys if self.sf < float(k.co[0]) < self.ef]
+            if len(inner) < 2:
+                continue
+            after, before = inner[0], inner[-1]
+            dt_after = float(after.co[0]) - float(self.sf)
+            dt_before = float(self.ef) - float(before.co[0])
+            if dt_after < EPS or dt_before < EPS:
+                continue
+            slope = (
+                (float(after.co[1]) - float(before.co[1]))
+                / (dt_after + dt_before)
+            )
+            for key in (first, last):
+                key.interpolation = 'BEZIER'
+                key.handle_left_type = 'FREE'
+                key.handle_right_type = 'FREE'
+            first.handle_left = (
+                float(self.sf) - dt_before / 3.0,
+                float(first.co[1]) - slope * dt_before / 3.0,
+            )
+            first.handle_right = (
+                float(self.sf) + dt_after / 3.0,
+                float(first.co[1]) + slope * dt_after / 3.0,
+            )
+            last.handle_left = (
+                float(self.ef) - dt_before / 3.0,
+                float(last.co[1]) - slope * dt_before / 3.0,
+            )
+            last.handle_right = (
+                float(self.ef) + dt_after / 3.0,
+                float(last.co[1]) + slope * dt_after / 3.0,
+            )
+            try:
+                fc.update()
+            except Exception:
+                pass
+
+    def add_cycle_modifiers(self, chains):
+        for fc, _pbn, _ch in self._baked_curves(chains):
+            if any(m.type == 'CYCLES' for m in fc.modifiers):
+                continue
+            try:
+                mod = fc.modifiers.new('CYCLES')
+            except (RuntimeError, ReferenceError):
+                continue
+            try:
+                mod.name = CYCLE_MODIFIER_NAME
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+            try:
+                fc.update()
+            except Exception:
+                pass
+
+    def remove_cycle_modifiers(self, chains):
+        """Remove this add-on's Cycles modifiers from the chain's curves."""
+        for fc, _pbn, _ch in self._bones_fcurve_map(chains):
+            for m in list(fc.modifiers):
+                if (
+                    m.type == 'CYCLES'
+                    and getattr(m, "name", None) == CYCLE_MODIFIER_NAME
+                ):
+                    try:
+                        fc.modifiers.remove(m)
+                    except (RuntimeError, ReferenceError):
+                        pass
 
 
 # ============================================================================
@@ -1164,7 +1349,7 @@ class PERFECTOVERLAP_PG_props(bpy.types.PropertyGroup):
     )
     strength: bpy.props.FloatProperty(
         name="Strength", default=1.0, min=1.0, max=10.0,
-        description="Exaggerate the overlap offset",
+        description="Adds follow-through (faster response, more swing)",
     )
     threshold: bpy.props.FloatProperty(
         name="Threshold", default=0.001, min=0.00001, max=0.1,
@@ -1173,11 +1358,17 @@ class PERFECTOVERLAP_PG_props(bpy.types.PropertyGroup):
     )
     animate_translate: bpy.props.BoolProperty(
         name="Translation", default=False,
-        description="Also lag unlocked location channels",
+        description=(
+            "Also lag the location of unlocked, unconnected bones. "
+            "Delete Keys then removes their location keys as well"
+        ),
     )
     cycle: bpy.props.BoolProperty(
         name="Cycle", default=False,
-        description="Settle the loop with pre-roll and close the seam",
+        description=(
+            "Treat the range as a loop (last frame = first frame): "
+            "settle with pre-roll and close the seam"
+        ),
     )
     cycle_preroll: bpy.props.IntProperty(
         name="Pre-roll", default=2, min=1, max=20,
@@ -1240,6 +1431,14 @@ def _apply_props(solver, props):
     return solver
 
 
+def _short_list(names, limit=6):
+    names = list(names)
+    text = ", ".join(names[:limit])
+    if len(names) > limit:
+        text += " (+{} more)".format(len(names) - limit)
+    return text
+
+
 def _format_failures(label, failures, limit=8):
     if not failures:
         return ""
@@ -1260,6 +1459,14 @@ def _report_failures(operator, solver):
         msg = _format_failures(label, failures)
         if msg:
             operator.report({'WARNING'}, msg)
+
+
+def _restore_scene(scene, frame, subframe):
+    try:
+        scene.frame_set(frame, subframe=subframe)
+        bpy.context.view_layer.update()
+    except Exception:
+        traceback.print_exc()
 
 
 # ============================================================================
@@ -1301,6 +1508,7 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
 
         scene = context.scene
         original_frame = scene.frame_current
+        original_subframe = current_subframe(scene)
         solver = _apply_props(PerfectOverlapSolver(), props)
 
         chains = None
@@ -1314,21 +1522,20 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
                 self.report(
                     {'WARNING'},
                     "No chain detected. Select the child controls; each "
-                    "chain needs a parent driver.",
+                    "chain needs a parent that drives it.",
                 )
                 return {'CANCELLED'}
 
             snapshot = solver.capture_pose(chains)
 
-            # ---- Phase 1: read ----
-            scene.frame_set(props.start_frame)
-            bpy.context.view_layer.update()
+            # ---- Phase 1: read (nothing is modified) ----
             source = solver.sample_source(chains)
             if not source:
                 self.report({'ERROR'}, "Could not read the source animation")
                 return {'CANCELLED'}
+            solver.model_mismatch = solver.check_model(source)
 
-            # ---- Phase 2: solve (pure math) ----
+            # ---- Phase 2: solve (pure maths, nothing is modified) ----
             results = solver.solve(
                 chains,
                 source,
@@ -1354,27 +1561,36 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
                 solver.reduce_keys(chains)
             except Exception as exc:
                 traceback.print_exc()
+                self.report({'WARNING'}, "Key reduction skipped: {}".format(exc))
+
+            try:
+                if props.cycle:
+                    solver.close_cycle_seam(chains)
+                    solver.smooth_cycle_seam(chains)
+                    solver.add_cycle_modifiers(chains)
+                else:
+                    solver.remove_cycle_modifiers(chains)
+            except Exception as exc:
+                traceback.print_exc()
+                self.report({'WARNING'}, "Cycle step skipped: {}".format(exc))
+
+            bone_count = sum(1 for _ in solver.iter_bones(chains))
+            self.report(
+                {'INFO'},
+                "Baked overlap on {} bone(s), frames {} to {} "
+                "(largest offset {:.1f} deg)".format(
+                    bone_count, props.start_frame, props.end_frame,
+                    math.degrees(solver.max_overlap_angle),
+                ),
+            )
+
+            if solver.max_overlap_angle < MIN_VISIBLE_OVERLAP:
                 self.report(
                     {'WARNING'},
-                    "Key reduction skipped: {}".format(exc),
+                    "No visible overlap: the selected bones and the parent "
+                    "driving them do not move in this frame range. Animate "
+                    "the parent (or pick another range) and run again.",
                 )
-
-            if props.cycle:
-                try:
-                    solver.close_cycle_seam(chains)
-                    solver.add_cycle_modifiers(chains)
-                except Exception as exc:
-                    traceback.print_exc()
-                    self.report(
-                        {'WARNING'},
-                        "Cycle finalization skipped: {}".format(exc),
-                    )
-            else:
-                try:
-                    solver.remove_cycle_modifiers(chains)
-                except Exception:
-                    pass
-
             if props.animate_translate and solver.translate_skipped:
                 self.report(
                     {'WARNING'},
@@ -1382,45 +1598,40 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
                         len(solver.translate_skipped),
                     ),
                 )
-
+            if solver.model_mismatch:
+                self.report(
+                    {'WARNING'},
+                    "Constraints or Inherit settings on {} are not modelled "
+                    "exactly; the overlap there may be slightly off.".format(
+                        _short_list(solver.model_mismatch),
+                    ),
+                )
             _report_failures(self, solver)
-
-            bone_count = sum(1 for _ in solver.iter_bones(chains))
-            self.report(
-                {'INFO'},
-                "Baked overlap on {} bone(s), frames {} to {}".format(
-                    bone_count, props.start_frame, props.end_frame,
-                ),
-            )
 
         except Exception as exc:
             traceback.print_exc()
             if touched:
-                # The animation was already partly rewritten. Return
-                # FINISHED so Blender pushes one undo step for it.
+                # The animation was already partly rewritten. Return FINISHED
+                # so Blender pushes ONE undo step for it.
                 self.report(
                     {'ERROR'},
                     "Partial bake ({}). Press Ctrl+Z to undo.".format(exc),
                 )
                 result = {'FINISHED'}
             else:
-                try:
-                    if snapshot and chains:
-                        solver.restore_pose(chains, snapshot)
-                except Exception:
-                    pass
                 self.report(
                     {'ERROR'},
                     "Bake failed, animation unchanged: {}".format(exc),
                 )
                 result = {'CANCELLED'}
-
-        finally:
             try:
-                scene.frame_set(original_frame)
-                bpy.context.view_layer.update()
+                if snapshot and chains:
+                    solver.restore_pose(chains, snapshot)
             except Exception:
                 pass
+
+        finally:
+            _restore_scene(scene, original_frame, original_subframe)
 
         return result
 
@@ -1428,7 +1639,10 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
 class PERFECTOVERLAP_OT_delete(bpy.types.Operator):
     bl_idname = "perfect_overlap.delete"
     bl_label = "Delete Keys"
-    bl_description = "Delete Perfect Overlap keys on the selected chain"
+    bl_description = (
+        "Delete the rotation keys (and location keys when Translation is on) "
+        "of the selected chain in the frame range"
+    )
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -1460,6 +1674,7 @@ class PERFECTOVERLAP_OT_delete(bpy.types.Operator):
 
         scene = context.scene
         original_frame = scene.frame_current
+        original_subframe = current_subframe(scene)
         solver = _apply_props(PerfectOverlapSolver(), props)
 
         chains = None
@@ -1479,16 +1694,20 @@ class PERFECTOVERLAP_OT_delete(bpy.types.Operator):
             start_pose = solver.capture_pose(chains)
 
             touched = True
-            solver.delete_keys(chains)
+            removed = solver.delete_keys(chains)
             solver.restore_pose(chains, start_pose)
+            try:
+                solver.remove_cycle_modifiers(chains)
+            except Exception:
+                traceback.print_exc()
 
-            _report_failures(self, solver)
             self.report(
                 {'INFO'},
-                "Deleted overlap keys on {} bone(s)".format(
-                    sum(1 for _ in solver.iter_bones(chains)),
+                "Deleted {} key(s) on {} bone(s)".format(
+                    removed, sum(1 for _ in solver.iter_bones(chains)),
                 ),
             )
+            _report_failures(self, solver)
 
         except Exception as exc:
             traceback.print_exc()
@@ -1499,23 +1718,19 @@ class PERFECTOVERLAP_OT_delete(bpy.types.Operator):
                 )
                 result = {'FINISHED'}
             else:
-                try:
-                    if snapshot and chains:
-                        solver.restore_pose(chains, snapshot)
-                except Exception:
-                    pass
                 self.report(
                     {'ERROR'},
                     "Delete failed, animation unchanged: {}".format(exc),
                 )
                 result = {'CANCELLED'}
-
-        finally:
             try:
-                scene.frame_set(original_frame)
-                bpy.context.view_layer.update()
+                if snapshot and chains:
+                    solver.restore_pose(chains, snapshot)
             except Exception:
                 pass
+
+        finally:
+            _restore_scene(scene, original_frame, original_subframe)
 
         return result
 
@@ -1556,7 +1771,7 @@ class PERFECTOVERLAP_PT_panel(bpy.types.Panel):
         layout = self.layout
         props = context.scene.perfect_overlap_props
 
-        layout.label(text="Select chain bones (not the driver)")
+        layout.label(text="Select the chain bones (not the driver)")
         layout.separator()
 
         box = layout.box()
@@ -1586,9 +1801,7 @@ class PERFECTOVERLAP_PT_panel(bpy.types.Panel):
         layout.separator()
         row = layout.row()
         row.scale_y = 1.6
-        row.operator(
-            "perfect_overlap.calculate", icon="KEYTYPE_KEYFRAME_VEC",
-        )
+        row.operator("perfect_overlap.calculate", icon="KEYTYPE_KEYFRAME_VEC")
         row = layout.row()
         row.operator("perfect_overlap.delete", icon="KEYFRAME")
         row = layout.row()
