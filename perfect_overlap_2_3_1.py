@@ -1,7 +1,7 @@
 # ##### BEGIN GPL LICENSE BLOCK #####
 #
 # Perfect Overlap Addon
-# Version 2.3.0 - source-cache + local-space overlap solver.
+# Version 2.3.1 - source-cache + local-space overlap solver (stability fix).
 # Copyright 2021-2026 CaptainHansode, sakaiden.com
 # Copyright 2026 Sanku Venkatesh
 #
@@ -11,11 +11,31 @@
 # 2 of the License, or (at your option) any later version.
 #
 # ##### END GPL LICENSE BLOCK #####
+#
+# 2.3.1 changes
+# -------------
+# * FIX: safe_quaternion() used ``Quaternion.length``. mathutils.Quaternion has
+#   no ``length`` (only Vector does); the size of a quaternion is
+#   ``.magnitude``. That raised AttributeError, which escaped as
+#   "RuntimeError: Perfect Overlap calculation failed". The same bug was also
+#   being swallowed inside bone_rotation_quaternion(), which silently turned
+#   every sampled rotation into the identity quaternion.
+# * SAFER BAKE: the solver now works in three phases.
+#     1. sample_source()  - read-only
+#     2. solve_all()      - pure maths on the cached samples
+#     3. del_animkey() + write_results() - the only phase that edits keys
+#   If anything fails in phases 1-2 your animation is left untouched.
+# * Operators no longer re-raise RuntimeError; failures are reported in the UI
+#   and the full traceback is printed to the system console.
+# * Post-processing (key reduction, cycle seam) can no longer fail the whole
+#   bake - problems there are reported as warnings.
+# * Cycle residual uses a proper quaternion angle (handles q == -q).
+# * Removed the forced wm.redraw_timer call (console spam, not needed).
 
 bl_info = {
     "name": "Perfect Overlap Addon",
     "author": "Sanku Venkatesh",
-    "version": (2, 3, 0),
+    "version": (2, 3, 1),
     "blender": (5, 1, 0),
     "location": "3D Viewport > Sidebar > Perfect Overlap Addon (Pose Mode)",
     "description": (
@@ -26,10 +46,12 @@ bl_info = {
     "category": "Animation",
 }
 
-import bpy
-import math
-import mathutils
 import json
+import math
+import traceback
+
+import bpy
+import mathutils
 
 __author__ = "Sanku Venkatesh"
 __copyright__ = (
@@ -58,7 +80,20 @@ MAX_TRANSLATION_STEP_RATIO = 0.20
 MAX_TRANSLATION_OFFSET_RATIO = 1.5
 CYCLE_MODIFIER_NAME = "Perfect Overlap Cycle"
 TRANSLATION_OWNERSHIP_KEY = "_perfect_overlap_translation_ownership_v3"
+LEGACY_OWNERSHIP_KEY = "_perfect_overlap_translation_ownership_v2"
+ROTATION_CHANNELS = (
+    "rotation_quaternion",
+    "rotation_euler",
+    "rotation_axis_angle",
+)
 
+
+# ----------------------------------------------------------------------
+# Small math helpers
+#
+# NOTE: mathutils.Quaternion has NO ``.length`` attribute. Use ``.magnitude``.
+# (mathutils.Vector has both ``.length`` and ``.magnitude``.)
+# ----------------------------------------------------------------------
 
 def is_finite_vector(vec):
     try:
@@ -74,27 +109,35 @@ def is_finite_quaternion(quat):
         return False
 
 
-def is_finite_matrix(mat):
-    try:
-        return all(math.isfinite(float(v)) for row in mat for v in row)
-    except (TypeError, ValueError, AttributeError):
-        return False
+def identity_quaternion():
+    return mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
 
 
 def safe_quaternion(value, fallback=None):
+    """Return a normalized copy of ``value``.
+
+    Falls back to a copy of ``fallback`` (identity by default) when the input
+    is zero-length, non-finite or not a quaternion at all. Never raises.
+    """
     if fallback is None:
-        fallback = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
+        fallback = identity_quaternion()
     try:
         q = value.copy()
-        if q.length < EPS or not is_finite_quaternion(q):
+        magnitude = float(q.magnitude)
+        if (
+            not math.isfinite(magnitude)
+            or magnitude < EPS
+            or not is_finite_quaternion(q)
+        ):
             return fallback.copy()
         q.normalize()
         return q
-    except (TypeError, ValueError, ArithmeticError):
+    except Exception:
         return fallback.copy()
 
 
 def safe_vector(value, fallback=None):
+    """Return a copy of ``value`` or of ``fallback`` (zero by default). Never raises."""
     if fallback is None:
         fallback = ZERO
     try:
@@ -102,26 +145,46 @@ def safe_vector(value, fallback=None):
         if not is_finite_vector(v):
             return fallback.copy()
         return v
-    except (TypeError, ValueError, AttributeError):
+    except Exception:
         return fallback.copy()
+
+
+def quaternion_angle(q0, q1):
+    """Smallest rotation angle in radians between two rotations.
+
+    q and -q are the same rotation, so the absolute dot product is used.
+    """
+    try:
+        a = safe_quaternion(q0)
+        b = safe_quaternion(q1)
+        dot = min(1.0, abs(float(a.dot(b))))
+        return 2.0 * math.acos(dot)
+    except Exception:
+        return math.pi
 
 
 def frame_list(sf, ef):
     return list(range(int(sf), int(ef) + 1))
 
 
+# ----------------------------------------------------------------------
+# Solver
+# ----------------------------------------------------------------------
+
 class PerfectOverlapSolver:
     """Local-space overlap solver.
 
-    Important design change from 2.2.x:
-    - Source animation is sampled BEFORE any keys are deleted.
-    - Each selected bone is solved from its own sampled local animation.
-    - Rotation overlap edits only rotation properties.
-    - Optional translation overlap edits local location only.
-    - No pbn.matrix assignment is used by the overlap solver.
+    Pipeline (driven by PERFECTOVERLAP_OT_calculate):
 
-    That prevents world-space matrix writes from unintentionally changing
-    location, IK/constraint feedback, or parent-relative transforms.
+      1. sample_source()  Read the user's evaluated local animation.
+      2. solve_all()      Pure maths on those samples. It never touches the
+                          scene, the pose or any F-Curve.
+      3. del_animkey() / write_results()
+                          Only now is the animation changed.
+
+    Rotation overlap edits only rotation properties. Optional translation
+    overlap edits local ``location`` only. No pose-bone matrix is ever
+    assigned, so world-space writes cannot disturb IK / constraints.
     """
 
     def __init__(self):
@@ -138,12 +201,16 @@ class PerfectOverlapSolver:
         self.translate_skipped = []
         self.key_failures = set()
         self.fcurve_lookup_failures = set()
-        self.matrix_assign_failures = set()
+        self.pose_failures = set()
 
     @staticmethod
     def _record_failure(collection, value):
         if value:
             collection.add(str(value))
+
+    def log(self, message):
+        if self.debug:
+            print("[Perfect Overlap] {}".format(message))
 
     # ------------------------------------------------------------------
     # Parameters
@@ -271,10 +338,6 @@ class PerfectOverlapSolver:
                 pass
         return result
 
-    @staticmethod
-    def _default_chain():
-        return {"obj_list": []}
-
     def get_tree_list(self):
         selected = self.get_selection()
         if not selected:
@@ -310,18 +373,18 @@ class PerfectOverlapSolver:
                 current = next_bone
 
             depth = self.get_bone_depth(pbn)
-            trees.setdefault(depth, {})[f"tree{count}"] = {
-                **self._default_chain(),
+            trees.setdefault(depth, {})["tree{}".format(count)] = {
                 "obj_list": chain,
             }
             count += 1
 
         return trees
 
-    def iter_chains(self, obj_trees):
+    @staticmethod
+    def iter_chains(obj_trees):
         for depth in sorted(obj_trees.keys()):
-            for name in sorted(obj_trees[depth].keys()):
-                yield obj_trees[depth][name]
+            for chain in obj_trees[depth].values():
+                yield chain
 
     def iter_bones(self, obj_trees):
         seen = set()
@@ -366,41 +429,62 @@ class PerfectOverlapSolver:
                     float(aa[2]),
                     float(aa[3]),
                 ))
-                if axis.length < EPS:
-                    axis = mathutils.Vector((1.0, 0.0, 0.0))
-                else:
-                    axis.normalize()
-
-                return safe_quaternion(
-                    mathutils.Quaternion(axis, float(aa[0]))
-                )
+                angle = float(aa[0])
+                if (
+                    axis.length < EPS
+                    or not is_finite_vector(axis)
+                    or not math.isfinite(angle)
+                ):
+                    # Blender treats a zero axis as "no rotation".
+                    return identity_quaternion()
+                axis.normalize()
+                return safe_quaternion(mathutils.Quaternion(axis, angle))
 
             # All Euler rotation modes (XYZ, ZYX, etc.) use the active
             # rotation_euler channel.
-            return safe_quaternion(
-                pbn.rotation_euler.to_quaternion()
+            return safe_quaternion(pbn.rotation_euler.to_quaternion())
+
+        except (ValueError, ArithmeticError, TypeError):
+            return identity_quaternion()
+
+    @staticmethod
+    def _make_tracker(seed):
+        """Continuity tracker seeded from a capture_pose() entry.
+
+        The tracker remembers the last value written to each rotation
+        representation so Euler / Axis-Angle / Quaternion output never flips
+        between equivalent-but-different values from one frame to the next.
+        """
+        tracker = {}
+        if not seed:
+            return tracker
+        try:
+            tracker["last_quat"] = safe_quaternion(seed["rotation_quaternion"])
+            tracker["last_euler"] = seed["rotation_euler"].copy()
+            tracker["last_axis_angle"] = tuple(
+                float(v) for v in seed["rotation_axis_angle"]
             )
+        except (KeyError, AttributeError, TypeError, ValueError):
+            return {}
+        return tracker
 
-        except (ValueError, ArithmeticError, TypeError, AttributeError):
-            return mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
-
-    def _apply_quaternion_rotation(self, pbn, quat, state):
+    def _apply_quaternion_rotation(self, pbn, quat, tracker):
         q = safe_quaternion(quat)
         mode = pbn.rotation_mode
 
         try:
             if mode == 'QUATERNION':
-                previous = state.get("last_quat")
+                previous = tracker.get("last_quat")
                 if previous is not None and q.dot(previous) < 0.0:
                     q.negate()
                 pbn.rotation_quaternion = q
-                state["last_quat"] = q.copy()
+                tracker["last_quat"] = q.copy()
                 return
 
             if mode == 'AXIS_ANGLE':
                 angle = float(q.angle)
                 axis = q.axis.copy()
-                previous = state.get("last_axis_angle")
+                previous = tracker.get("last_axis_angle")
                 if previous is not None:
                     prev_angle = float(previous[0])
                     prev_axis = mathutils.Vector(previous[1:4])
@@ -413,33 +497,34 @@ class PerfectOverlapSolver:
                         angle = -angle
                     angle += math.tau * round((prev_angle - angle) / math.tau)
                 pbn.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
-                state["last_axis_angle"] = (angle, axis.x, axis.y, axis.z)
+                tracker["last_axis_angle"] = (angle, axis.x, axis.y, axis.z)
                 return
 
             euler = q.to_euler(mode)
-            previous = state.get("last_euler")
+            previous = tracker.get("last_euler")
             if previous is not None:
                 try:
                     euler.make_compatible(previous)
                 except (ValueError, ArithmeticError):
                     pass
             pbn.rotation_euler = euler
-            state["last_euler"] = euler.copy()
+            tracker["last_euler"] = euler.copy()
 
         except Exception as exc:
             self._record_failure(
-                self.matrix_assign_failures,
-                f"{pbn.name} rotation assignment: {exc}",
+                self.pose_failures,
+                "{} rotation assignment: {}".format(pbn.name, exc),
             )
 
     # ------------------------------------------------------------------
-    # Source sampling - MUST happen before key deletion
+    # Phase 1 - source sampling (read-only)
     # ------------------------------------------------------------------
 
     def sample_source(self, obj_trees):
-        """Sample the user's evaluated local animation before destructive bake steps."""
+        """Sample the user's evaluated local animation before any key is edited."""
         scene = bpy.context.scene
         original_frame = scene.frame_current
+        original_subframe = _current_subframe(scene)
         cache = {}
 
         bones = list(self.iter_bones(obj_trees))
@@ -452,58 +537,20 @@ class PerfectOverlapSolver:
                 bpy.context.view_layer.update()
                 frame_data = {}
                 for pbn in bones:
-                    try:
-                        frame_data[pbn.name] = {
-                            "location": safe_vector(pbn.location),
-                            "quaternion": self.bone_rotation_quaternion(pbn),
-                            "scale": safe_vector(pbn.scale, mathutils.Vector((1.0, 1.0, 1.0))),
-                        }
-                    except (ReferenceError, AttributeError):
-                        continue
+                    frame_data[pbn.name] = {
+                        "location": safe_vector(pbn.location),
+                        "quaternion": self.bone_rotation_quaternion(pbn),
+                    }
                 cache[frame] = frame_data
         finally:
-            scene.frame_set(original_frame)
+            scene.frame_set(original_frame, subframe=original_subframe)
             bpy.context.view_layer.update()
 
         return cache
 
     # ------------------------------------------------------------------
-    # Simulation state
+    # Phase 2 - local-space spring solver (pure maths)
     # ------------------------------------------------------------------
-
-    def init_state(self, obj_trees, source_cache):
-        states = {}
-        self.translate_skipped = []
-
-        first_frame = int(self.sf)
-        frame_data = source_cache.get(first_frame, {})
-
-        for pbn in self.iter_bones(obj_trees):
-            data = frame_data.get(pbn.name)
-            if data is None:
-                data = {
-                    "location": safe_vector(pbn.location),
-                    "quaternion": self.bone_rotation_quaternion(pbn),
-                    "scale": safe_vector(
-                        pbn.scale,
-                        mathutils.Vector((1.0, 1.0, 1.0)),
-                    ),
-                }
-
-            if self.animate_translate and not self.translate_axes(pbn):
-                self.translate_skipped.append(pbn.name)
-
-            states[pbn.name] = {
-                "location": data["location"].copy(),
-                "location_velocity": ZERO.copy(),
-                "quaternion": data["quaternion"].copy(),
-                "angular_velocity": ZERO.copy(),
-                "last_quat": data["quaternion"].copy(),
-                "last_euler": pbn.rotation_euler.copy(),
-                "last_axis_angle": tuple(float(v) for v in pbn.rotation_axis_angle),
-            }
-
-        return states
 
     def translate_axes(self, pbn):
         if not self.animate_translate:
@@ -514,10 +561,6 @@ class PerfectOverlapSolver:
             return [i for i in range(3) if not pbn.lock_location[i]]
         except (AttributeError, ReferenceError):
             return []
-
-    # ------------------------------------------------------------------
-    # Local-space spring solver
-    # ------------------------------------------------------------------
 
     def _solve_rotation(self, state, target, k, damping, amp):
         target = safe_quaternion(target, state["quaternion"])
@@ -535,7 +578,7 @@ class PerfectOverlapSolver:
             else:
                 axis.normalize()
                 error = axis * angle
-        except Exception:
+        except (ValueError, ArithmeticError, TypeError):
             error = ZERO.copy()
 
         velocity = state["angular_velocity"] * damping + error * k
@@ -543,8 +586,7 @@ class PerfectOverlapSolver:
             velocity = ZERO.copy()
 
         step = velocity * amp
-        step_len = step.length
-        if step_len > MAX_ANGULAR_STEP:
+        if step.length > MAX_ANGULAR_STEP:
             step = step.normalized() * MAX_ANGULAR_STEP
 
         try:
@@ -556,17 +598,17 @@ class PerfectOverlapSolver:
                 result.normalize()
             else:
                 result = current.copy()
-        except Exception:
+        except (ValueError, ArithmeticError, TypeError):
             result = current.copy()
 
         state["angular_velocity"] = velocity.copy()
         state["quaternion"] = result.copy()
         return result
 
-    def _solve_location(self, state, target, pbn, k, damping, amp):
+    def _solve_location(self, state, target, info, k, damping, amp):
+        allowed = info["axes"]
         target = safe_vector(target, state["location"])
         current = state["location"]
-        allowed = self.translate_axes(pbn)
 
         # Keep all locked / disallowed axes exactly at the source value.
         for axis in range(3):
@@ -579,7 +621,7 @@ class PerfectOverlapSolver:
         if not is_finite_vector(velocity):
             velocity = ZERO.copy()
 
-        length = max(float(getattr(pbn, "length", 1.0)), 1.0e-5)
+        length = info["length"]
         max_step = length * MAX_TRANSLATION_STEP_RATIO
         step = velocity * amp
         if step.length > max_step:
@@ -596,137 +638,160 @@ class PerfectOverlapSolver:
         offset = result - target
         if offset.length > maximum_offset:
             result = target + offset.normalized() * maximum_offset
-            velocity *= 0.0
+            velocity = ZERO.copy()
 
         state["location_velocity"] = velocity.copy()
         state["location"] = result.copy()
         return result
 
-    def solve_frame(self, frame_data, states, obj_trees, k, damping, amp, write):
-        for pbn in self.iter_bones(obj_trees):
-            data = frame_data.get(pbn.name)
-            state = states.get(pbn.name)
-            if data is None or state is None:
+    def _step_frame(self, frame_data, states, info, k, damping, amp):
+        """Advance every bone by one frame. Pure maths, no Blender writes."""
+        out = {}
+        for name, state in states.items():
+            data = frame_data.get(name)
+            if data is None:
                 continue
-
-            try:
-                q = self._solve_rotation(
-                    state,
-                    data["quaternion"],
-                    k,
-                    damping,
-                    amp,
+            quat = self._solve_rotation(
+                state, data["quaternion"], k, damping, amp
+            )
+            loc = None
+            if info[name]["axes"]:
+                loc = self._solve_location(
+                    state, data["location"], info[name], k, damping, amp
                 )
-                self._apply_quaternion_rotation(pbn, q, state)
+            out[name] = {
+                "quaternion": quat.copy(),
+                "location": loc.copy() if loc is not None else None,
+            }
+        return out
 
-                # Preserve animator scale; overlap never synthesizes scale.
-                try:
-                    pbn.scale = data["scale"].copy()
-                except Exception:
-                    pass
+    def solve_all(self, obj_trees, source_cache, cycle=False, preroll=0):
+        """Simulate the overlap for the whole frame range.
 
-                if self.animate_translate:
-                    loc = self._solve_location(
-                        state,
-                        data["location"],
-                        pbn,
-                        k,
-                        damping,
-                        amp,
-                    )
-                    pbn.location = loc
-
-                if write:
-                    self.set_animkey(pbn)
-
-            except Exception as exc:
-                self._record_failure(
-                    self.matrix_assign_failures,
-                    f"{pbn.name}: {exc}",
-                )
-
-        bpy.context.view_layer.update()
-
-    def solve_bake(self, obj_trees, source_cache, cycle=False, preroll=0):
-        if not source_cache:
-            return False
+        Returns ``{frame: {bone_name: {"quaternion": Quaternion,
+        "location": Vector or None}}}`` or ``None`` when there is nothing to
+        solve. Touches no Blender data, so it cannot damage the animation.
+        """
+        frames = frame_list(self.sf, self.ef)
+        first = source_cache.get(frames[0])
+        if not first:
+            return None
 
         k, damping, amp = self.solver_params()
-        states = self.init_state(obj_trees, source_cache)
-        frames = frame_list(self.sf, self.ef)
+        self.translate_skipped = []
+        states = {}
+        info = {}
 
-        # The Start Frame remains the exact source pose. This avoids creating
-        # a visible jump at the beginning of the selected range.
-        scene = bpy.context.scene
-        scene.frame_set(self.sf)
-        bpy.context.view_layer.update()
-
-        first = source_cache.get(self.sf, {})
         for pbn in self.iter_bones(obj_trees):
             data = first.get(pbn.name)
             if data is None:
                 continue
-            state = states[pbn.name]
-            self._apply_quaternion_rotation(pbn, data["quaternion"], state)
-            if self.animate_translate:
-                pbn.location = data["location"].copy()
-            try:
-                pbn.scale = data["scale"].copy()
-            except Exception:
-                pass
-            self.set_animkey(pbn)
-        bpy.context.view_layer.update()
+            axes = self.translate_axes(pbn)
+            if self.animate_translate and not axes:
+                self.translate_skipped.append(pbn.name)
+            info[pbn.name] = {
+                "axes": axes,
+                "length": max(float(pbn.length), 1.0e-5),
+            }
+            states[pbn.name] = {
+                "quaternion": data["quaternion"].copy(),
+                "location": data["location"].copy(),
+                "angular_velocity": ZERO.copy(),
+                "location_velocity": ZERO.copy(),
+            }
+
+        if not states:
+            return None
+
+        # The Start Frame remains the exact source pose. This avoids creating
+        # a visible jump at the beginning of the selected range.
+        results = {
+            frames[0]: {
+                name: {
+                    "quaternion": first[name]["quaternion"].copy(),
+                    "location": (
+                        first[name]["location"].copy()
+                        if info[name]["axes"] else None
+                    ),
+                }
+                for name in states
+            }
+        }
 
         if cycle and preroll > 0:
-            # Settle the state through repeated source loops without writing.
+            # Settle the momentum through repeated source loops. Nothing is
+            # recorded during these hidden passes.
             for _ in range(int(preroll)):
                 for frame in frames[1:]:
-                    scene.frame_set(frame)
-                    self.solve_frame(
+                    self._step_frame(
                         source_cache.get(frame, {}),
-                        states,
-                        obj_trees,
-                        k,
-                        damping,
-                        amp,
-                        write=False,
+                        states, info, k, damping, amp,
                     )
-                scene.frame_set(self.sf)
-                bpy.context.view_layer.update()
 
-            # Reset to the source Start Frame for the actual visible bake, but
-            # keep the settled velocities. The output begins exactly at source.
-            start_data = source_cache.get(self.sf, {})
-            for pbn in self.iter_bones(obj_trees):
-                data = start_data.get(pbn.name)
-                if data is None:
-                    continue
-                states[pbn.name]["quaternion"] = data["quaternion"].copy()
-                states[pbn.name]["location"] = data["location"].copy()
-                states[pbn.name]["last_quat"] = data["quaternion"].copy()
-                if self.animate_translate:
-                    pbn.location = data["location"].copy()
-                self._apply_quaternion_rotation(
-                    pbn,
-                    data["quaternion"],
-                    states[pbn.name],
-                )
-            bpy.context.view_layer.update()
+            # Restart from the exact source pose at the Start Frame but keep
+            # the settled velocities. The visible output begins at source.
+            for name, state in states.items():
+                state["quaternion"] = first[name]["quaternion"].copy()
+                state["location"] = first[name]["location"].copy()
 
         for frame in frames[1:]:
-            scene.frame_set(frame)
-            self.solve_frame(
+            results[frame] = self._step_frame(
                 source_cache.get(frame, {}),
-                states,
-                obj_trees,
-                k,
-                damping,
-                amp,
-                write=True,
+                states, info, k, damping, amp,
             )
 
         self.passes_run = int(preroll) if cycle else 1
-        return True
+        self.log(
+            "solved {} bone(s) over {} frame(s), pre-roll passes: {}".format(
+                len(states), len(frames), self.passes_run
+            )
+        )
+        return results
+
+    # ------------------------------------------------------------------
+    # Phase 3 - writing
+    # ------------------------------------------------------------------
+
+    def write_results(self, obj_trees, results, start_pose):
+        """Write the solved rotation (and optional location) as keyframes."""
+        scene = bpy.context.scene
+        obj = bpy.context.active_object
+        start_pose = start_pose or {}
+
+        bones = {}
+        for pbn in self.iter_bones(obj_trees):
+            bones[pbn.name] = pbn
+        trackers = {
+            name: self._make_tracker(start_pose.get(name)) for name in bones
+        }
+
+        self._ensure_action_slot(obj)
+
+        for frame in frame_list(self.sf, self.ef):
+            frame_result = results.get(frame)
+            if not frame_result:
+                continue
+            scene.frame_set(frame)
+            for name, pbn in bones.items():
+                res = frame_result.get(name)
+                if res is None:
+                    continue
+                self._apply_quaternion_rotation(
+                    pbn, res["quaternion"], trackers[name]
+                )
+                if res["location"] is not None:
+                    try:
+                        pbn.location = res["location"].copy()
+                    except Exception as exc:
+                        self._record_failure(
+                            self.pose_failures,
+                            "{} location assignment: {}".format(name, exc),
+                        )
+                self.set_animkey(pbn)
+            bpy.context.view_layer.update()
+
+        if not self._ensure_action_slot(obj):
+            self._record_failure(self.key_failures, "Action slot")
 
     # ------------------------------------------------------------------
     # Keying / action slot handling
@@ -780,7 +845,6 @@ class PerfectOverlapSolver:
 
     def set_animkey(self, pbn):
         frame = bpy.context.scene.frame_current
-        self._ensure_action_slot(pbn.id_data)
 
         for axis in self.translate_axes(pbn):
             try:
@@ -788,9 +852,15 @@ class PerfectOverlapSolver:
                     data_path='location', index=axis, frame=frame
                 )
                 if result is False:
-                    self._record_failure(self.key_failures, f"{pbn.name} loc[{axis}]")
+                    self._record_failure(
+                        self.key_failures,
+                        "{} loc[{}]".format(pbn.name, axis),
+                    )
             except Exception as exc:
-                self._record_failure(self.key_failures, f"{pbn.name} loc[{axis}]: {exc}")
+                self._record_failure(
+                    self.key_failures,
+                    "{} loc[{}]: {}".format(pbn.name, axis, exc),
+                )
 
         try:
             result = pbn.keyframe_insert(
@@ -798,12 +868,13 @@ class PerfectOverlapSolver:
                 frame=frame,
             )
             if result is False:
-                self._record_failure(self.key_failures, f"{pbn.name} rotation")
+                self._record_failure(
+                    self.key_failures, "{} rotation".format(pbn.name)
+                )
         except Exception as exc:
-            self._record_failure(self.key_failures, f"{pbn.name} rotation: {exc}")
-
-        if not self._ensure_action_slot(pbn.id_data):
-            self._record_failure(self.key_failures, f"{pbn.name} Action slot")
+            self._record_failure(
+                self.key_failures, "{} rotation: {}".format(pbn.name, exc)
+            )
 
     # ------------------------------------------------------------------
     # Pose capture / restore
@@ -816,7 +887,9 @@ class PerfectOverlapSolver:
                 "location": pbn.location.copy(),
                 "rotation_quaternion": pbn.rotation_quaternion.copy(),
                 "rotation_euler": pbn.rotation_euler.copy(),
-                "rotation_axis_angle": tuple(float(v) for v in pbn.rotation_axis_angle),
+                "rotation_axis_angle": tuple(
+                    float(v) for v in pbn.rotation_axis_angle
+                ),
                 "scale": pbn.scale.copy(),
             }
         return snapshot
@@ -832,8 +905,7 @@ class PerfectOverlapSolver:
             pbn.rotation_quaternion = values["rotation_quaternion"].copy()
             e = values["rotation_euler"]
             pbn.rotation_euler = mathutils.Euler((e[0], e[1], e[2]), e.order)
-            aa = values["rotation_axis_angle"]
-            pbn.rotation_axis_angle = aa
+            pbn.rotation_axis_angle = values["rotation_axis_angle"]
             pbn.scale = values["scale"].copy()
         bpy.context.view_layer.update()
 
@@ -852,31 +924,44 @@ class PerfectOverlapSolver:
             return None
         if not self._ensure_action_slot(id_data):
             if report_missing:
-                self._record_failure(self.fcurve_lookup_failures, f"{id_data.name} Action slot")
+                self._record_failure(
+                    self.fcurve_lookup_failures,
+                    "{} Action slot".format(id_data.name),
+                )
             return None
 
         slot = getattr(adt, "action_slot", None)
         if slot is None:
             if report_missing:
-                self._record_failure(self.fcurve_lookup_failures, f"{id_data.name} assigned Action slot")
+                self._record_failure(
+                    self.fcurve_lookup_failures,
+                    "{} assigned Action slot".format(id_data.name),
+                )
             return None
 
         try:
             from bpy_extras import anim_utils
-            helper = getattr(anim_utils, "animdata_get_channelbag_for_assigned_slot", None)
+            helper = getattr(
+                anim_utils, "animdata_get_channelbag_for_assigned_slot", None
+            )
             channelbag = helper(adt) if helper is not None else None
             if channelbag is None:
-                fallback = getattr(anim_utils, "action_get_channelbag_for_slot", None)
+                fallback = getattr(
+                    anim_utils, "action_get_channelbag_for_slot", None
+                )
                 if fallback is not None:
                     channelbag = fallback(adt.action, slot)
+            # No channelbag simply means this slot has no F-Curves yet
+            # (for example a brand-new Action). That is not a failure.
             if channelbag is None:
-                if report_missing:
-                    self._record_failure(self.fcurve_lookup_failures, f"{id_data.name} channelbag")
                 return None
             return channelbag.fcurves
         except (ImportError, AttributeError, RuntimeError, TypeError) as exc:
             if report_missing:
-                self._record_failure(self.fcurve_lookup_failures, f"{id_data.name} channelbag lookup: {exc}")
+                self._record_failure(
+                    self.fcurve_lookup_failures,
+                    "{} channelbag lookup: {}".format(id_data.name, exc),
+                )
             return None
 
     def _get_fcurves(self, id_data, report_missing=False):
@@ -887,7 +972,9 @@ class PerfectOverlapSolver:
         obj = bpy.context.active_object
         if obj is None:
             return []
-        by_prefix = {pbn.path_from_id(): pbn for pbn in self.iter_bones(obj_trees)}
+        by_prefix = {
+            pbn.path_from_id(): pbn for pbn in self.iter_bones(obj_trees)
+        }
         result = []
         for fc in self._get_fcurves(obj, report_missing):
             for prefix, pbn in by_prefix.items():
@@ -902,7 +989,10 @@ class PerfectOverlapSolver:
         for fc, pbn, channel in self._chain_fcurve_map(obj_trees, True):
             if channel == self.rotation_data_path(pbn):
                 pass
-            elif channel == 'location' and fc.array_index in self.translate_axes(pbn):
+            elif (
+                channel == 'location'
+                and fc.array_index in self.translate_axes(pbn)
+            ):
                 pass
             else:
                 continue
@@ -946,25 +1036,35 @@ class PerfectOverlapSolver:
         raw = action.get(TRANSLATION_OWNERSHIP_KEY)
         if not raw:
             # Also read v2 metadata created by 2.2.x.
-            raw = action.get("_perfect_overlap_translation_ownership_v2")
+            raw = action.get(LEGACY_OWNERSHIP_KEY)
         if not raw:
             return []
         try:
             data = json.loads(raw) if isinstance(raw, str) else raw
         except (TypeError, ValueError):
-            self._record_failure(self.fcurve_lookup_failures, f"{id_data.name} translation ownership metadata")
+            self._record_failure(
+                self.fcurve_lookup_failures,
+                "{} translation ownership metadata".format(id_data.name),
+            )
             return []
-        return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
+        if isinstance(data, list):
+            return [entry for entry in data if isinstance(entry, dict)]
+        return []
 
     def _save_translation_ownership(self, id_data, entries):
         action, _adt, _slot = self._assigned_action_slot(id_data)
         if action is None:
             return True
         try:
-            action[TRANSLATION_OWNERSHIP_KEY] = json.dumps(entries, separators=(",", ":"))
+            action[TRANSLATION_OWNERSHIP_KEY] = json.dumps(
+                entries, separators=(",", ":")
+            )
             return True
         except Exception as exc:
-            self._record_failure(self.fcurve_lookup_failures, f"{id_data.name} translation ownership save: {exc}")
+            self._record_failure(
+                self.fcurve_lookup_failures,
+                "{} translation ownership save: {}".format(id_data.name, exc),
+            )
             return False
 
     @staticmethod
@@ -1002,7 +1102,10 @@ class PerfectOverlapSolver:
 
         selected_paths = None
         if obj_trees is not None:
-            selected_paths = {pbn.path_from_id() + ".location" for pbn in self.iter_bones(obj_trees)}
+            selected_paths = {
+                pbn.path_from_id() + ".location"
+                for pbn in self.iter_bones(obj_trees)
+            }
 
         targets = []
         kept_entries = []
@@ -1010,7 +1113,10 @@ class PerfectOverlapSolver:
             if not self._ownership_entry_matches(entry, id_data, slot):
                 kept_entries.append(entry)
                 continue
-            if selected_paths is not None and entry.get("data_path") not in selected_paths:
+            if (
+                selected_paths is not None
+                and entry.get("data_path") not in selected_paths
+            ):
                 kept_entries.append(entry)
                 continue
             targets.append(entry)
@@ -1022,7 +1128,9 @@ class PerfectOverlapSolver:
         if container is None:
             return 0
 
-        curves = {(fc.data_path, int(fc.array_index)): fc for fc in list(container)}
+        curves = {
+            (fc.data_path, int(fc.array_index)): fc for fc in list(container)
+        }
         sf = float(self.sf)
         ef = float(self.ef)
         remove_frames = {}
@@ -1030,7 +1138,10 @@ class PerfectOverlapSolver:
         target_curve_keys = set()
 
         for entry in targets:
-            key = (entry.get("data_path", ""), int(entry.get("array_index", 0)))
+            key = (
+                entry.get("data_path", ""),
+                int(entry.get("array_index", 0)),
+            )
             target_curve_keys.add(key)
             frames = self._normalized_owned_frames(entry)
             outside = [f for f in frames if f < sf or f > ef]
@@ -1093,21 +1204,30 @@ class PerfectOverlapSolver:
             return True
 
         existing = self._load_translation_ownership(obj)
-        selected_paths = {pbn.path_from_id() + ".location" for pbn in self.iter_bones(obj_trees)}
+        selected_paths = {
+            pbn.path_from_id() + ".location"
+            for pbn in self.iter_bones(obj_trees)
+        }
         sf = float(self.sf)
         ef = float(self.ef)
 
         kept = []
         preserved_by_key = {}
         for entry in existing:
-            if not self._ownership_entry_matches(entry, obj, slot) or entry.get("data_path") not in selected_paths:
+            if (
+                not self._ownership_entry_matches(entry, obj, slot)
+                or entry.get("data_path") not in selected_paths
+            ):
                 kept.append(entry)
                 continue
             frames = self._normalized_owned_frames(entry)
             outside = [f for f in frames if f < sf or f > ef]
             if not outside:
                 continue
-            key = (entry.get("data_path", ""), int(entry.get("array_index", 0)))
+            key = (
+                entry.get("data_path", ""),
+                int(entry.get("array_index", 0)),
+            )
             value = self._ownership_entry_with_frames(entry, outside)
             if value is not None:
                 preserved_by_key[key] = value
@@ -1120,7 +1240,10 @@ class PerfectOverlapSolver:
         owner_id = obj.name
         slot_handle = int(slot.handle)
         slot_identifier = getattr(slot, "identifier", "")
-        selected_by_path = {pbn.path_from_id() + ".location": pbn for pbn in self.iter_bones(obj_trees)}
+        selected_by_path = {
+            pbn.path_from_id() + ".location": pbn
+            for pbn in self.iter_bones(obj_trees)
+        }
 
         for fc in list(container):
             pbn = selected_by_path.get(fc.data_path)
@@ -1153,24 +1276,26 @@ class PerfectOverlapSolver:
     # ------------------------------------------------------------------
 
     def del_animkey(self, obj_trees, pose_snapshot=None):
-        """Delete baked rotation keys and selected translation keys in range.
+        """Delete rotation keys and selected translation keys in range.
 
         When Translation is enabled, all existing location keys for unlocked
         translation axes in the selected range are removed before the new
         bake is written. This is intentional: the bake owns that channel
         over the requested range, so manually keyed location values inside
         the range will be replaced by the generated result.
+
+        Returns the number of keys removed.
         """
-        container = self._fcurve_container(bpy.context.active_object)
+        obj = bpy.context.active_object
+        container = self._fcurve_container(obj)
         emptied = []
+        removed = 0
 
         for fc, pbn, channel in self._chain_fcurve_map(obj_trees):
             if channel == 'location':
                 if fc.array_index not in self.translate_axes(pbn):
                     continue
-            elif channel in ('rotation_euler', 'rotation_quaternion', 'rotation_axis_angle'):
-                pass
-            else:
+            elif channel not in ROTATION_CHANNELS:
                 continue
 
             indices = [
@@ -1180,6 +1305,7 @@ class PerfectOverlapSolver:
             for i in reversed(indices):
                 try:
                     fc.keyframe_points.remove(fc.keyframe_points[i], fast=True)
+                    removed += 1
                 except (RuntimeError, ReferenceError):
                     pass
             try:
@@ -1198,8 +1324,9 @@ class PerfectOverlapSolver:
 
         bpy.context.view_layer.update()
         self.restore_pose(obj_trees, pose_snapshot)
-        self._ensure_action_slot(bpy.context.active_object)
+        self._ensure_action_slot(obj)
         self.remove_addon_cycles(obj_trees)
+        return removed
 
     # ------------------------------------------------------------------
     # Key reduction
@@ -1281,7 +1408,10 @@ class PerfectOverlapSolver:
                     valid = False
                     break
             if not valid:
-                self._record_failure(self.fcurve_lookup_failures, f"{bone_name} {channel} incomplete key set")
+                self._record_failure(
+                    self.fcurve_lookup_failures,
+                    "{} {} incomplete key set".format(bone_name, channel),
+                )
                 self._smooth(fcurves)
                 continue
 
@@ -1289,7 +1419,10 @@ class PerfectOverlapSolver:
             keep = self._douglas_peucker_keep_indices(values, frames, tolerance)
             remove_frames = {frames[i] for i in range(len(frames)) if i not in keep}
             for fc in fcurves:
-                indices = [i for i, k in enumerate(fc.keyframe_points) if float(k.co[0]) in remove_frames]
+                indices = [
+                    i for i, k in enumerate(fc.keyframe_points)
+                    if float(k.co[0]) in remove_frames
+                ]
                 for i in reversed(indices):
                     try:
                         fc.keyframe_points.remove(fc.keyframe_points[i], fast=True)
@@ -1333,9 +1466,15 @@ class PerfectOverlapSolver:
         return first, last
 
     def remove_addon_cycles(self, obj_trees):
-        for fc, _ in self._baked_fcurves(obj_trees):
+        """Remove this add-on's Cycles modifiers from every rotation/location F-Curve of the chain."""
+        for fc, _pbn, channel in self._chain_fcurve_map(obj_trees):
+            if channel != 'location' and channel not in ROTATION_CHANNELS:
+                continue
             for modifier in list(fc.modifiers):
-                if modifier.type == 'CYCLES' and modifier.name == CYCLE_MODIFIER_NAME:
+                if (
+                    modifier.type == 'CYCLES'
+                    and getattr(modifier, "name", None) == CYCLE_MODIFIER_NAME
+                ):
                     try:
                         fc.modifiers.remove(modifier)
                     except (RuntimeError, ReferenceError):
@@ -1347,8 +1486,11 @@ class PerfectOverlapSolver:
                 continue
             try:
                 mod = fc.modifiers.new('CYCLES')
-                mod.name = CYCLE_MODIFIER_NAME
             except (RuntimeError, ReferenceError):
+                continue
+            try:
+                mod.name = CYCLE_MODIFIER_NAME
+            except (AttributeError, RuntimeError, TypeError):
                 pass
 
     def enforce_cycle_seam(self, obj_trees):
@@ -1402,36 +1544,43 @@ class PerfectOverlapSolver:
     # ------------------------------------------------------------------
 
     def cycle_residual(self, obj_trees):
+        """Return (bone_name, angle_radians) of the worst start/end rotation mismatch."""
         scene = bpy.context.scene
         original_frame = scene.frame_current
+        original_subframe = _current_subframe(scene)
         try:
             scene.frame_set(self.sf)
             bpy.context.view_layer.update()
-            start = {p.name: self.bone_rotation_quaternion(p) for p in self.iter_bones(obj_trees)}
+            start = {
+                p.name: self.bone_rotation_quaternion(p)
+                for p in self.iter_bones(obj_trees)
+            }
             scene.frame_set(self.ef)
             bpy.context.view_layer.update()
-            end = {p.name: self.bone_rotation_quaternion(p) for p in self.iter_bones(obj_trees)}
+            end = {
+                p.name: self.bone_rotation_quaternion(p)
+                for p in self.iter_bones(obj_trees)
+            }
         finally:
-            scene.frame_set(original_frame)
+            scene.frame_set(original_frame, subframe=original_subframe)
             bpy.context.view_layer.update()
 
-        worst = 0.0
         worst_name = ""
         worst_angle = 0.0
         for name, q0 in start.items():
             q1 = end.get(name)
             if q1 is None:
                 continue
-            try:
-                angle = q0.rotation_difference(q1).angle
-            except Exception:
-                angle = math.pi
-            if angle > worst:
-                worst = float(angle)
+            angle = quaternion_angle(q0, q1)
+            if angle > worst_angle:
+                worst_angle = angle
                 worst_name = name
-                worst_angle = float(angle)
-        return worst_name, worst, worst_angle
+        return worst_name, worst_angle
 
+
+# ----------------------------------------------------------------------
+# Properties
+# ----------------------------------------------------------------------
 
 class PERFECTOVERLAP_PG_props(bpy.types.PropertyGroup):
     start_frame: bpy.props.IntProperty(name="Start Frame", default=0, min=-1048574, max=1048574)
@@ -1454,7 +1603,10 @@ class PERFECTOVERLAP_PG_props(bpy.types.PropertyGroup):
         step=0.01, precision=4,
         description="Key reduction tolerance. Location values use bone length as scale.",
     )
-    debug: bpy.props.BoolProperty(name="Debug", default=False)
+    debug: bpy.props.BoolProperty(
+        name="Debug", default=False,
+        description="Print solver details to the system console.",
+    )
     animate_translate: bpy.props.BoolProperty(
         name="Translation", default=False,
         description=(
@@ -1472,6 +1624,10 @@ class PERFECTOVERLAP_PG_props(bpy.types.PropertyGroup):
     )
 
 
+# ----------------------------------------------------------------------
+# Operator helpers
+# ----------------------------------------------------------------------
+
 def _configure(module, props):
     module.sf = int(props.start_frame)
     module.ef = int(props.end_frame)
@@ -1484,21 +1640,47 @@ def _configure(module, props):
     return module
 
 
-def _redraw():
+def _current_subframe(scene):
     try:
-        bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
-    except RuntimeError:
-        pass
+        return float(scene.frame_subframe)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
+def _restore_scene_state(scene, frame, subframe, module=None, obj_trees=None, snapshot=None):
+    """Put the timeline back where the user left it (and the pose, after a failed bake)."""
+    try:
+        scene.frame_set(frame, subframe=subframe)
+        bpy.context.view_layer.update()
+        if module is not None and obj_trees and snapshot:
+            module.restore_pose(obj_trees, snapshot)
+            scene.frame_set(frame, subframe=subframe)
+            bpy.context.view_layer.update()
+    except Exception:
+        traceback.print_exc()
+
+
+def _safe_step(operator, label, func, *args):
+    """Run a non-essential post-processing step; report a warning instead of failing."""
+    try:
+        return func(*args)
+    except Exception as exc:
+        traceback.print_exc()
+        operator.report({'WARNING'}, "{} skipped: {}".format(label, exc))
+        return None
 
 
 def _frame_range_ok(operator, props):
     if props.start_frame < props.end_frame:
         return True
     message = "Make the Start Frame smaller than the End Frame."
-    bpy.context.window_manager.popup_menu(
-        lambda self, context: self.layout.label(text=message),
-        title="Info", icon="INFO",
-    )
+    try:
+        bpy.context.window_manager.popup_menu(
+            lambda self, context: self.layout.label(text=message),
+            title="Info", icon="INFO",
+        )
+    except Exception:
+        pass
     operator.report({'INFO'}, message)
     return False
 
@@ -1551,9 +1733,24 @@ def _format_failures(label, failures, limit=12):
         return ""
     values = sorted(str(v) for v in failures)
     if len(values) > limit:
-        return f"{label}: {', '.join(values[:limit])} (+{len(values) - limit} more)"
-    return f"{label}: {', '.join(values)}"
+        return "{}: {} (+{} more)".format(label, ", ".join(values[:limit]), len(values) - limit)
+    return "{}: {}".format(label, ", ".join(values))
 
+
+def _report_failures(operator, module):
+    for label, values in (
+        ("Keying failures", module.key_failures),
+        ("Animation-channel lookup failures", module.fcurve_lookup_failures),
+        ("Pose/assignment failures", module.pose_failures),
+    ):
+        message = _format_failures(label, values)
+        if message:
+            operator.report({'WARNING'}, message)
+
+
+# ----------------------------------------------------------------------
+# Operators
+# ----------------------------------------------------------------------
 
 class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
     bl_idname = "perfect_overlap.calculate"
@@ -1580,10 +1777,13 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
 
         scene = context.scene
         original_frame = scene.frame_current
+        original_subframe = _current_subframe(scene)
         module = _configure(PerfectOverlapSolver(), props)
         obj_trees = None
         operation_snapshot = None
+        animation_touched = False
         failed = False
+        result = {'FINISHED'}
 
         try:
             obj_trees = module.get_tree_list()
@@ -1593,60 +1793,67 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
 
             operation_snapshot = module.capture_pose(obj_trees)
 
-            # CRITICAL: sample the source animation BEFORE deleting keys.
+            # Phase 1 + 2: read and solve. Nothing is modified yet, so an
+            # error here leaves the user's animation exactly as it was.
             source_cache = module.sample_source(obj_trees)
             if not source_cache:
                 self.report({'ERROR'}, "Could not sample the source animation.")
+                return {'CANCELLED'}
+
+            results = module.solve_all(
+                obj_trees,
+                source_cache,
+                cycle=bool(props.cycle),
+                preroll=int(props.cycle_preroll) if props.cycle else 0,
+            )
+            if not results:
+                self.report({'ERROR'}, "Overlap solver produced no output.")
                 return {'CANCELLED'}
 
             scene.frame_set(props.start_frame)
             bpy.context.view_layer.update()
             start_pose = module.capture_pose(obj_trees)
 
-            # Remove only previous Perfect Overlap-owned translation keys.
+            # Phase 3: replace the animation in the requested range.
+            animation_touched = True
             module.remove_owned_translation_animation(obj, obj_trees)
-            bpy.context.view_layer.update()
-
-            # Delete rotation keys in the requested range. The source is safe in
-            # source_cache, so the bake no longer depends on deleted animation.
             module.del_animkey(obj_trees, start_pose)
+            module.write_results(obj_trees, results, start_pose)
 
-            solved = module.solve_bake(
-                obj_trees,
-                source_cache,
-                cycle=bool(props.cycle),
-                preroll=int(props.cycle_preroll) if props.cycle else 0,
+            # Post-processing. These steps polish the bake, so a failure in
+            # one of them is only a warning.
+            _safe_step(self, "Key reduction", module.cleanup_keys, obj_trees)
+            _safe_step(self, "Cycle modifier cleanup", module.remove_addon_cycles, obj_trees)
+
+            bone_count = sum(1 for _ in module.iter_bones(obj_trees))
+            summary = "Overlap baked on {} bone(s), frames {} to {}.".format(
+                bone_count, props.start_frame, props.end_frame
             )
-            if not solved:
-                raise RuntimeError("Overlap solver produced no output.")
-
-            module.cleanup_keys(obj_trees)
-            module.remove_addon_cycles(obj_trees)
+            cycle_warning = ""
 
             if props.cycle:
-                name, residual, angle = module.cycle_residual(obj_trees)
-                module.enforce_cycle_seam(obj_trees)
-                module.set_cycle_seam_tangents(obj_trees)
-                module.add_cyclic_modifiers(obj_trees)
-                if props.animate_translate:
-                    module.record_translation_ownership(obj_trees)
-                if residual > math.radians(2.0):
-                    self.report(
-                        {'WARNING'},
-                        "Cycle rotation residual {:.2f} degrees on '{}'. Increase Pre-roll Passes or use a clean source loop.".format(
-                            math.degrees(angle), name or "unknown"
-                        ),
-                    )
-                else:
-                    self.report(
-                        {'INFO'},
-                        "Cycle solved with {} pre-roll pass(es). Residual {:.2f} degrees.".format(
-                            int(props.cycle_preroll), math.degrees(residual)
-                        ),
-                    )
-            elif props.animate_translate:
-                module.record_translation_ownership(obj_trees)
+                residual = _safe_step(self, "Cycle residual check", module.cycle_residual, obj_trees)
+                _safe_step(self, "Cycle seam", module.enforce_cycle_seam, obj_trees)
+                _safe_step(self, "Cycle seam tangents", module.set_cycle_seam_tangents, obj_trees)
+                _safe_step(self, "Cycle modifier", module.add_cyclic_modifiers, obj_trees)
+                if residual is not None:
+                    name, angle = residual
+                    if angle > math.radians(2.0):
+                        cycle_warning = (
+                            "Cycle rotation residual {:.2f} degrees on '{}'. "
+                            "Increase Pre-roll Passes or use a clean source loop."
+                        ).format(math.degrees(angle), name or "unknown")
+                    else:
+                        summary += " Cycle residual {:.2f} degrees after {} pre-roll pass(es).".format(
+                            math.degrees(angle), int(props.cycle_preroll)
+                        )
 
+            if props.animate_translate:
+                _safe_step(self, "Translation ownership", module.record_translation_ownership, obj_trees)
+
+            self.report({'INFO'}, summary)
+            if cycle_warning:
+                self.report({'WARNING'}, cycle_warning)
             if props.animate_translate and module.translate_skipped:
                 self.report(
                     {'WARNING'},
@@ -1654,33 +1861,34 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
                         len(module.translate_skipped)
                     ),
                 )
-
-            for label, values in (
-                ("Keying failures", module.key_failures),
-                ("Animation-channel lookup failures", module.fcurve_lookup_failures),
-                ("Pose/assignment failures", module.matrix_assign_failures),
-            ):
-                message = _format_failures(label, values)
-                if message:
-                    self.report({'WARNING'}, message)
+            _report_failures(self, module)
 
         except Exception as exc:
             failed = True
-            raise RuntimeError("Perfect Overlap calculation failed: {}".format(exc)) from exc
+            traceback.print_exc()
+            if animation_touched:
+                # Part of the animation was already replaced. Finish the
+                # operator so Blender records ONE undo step for it.
+                self.report(
+                    {'ERROR'},
+                    "Perfect Overlap stopped part-way ({}). Press Ctrl+Z to undo the partial bake.".format(exc),
+                )
+                result = {'FINISHED'}
+            else:
+                self.report(
+                    {'ERROR'},
+                    "Perfect Overlap failed, your animation was not changed: {}".format(exc),
+                )
+                result = {'CANCELLED'}
 
         finally:
-            try:
-                scene.frame_set(original_frame)
-                bpy.context.view_layer.update()
-                if failed and operation_snapshot and obj_trees:
-                    module.restore_pose(obj_trees, operation_snapshot)
-                    scene.frame_set(original_frame)
-                    bpy.context.view_layer.update()
-                _redraw()
-            except Exception:
-                pass
+            _restore_scene_state(
+                scene, original_frame, original_subframe,
+                module if (failed and animation_touched) else None,
+                obj_trees, operation_snapshot,
+            )
 
-        return {'FINISHED'}
+        return result
 
 
 class PERFECTOVERLAP_OT_del_anim(bpy.types.Operator):
@@ -1707,10 +1915,13 @@ class PERFECTOVERLAP_OT_del_anim(bpy.types.Operator):
 
         scene = context.scene
         original_frame = scene.frame_current
+        original_subframe = _current_subframe(scene)
         module = _configure(PerfectOverlapSolver(), props)
         obj_trees = None
         operation_snapshot = None
+        animation_touched = False
         failed = False
+        result = {'FINISHED'}
 
         try:
             obj_trees = module.get_tree_list()
@@ -1723,34 +1934,45 @@ class PERFECTOVERLAP_OT_del_anim(bpy.types.Operator):
             bpy.context.view_layer.update()
             start_pose = module.capture_pose(obj_trees)
 
-            module.remove_owned_translation_animation(obj, obj_trees)
-            bpy.context.view_layer.update()
-            module.del_animkey(obj_trees, start_pose)
+            animation_touched = True
+            removed = module.remove_owned_translation_animation(obj, obj_trees)
+            removed += module.del_animkey(obj_trees, start_pose)
 
-            key_msg = _format_failures("Keying failures", module.key_failures)
-            if key_msg:
-                self.report({'WARNING'}, key_msg)
-            lookup_msg = _format_failures("Animation-channel lookup failures", module.fcurve_lookup_failures)
-            if lookup_msg:
-                self.report({'WARNING'}, lookup_msg)
+            self.report({'INFO'}, "Deleted {} key(s) in frames {} to {}.".format(
+                removed, props.start_frame, props.end_frame
+            ))
+            for label, values in (
+                ("Keying failures", module.key_failures),
+                ("Animation-channel lookup failures", module.fcurve_lookup_failures),
+            ):
+                message = _format_failures(label, values)
+                if message:
+                    self.report({'WARNING'}, message)
 
         except Exception as exc:
             failed = True
-            raise RuntimeError("Perfect Overlap delete failed: {}".format(exc)) from exc
+            traceback.print_exc()
+            if animation_touched:
+                self.report(
+                    {'ERROR'},
+                    "Perfect Overlap delete stopped part-way ({}). Press Ctrl+Z to undo it.".format(exc),
+                )
+                result = {'FINISHED'}
+            else:
+                self.report(
+                    {'ERROR'},
+                    "Perfect Overlap delete failed, your animation was not changed: {}".format(exc),
+                )
+                result = {'CANCELLED'}
 
         finally:
-            try:
-                scene.frame_set(original_frame)
-                bpy.context.view_layer.update()
-                if failed and operation_snapshot and obj_trees:
-                    module.restore_pose(obj_trees, operation_snapshot)
-                    scene.frame_set(original_frame)
-                    bpy.context.view_layer.update()
-                _redraw()
-            except Exception:
-                pass
+            _restore_scene_state(
+                scene, original_frame, original_subframe,
+                module if (failed and animation_touched) else None,
+                obj_trees, operation_snapshot,
+            )
 
-        return {'FINISHED'}
+        return result
 
 
 class PERFECTOVERLAP_OT_reset_settings(bpy.types.Operator):
@@ -1771,6 +1993,10 @@ class PERFECTOVERLAP_OT_reset_settings(bpy.types.Operator):
         self.report({'INFO'}, "Perfect Overlap settings reset to defaults")
         return {'FINISHED'}
 
+
+# ----------------------------------------------------------------------
+# UI
+# ----------------------------------------------------------------------
 
 class PERFECTOVERLAP_PT_panel(bpy.types.Panel):
     bl_label = "Perfect Overlap"
@@ -1808,6 +2034,8 @@ class PERFECTOVERLAP_PT_panel(bpy.types.Panel):
         box.prop(props, "cycle")
         if props.cycle:
             box.prop(props, "cycle_preroll")
+
+        layout.prop(props, "debug")
 
         layout.label(text="Main")
         row = layout.row()
