@@ -1,7 +1,7 @@
 # ##### BEGIN GPL LICENSE BLOCK #####
 #
 # Perfect Overlap Addon
-# Version 2.5.1 - tail-spring overlap solver (reviewed and fixed).
+# Version 2.6.0 - Anim Layer (NLA Add track) + key safety nets.
 #
 # Copyright 2021-2026 CaptainHansode, sakaiden.com
 # Copyright 2026 Sanku Venkatesh
@@ -13,25 +13,16 @@
 #
 # ##### END GPL LICENSE BLOCK #####
 #
-# 2.5.1 - fixes over 2.5.0
-# ------------------------
-# * Key reduction is now Douglas-Peucker. The old greedy pass only compared
-#   the key next to the end of a segment, so the error could pile up.
-# * Cycle: only the curves this add-on writes are touched (the seam code used
-#   to overwrite unrelated channels such as scale), and the loop is solved as
-#   a true periodic state, so first frame == last frame without a pop.
-# * Armature OBJECT motion now also drives the lag (ignored in Cycle mode).
-# * Translation spring is consistent with the aim solve and tracks the value
-#   that was really applied, so locked axes cannot wind up.
-# * Model check: warns about bones whose pose cannot be reproduced exactly
-#   (constraints on the bone, non-default Inherit Rotation / Scale).
-# * "Nothing to overlap" warning when neither the chain nor its driver moves.
-# * AttributeError is no longer swallowed while sampling.
+# 2.6.0
+# * Anim Layer option: bake onto a separate NLA track (Add blend) instead of
+#   writing into the existing Action (the active Action is pushed down first).
+# * Direct bake safety nets: skipped keys are re-inserted, key reduction is
+#   checked against the real curve, NLA-animated bones get an explanation.
 
 bl_info = {
     "name": "Perfect Overlap",
     "author": "Sanku Venkatesh",
-    "version": (2, 5, 1),
+    "version": (2, 6, 0),
     "blender": (4, 4, 0),
     "location": "3D Viewport > Sidebar > Perfect Overlap (Pose Mode)",
     "description": (
@@ -42,6 +33,7 @@ bl_info = {
 }
 
 import bpy
+import json
 import math
 import mathutils
 import traceback
@@ -89,6 +81,21 @@ ROTATION_PATHS = (
     "rotation_euler",
     "rotation_axis_angle",
 )
+
+# Anim Layer (NLA) settings
+LAYER_NAME = "Perfect Overlap"
+LAYER_ACTION_PROP = "perfect_overlap_layer"
+LAYER_STATIC_PROP = "perfect_overlap_static"
+LAYER_VERIFY_ANGLE = math.radians(1.0)
+STATIC_TOLERANCE = 1.0e-4
+
+# What an NLA stack evaluates to for a channel that nothing below animates.
+DEFAULT_CHANNEL_VALUES = {
+    "rotation_quaternion": (1.0, 0.0, 0.0, 0.0),
+    "rotation_euler": (0.0, 0.0, 0.0),
+    "rotation_axis_angle": (0.0, 0.0, 1.0, 0.0),
+    "location": (0.0, 0.0, 0.0),
+}
 
 
 # ============================================================================
@@ -214,6 +221,9 @@ class PerfectOverlapSolver:
         self.translate_skipped = []
         self.model_mismatch = []
         self.max_overlap_angle = 0.0
+        self.filled_keys = 0
+        self.layer_static = []
+        self._written = {}
 
     # ------------------------------------------------------------------------
     # Config
@@ -474,6 +484,10 @@ class PerfectOverlapSolver:
                         "local_loc": safe_vector(pbn.location),
                         "local_quat": self._active_quat(pbn),
                         "local_scale": safe_vector(pbn.scale, ONE_V),
+                        "raw_rotation": tuple(
+                            float(v)
+                            for v in getattr(pbn, self._rotation_path(pbn))
+                        ),
                     }
                 for name, pbn in drivers.items():
                     frame_data[name] = {"matrix": pbn.matrix.copy()}
@@ -1039,6 +1053,15 @@ class PerfectOverlapSolver:
     def _key_bone(self, pbn):
         f = bpy.context.scene.frame_current
 
+        path = self._rotation_path(pbn)
+        self._written[(pbn.name, path, f)] = tuple(
+            float(v) for v in getattr(pbn, path)
+        )
+        if self._translate_axes(pbn):
+            self._written[(pbn.name, "location", f)] = tuple(
+                float(v) for v in pbn.location
+            )
+
         for ax in self._translate_axes(pbn):
             try:
                 r = pbn.keyframe_insert(data_path='location', index=ax, frame=f)
@@ -1144,17 +1167,19 @@ class PerfectOverlapSolver:
             stack.append((idx, right))
         return keep
 
-    def reduce_keys(self, chains):
-        """Key reduction on the channels this add-on wrote. Returns the number
-        of keys removed."""
+    def reduce_keys(self, chains, curves=None):
+        """Key reduction on the channels this add-on wrote (or on ``curves``, a
+        list of (fcurve, pbn, channel)). Returns the number of keys removed."""
+        if curves is None:
+            curves = self._baked_curves(chains)
         groups = {}
-        for fc, pbn, channel in self._baked_curves(chains):
+        for fc, pbn, channel in curves:
             groups.setdefault((pbn.name, channel), []).append((fc, pbn))
 
         removed = 0
-        for (name, channel), curves in groups.items():
-            fcurves = [fc for fc, _ in curves]
-            pbn = curves[0][1]
+        for (name, channel), members in groups.items():
+            fcurves = [fc for fc, _ in members]
+            pbn = members[0][1]
             if channel == 'location':
                 tol = max(self.threshold * max(float(pbn.length), EPS), 1.0e-8)
             else:
@@ -1212,7 +1237,41 @@ class PerfectOverlapSolver:
                 except Exception:
                     pass
             self._smooth(fcurves)
+            removed -= self._ensure_fidelity(fcurves, frames, values, tol)
         return removed
+
+    def _ensure_fidelity(self, fcurves, frames, values, tol):
+        """Blender evaluates the reduced keys with Bezier handles, not with the
+        straight lines the reduction assumed. Check the real curve against the
+        dense bake and put back the key with the largest error until it holds.
+        Returns how many keys were restored."""
+        if any(len(fc.modifiers) for fc in fcurves):
+            return 0
+        limit = tol * 2.0 + 1.0e-9
+        restored = 0
+        for _ in range(len(frames)):
+            worst, worst_i = 0.0, None
+            for i, f in enumerate(frames):
+                for fc, comp in zip(fcurves, values):
+                    try:
+                        err = abs(float(fc.evaluate(f)) - comp[i])
+                    except Exception:
+                        return restored
+                    if err > worst:
+                        worst, worst_i = err, i
+            if worst_i is None or worst <= limit:
+                break
+            for fc, comp in zip(fcurves, values):
+                try:
+                    fc.keyframe_points.insert(
+                        frames[worst_i], comp[worst_i], options={'FAST'},
+                    )
+                    fc.update()
+                except Exception:
+                    return restored
+            self._smooth(fcurves)
+            restored += 1
+        return restored
 
     def _smooth(self, fcurves):
         for fc in fcurves:
@@ -1241,9 +1300,9 @@ class PerfectOverlapSolver:
                 last = k
         return first, last
 
-    def close_cycle_seam(self, chains):
+    def close_cycle_seam(self, chains, curves=None):
         """Make the end key equal the start key on every baked curve."""
-        for fc, _pbn, _ch in self._baked_curves(chains):
+        for fc, _pbn, _ch in (curves if curves is not None else self._baked_curves(chains)):
             first, last = self._seam_keys(fc)
             if first is None or last is None or first is last:
                 continue
@@ -1253,9 +1312,9 @@ class PerfectOverlapSolver:
             except Exception:
                 pass
 
-    def smooth_cycle_seam(self, chains):
+    def smooth_cycle_seam(self, chains, curves=None):
         """Give the seam keys a shared tangent so the loop point is smooth."""
-        for fc, _pbn, _ch in self._baked_curves(chains):
+        for fc, _pbn, _ch in (curves if curves is not None else self._baked_curves(chains)):
             first, last = self._seam_keys(fc)
             if first is None or last is None or first is last:
                 continue
@@ -1328,6 +1387,559 @@ class PerfectOverlapSolver:
                         pass
 
 
+    # ------------------------------------------------------------------------
+    # Direct bake: safety nets
+    # ------------------------------------------------------------------------
+
+    def fill_missing_keys(self, chains):
+        """Re-insert baked keys that keyframe_insert silently skipped (locked
+        curves, keying preferences, ...). Returns how many were added."""
+        obj = bpy.context.active_object
+        container = self._fcurve_container(obj)
+        existing = {
+            (fc.data_path, int(fc.array_index)): fc
+            for fc, _pbn, _ch in self._baked_curves(chains)
+        }
+        frames = list(range(self.sf, self.ef + 1))
+        filled = 0
+        for pbn in self.iter_bones(chains):
+            path = self._rotation_path(pbn)
+            count = 4 if pbn.rotation_mode in ('QUATERNION', 'AXIS_ANGLE') else 3
+            channels = [(path, list(range(count)))]
+            axes = self._translate_axes(pbn)
+            if axes:
+                channels.append(("location", axes))
+            for channel, indices in channels:
+                data_path = pbn.path_from_id() + "." + channel
+                for idx in indices:
+                    fc = existing.get((data_path, idx))
+                    if fc is None and container is not None:
+                        try:
+                            fc = container.new(
+                                data_path, index=idx, group_name=pbn.name,
+                            )
+                        except (RuntimeError, TypeError, AttributeError):
+                            fc = None
+                    if fc is None:
+                        continue
+                    have = {round(float(k.co[0]), 3) for k in fc.keyframe_points}
+                    added = False
+                    for f in frames:
+                        if round(float(f), 3) in have:
+                            continue
+                        vals = self._written.get((pbn.name, channel, f))
+                        if vals is None or idx >= len(vals):
+                            continue
+                        fc.keyframe_points.insert(f, vals[idx], options={'FAST'})
+                        filled += 1
+                        added = True
+                    if added:
+                        try:
+                            fc.update()
+                        except Exception:
+                            pass
+        return filled
+
+    def nla_animates_chain(self, obj, chains):
+        """True when NLA strips (not our own layers) animate the chain bones."""
+        adt = getattr(obj, "animation_data", None)
+        if adt is None:
+            return False
+        prefixes = tuple(
+            pbn.path_from_id() + "." for pbn in self.iter_bones(chains)
+        )
+        try:
+            for track in adt.nla_tracks:
+                for strip in track.strips:
+                    act = strip.action
+                    if act is None or act.get(LAYER_ACTION_PROP):
+                        continue
+                    cb = self._channelbag_for(
+                        act, getattr(strip, "action_slot", None),
+                    )
+                    if cb is None:
+                        continue
+                    for fc in cb.fcurves:
+                        if fc.data_path.startswith(prefixes):
+                            return True
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        return False
+
+    # ------------------------------------------------------------------------
+    # Anim Layer (NLA track with Add blending)
+    #
+    # NLA "Add" adds the strip's values onto what the stack below evaluates to.
+    # So the layer stores  new - base  for every channel, where base is what the
+    # stack below gives (the sampled source) or, for a channel nothing below
+    # animates, Blender's default value (identity quaternion, 0 location, ...).
+    # ------------------------------------------------------------------------
+
+    def _channelbag_for(self, action, slot):
+        if action is None:
+            return None
+        try:
+            from bpy_extras import anim_utils
+        except ImportError:
+            return None
+        try:
+            if slot is not None:
+                cb = anim_utils.action_get_channelbag_for_slot(action, slot)
+                if cb is not None:
+                    return cb
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        try:
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for cb in strip.channelbags:
+                        return cb
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        return None
+
+    def check_layer_ready(self, obj):
+        adt = getattr(obj, "animation_data", None)
+        if adt is not None and getattr(adt, "use_tweak_mode", False):
+            raise RuntimeError(
+                "Leave NLA tweak mode (Tab in the NLA editor) before baking "
+                "an Anim Layer"
+            )
+
+    def animated_channels(self, obj):
+        """{(data_path, index)} animated by the stack that will sit below the
+        layer: the active Action and every NLA strip that is not our own."""
+        paths = set()
+        adt = getattr(obj, "animation_data", None)
+        if adt is None:
+            return paths
+        sources = []
+        if adt.action is not None:
+            sources.append((adt.action, getattr(adt, "action_slot", None)))
+        for track in adt.nla_tracks:
+            for strip in track.strips:
+                act = strip.action
+                if act is None or act.get(LAYER_ACTION_PROP):
+                    continue
+                sources.append((act, getattr(strip, "action_slot", None)))
+        for act, slot in sources:
+            cb = self._channelbag_for(act, slot)
+            if cb is None:
+                continue
+            for fc in cb.fcurves:
+                if getattr(fc, "mute", False):
+                    continue
+                paths.add((fc.data_path, int(fc.array_index)))
+        return paths
+
+    def _layer_strips(self, obj):
+        adt = getattr(obj, "animation_data", None)
+        if adt is None:
+            return
+        for track in list(adt.nla_tracks):
+            for strip in list(track.strips):
+                act = strip.action
+                if act is not None and act.get(LAYER_ACTION_PROP):
+                    yield track, strip
+
+    def layer_previous_curves(self, chains):
+        """F-Curves of the chain bones inside earlier Perfect Overlap layers."""
+        obj = bpy.context.active_object
+        prefixes = tuple(
+            pbn.path_from_id() + "." for pbn in self.iter_bones(chains)
+        )
+        items = []
+        for track, strip in self._layer_strips(obj):
+            cb = self._channelbag_for(
+                strip.action, getattr(strip, "action_slot", None),
+            )
+            if cb is None:
+                continue
+            for fc in list(cb.fcurves):
+                if fc.data_path.startswith(prefixes):
+                    items.append({
+                        "fc": fc, "cb": cb, "track": track, "strip": strip,
+                        "action": strip.action, "mute": bool(fc.mute),
+                    })
+        return items
+
+    def _apply_static_values(self, items, chains):
+        """Put the un-keyed channels the old layer(s) drove back to the pose they
+        had before the layer existed. Without this they keep whatever the layer
+        last evaluated to once the layer is muted or removed."""
+        obj = bpy.context.active_object
+        prefixes = tuple(
+            pbn.path_from_id() + "." for pbn in self.iter_bones(chains)
+        )
+        seen = set()
+        for it in items:
+            action = it["action"]
+            if id(action) in seen:
+                continue
+            seen.add(id(action))
+            try:
+                data = json.loads(action.get(LAYER_STATIC_PROP) or "{}")
+            except (TypeError, ValueError):
+                continue
+            for key, value in data.items():
+                data_path, _sep, idx = key.rpartition("|")
+                if not data_path.startswith(prefixes):
+                    continue
+                try:
+                    name = data_path.split('"')[1]
+                    channel = data_path.rsplit(".", 1)[1]
+                    getattr(obj.pose.bones.get(name), channel)[int(idx)] = float(value)
+                except (IndexError, KeyError, AttributeError, TypeError, ValueError):
+                    continue
+        bpy.context.view_layer.update()
+
+    def layer_mute_previous(self, chains):
+        """Mute the old layer curves so sampling sees the pure base animation."""
+        items = self.layer_previous_curves(chains)
+        for it in items:
+            it["fc"].mute = True
+        if items:
+            self._apply_static_values(items, chains)
+        return items
+
+    @staticmethod
+    def layer_unmute(items):
+        for it in items:
+            try:
+                it["fc"].mute = it["mute"]
+            except (ReferenceError, AttributeError, RuntimeError):
+                pass
+
+    def layer_commit_previous(self, items):
+        """Delete the old layer curves (and any strip/track/action left empty)."""
+        obj = bpy.context.active_object
+        adt = obj.animation_data
+        for it in items:
+            try:
+                it["cb"].fcurves.remove(it["fc"])
+            except (RuntimeError, ReferenceError, TypeError):
+                pass
+        done = set()
+        for it in items:
+            key = id(it["strip"])
+            if key in done:
+                continue
+            done.add(key)
+            try:
+                if len(it["cb"].fcurves) > 0:
+                    continue
+                track, action = it["track"], it["action"]
+                track.strips.remove(it["strip"])
+                if len(track.strips) == 0:
+                    adt.nla_tracks.remove(track)
+                if action.users == 0:
+                    bpy.data.actions.remove(action)
+            except (RuntimeError, ReferenceError, TypeError, AttributeError):
+                pass
+
+    @staticmethod
+    def rename_layer_track(track):
+        """Blender numbers duplicate names; once the old layer is gone take the
+        plain name back."""
+        adt = bpy.context.active_object.animation_data
+        try:
+            if track.name != LAYER_NAME and not any(
+                t.name == LAYER_NAME for t in adt.nla_tracks
+            ):
+                track.name = LAYER_NAME
+        except (AttributeError, RuntimeError, ReferenceError):
+            pass
+
+    def layer_remove(self, chains):
+        """Delete Keys with Anim Layer on: take the bones out of the layer(s)."""
+        items = self.layer_previous_curves(chains)
+        if items:
+            self._apply_static_values(items, chains)
+        self.layer_commit_previous(items)
+        return len(items)
+
+    @staticmethod
+    def _make_tracker(seed):
+        """Continuity tracker seeded from a capture_pose() entry."""
+        tracker = {}
+        if not seed:
+            return tracker
+        try:
+            tracker["last_quat"] = safe_quaternion(seed["rotation_quaternion"])
+            tracker["last_euler"] = seed["rotation_euler"].copy()
+            tracker["last_axis_angle"] = tuple(
+                float(v) for v in seed["rotation_axis_angle"]
+            )
+        except (KeyError, AttributeError, TypeError, ValueError):
+            return {}
+        return tracker
+
+    def _layer_rotation_values(self, pbn, quat, raw, anim, tracker):
+        """New rotation in the bone's own representation, aligned with the base
+        value (``raw``) so that  new - base  stays small."""
+        q = safe_quaternion(quat)
+        mode = pbn.rotation_mode
+        any_anim = any(anim)
+
+        if mode == 'QUATERNION':
+            ref = None
+            if any_anim and len(raw) == 4:
+                r = mathutils.Quaternion(raw)
+                if r.magnitude > EPS:
+                    ref = r
+            if ref is None:
+                ref = tracker.get("last_quat")
+            if ref is not None and q.dot(ref) < 0.0:
+                q.negate()
+            tracker["last_quat"] = q.copy()
+            return tuple(float(v) for v in q)
+
+        if mode == 'AXIS_ANGLE':
+            angle = float(q.angle)
+            axis = q.axis.copy()
+            prev = tuple(raw) if any_anim else tracker.get("last_axis_angle")
+            if prev is not None:
+                prev_axis = mathutils.Vector(prev[1:4])
+                if prev_axis.length >= EPS:
+                    prev_axis.normalize()
+                    if axis.dot(prev_axis) < 0.0:
+                        axis.negate()
+                        angle = -angle
+                angle += math.tau * round((float(prev[0]) - angle) / math.tau)
+            tracker["last_axis_angle"] = (angle, axis.x, axis.y, axis.z)
+            return (angle, axis.x, axis.y, axis.z)
+
+        euler = q.to_euler(mode)
+        ref = (
+            mathutils.Euler(tuple(raw), mode) if any_anim
+            else tracker.get("last_euler")
+        )
+        if ref is not None:
+            try:
+                euler.make_compatible(ref)
+            except (ValueError, ArithmeticError):
+                pass
+        values = [float(euler[0]), float(euler[1]), float(euler[2])]
+        for i in range(3):
+            if anim[i]:
+                values[i] += math.tau * round((raw[i] - values[i]) / math.tau)
+        tracker["last_euler"] = mathutils.Euler(tuple(values), mode)
+        return tuple(values)
+
+    def build_layer_curves(self, chains, source, results, start_pose, animated):
+        """Pure maths: {(bone, data_path, index): {frame: value}} for the layer,
+        plus the bones whose un-keyed pose is not the default pose."""
+        curves = {}
+        statics = []
+        static_values = {}
+        frames = range(self.sf, self.ef + 1)
+        for pbn in self.iter_bones(chains):
+            name = pbn.name
+            path = self._rotation_path(pbn)
+            data_path = pbn.path_from_id() + "." + path
+            loc_path = pbn.path_from_id() + ".location"
+            default = DEFAULT_CHANNEL_VALUES[path]
+            loc_default = DEFAULT_CHANNEL_VALUES["location"]
+            n = len(default)
+            anim = [(data_path, i) in animated for i in range(n)]
+            loc_anim = [(loc_path, i) in animated for i in range(3)]
+            axes = self._translate_axes(pbn)
+            tracker = self._make_tracker(start_pose.get(name) if start_pose else None)
+            is_static = False
+            for f in frames:
+                res = results.get(f, {}).get(name)
+                src = source["frames"][f].get(name)
+                if res is None or src is None:
+                    continue
+                raw = src["raw_rotation"]
+                values = self._layer_rotation_values(
+                    pbn, res["rotation"], raw, anim, tracker,
+                )
+                for i in range(n):
+                    base = raw[i] if anim[i] else default[i]
+                    if not anim[i]:
+                        static_values.setdefault("{}|{}".format(data_path, i), raw[i])
+                    if not anim[i] and abs(raw[i] - default[i]) > STATIC_TOLERANCE:
+                        is_static = True
+                    curves.setdefault((name, data_path, i), {})[f] = values[i] - base
+                if res["location"] is not None:
+                    for ax in axes:
+                        raw_loc = float(src["local_loc"][ax])
+                        base = raw_loc if loc_anim[ax] else loc_default[ax]
+                        if not loc_anim[ax]:
+                            static_values.setdefault("{}|{}".format(loc_path, ax), raw_loc)
+                        if not loc_anim[ax] and abs(raw_loc - loc_default[ax]) > STATIC_TOLERANCE:
+                            is_static = True
+                        curves.setdefault((name, loc_path, ax), {})[f] = (
+                            float(res["location"][ax]) - base
+                        )
+            if is_static:
+                statics.append(name)
+        return curves, statics, static_values
+
+    def _restore_action(self, adt, action, slot):
+        adt.action = action
+        if slot is not None:
+            try:
+                adt.action_slot = slot
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+
+    def _push_down_active_action(self, adt, undo):
+        """Move the active Action into its own NLA track (Blender's Push Down)
+        so a track above it can add to it."""
+        action = adt.action
+        if action is None:
+            return None
+        slot = getattr(adt, "action_slot", None)
+        try:
+            start = float(action.frame_range[0])
+        except (AttributeError, TypeError, IndexError):
+            start = float(self.sf)
+
+        track = adt.nla_tracks.new()
+        undo.append(lambda: adt.nla_tracks.remove(track))
+        try:
+            track.name = action.name
+        except (AttributeError, RuntimeError):
+            pass
+        strip = track.strips.new(action.name, int(math.floor(start)), action)
+        if slot is not None and hasattr(strip, "action_slot"):
+            try:
+                strip.action_slot = slot
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+            if strip.action_slot != slot:
+                raise RuntimeError(
+                    "Could not hand the Action slot to the pushed-down strip"
+                )
+        for attr_strip, attr_adt in (
+            ("blend_type", "action_blend_type"),
+            ("extrapolation", "action_extrapolation"),
+        ):
+            try:
+                setattr(strip, attr_strip, getattr(adt, attr_adt))
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+        try:
+            if abs(float(strip.frame_start) - start) > 1.0e-6:
+                strip.frame_start = start
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+        adt.action = None
+        undo.append(lambda: self._restore_action(adt, action, slot))
+        return strip
+
+    def _verify_layer(self, chains, results):
+        """Evaluate the NLA and compare with what was baked."""
+        scene = bpy.context.scene
+        span = self.ef - self.sf
+        frames = sorted({
+            min(self.ef, self.sf + 1),
+            self.sf + span // 2,
+            max(self.sf, self.ef - 1),
+        })
+        for f in frames:
+            scene.frame_set(f)
+            bpy.context.view_layer.update()
+            frame_result = results.get(f) or {}
+            for pbn in self.iter_bones(chains):
+                res = frame_result.get(pbn.name)
+                if res is None:
+                    continue
+                err = quat_angle_between(self._active_quat(pbn), res["rotation"])
+                if err > LAYER_VERIFY_ANGLE:
+                    raise RuntimeError(
+                        "Anim Layer check failed on '{}' at frame {} "
+                        "({:.1f} deg off)".format(pbn.name, f, math.degrees(err))
+                    )
+                if res["location"] is not None:
+                    limit = 1.0e-3 * max(float(pbn.length), EPS) + 1.0e-4
+                    for ax in self._translate_axes(pbn):
+                        if abs(float(pbn.location[ax]) - float(res["location"][ax])) > limit:
+                            raise RuntimeError(
+                                "Anim Layer check failed on '{}' location at "
+                                "frame {}".format(pbn.name, f)
+                            )
+
+    def write_layer(self, chains, source, results, start_pose, cycle=False):
+        """Bake onto a NEW NLA track with Add blending.
+
+        Transactional: if anything fails, every change made here is undone
+        (tracks and the layer Action removed, the original Action re-assigned)
+        and the error is re-raised."""
+        from bpy_extras import anim_utils
+
+        obj = bpy.context.active_object
+        animated = self.animated_channels(obj)
+        curves, statics, static_values = self.build_layer_curves(
+            chains, source, results, start_pose, animated,
+        )
+        if not curves:
+            raise RuntimeError("Nothing to write to the layer")
+        self.layer_static = statics
+
+        undo = []
+        try:
+            adt = obj.animation_data
+            if adt is None:
+                adt = obj.animation_data_create()
+                undo.append(obj.animation_data_clear)
+            self._push_down_active_action(adt, undo)
+
+            action = bpy.data.actions.new(
+                "{}_{}".format(obj.name, LAYER_NAME.replace(" ", ""))
+            )
+            undo.append(lambda: bpy.data.actions.remove(action))
+            action[LAYER_ACTION_PROP] = 1
+            action[LAYER_STATIC_PROP] = json.dumps(static_values)
+            slot = action.slots.new(id_type='OBJECT', name=obj.name)
+            channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
+
+            by_name = {pbn.name: pbn for pbn in self.iter_bones(chains)}
+            frames = list(range(self.sf, self.ef + 1))
+            made = []
+            for (bone, data_path, idx), series in sorted(curves.items()):
+                fc = channelbag.fcurves.new(data_path, index=idx, group_name=bone)
+                for f in frames:
+                    if f in series:
+                        fc.keyframe_points.insert(f, series[f], options={'FAST'})
+                fc.update()
+                made.append((fc, by_name[bone], data_path.rsplit(".", 1)[1]))
+
+            self.reduce_keys(chains, curves=made)
+            if cycle:
+                self.close_cycle_seam(chains, curves=made)
+                self.smooth_cycle_seam(chains, curves=made)
+
+            track = adt.nla_tracks.new()
+            undo.append(lambda: adt.nla_tracks.remove(track))
+            track.name = LAYER_NAME
+            strip = track.strips.new(LAYER_NAME, int(self.sf), action)
+            try:
+                if hasattr(strip, "action_slot"):
+                    strip.action_slot = slot
+            except (AttributeError, RuntimeError, TypeError):
+                pass
+            strip.blend_type = 'ADD'
+            strip.extrapolation = 'NOTHING'
+            bpy.context.view_layer.update()
+
+            self._verify_layer(chains, results)
+        except Exception:
+            for fn in reversed(undo):
+                try:
+                    fn()
+                except Exception:
+                    traceback.print_exc()
+            try:
+                bpy.context.view_layer.update()
+            except Exception:
+                pass
+            raise
+        return {"track": track, "strip": strip, "action": action}
+
+
 # ============================================================================
 # UI properties
 # ============================================================================
@@ -1373,6 +1985,15 @@ class PERFECTOVERLAP_PG_props(bpy.types.PropertyGroup):
     cycle_preroll: bpy.props.IntProperty(
         name="Pre-roll", default=2, min=1, max=20,
         description="Number of hidden passes used to settle cycle momentum",
+    )
+    use_anim_layer: bpy.props.BoolProperty(
+        name="Anim Layer", default=False,
+        description=(
+            "Bake the overlap onto a separate NLA track (Add blending) instead "
+            "of writing into the existing Action. The active Action is pushed "
+            "down into the NLA first so the track can sit on top of it. "
+            "Re-baking replaces the previous layer; Delete Keys removes it"
+        ),
     )
     debug: bpy.props.BoolProperty(
         name="Debug", default=False,
@@ -1506,6 +2127,7 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
             self.report({'ERROR'}, "Start frame must be less than end frame")
             return {'CANCELLED'}
 
+        use_layer = bool(props.use_anim_layer)
         scene = context.scene
         original_frame = scene.frame_current
         original_subframe = current_subframe(scene)
@@ -1514,6 +2136,8 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
         chains = None
         snapshot = None
         touched = False
+        muted = []
+        nla_warn = False
         result = {'FINISHED'}
 
         try:
@@ -1527,6 +2151,11 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
                 return {'CANCELLED'}
 
             snapshot = solver.capture_pose(chains)
+
+            if use_layer:
+                solver.check_layer_ready(obj)
+                # earlier layer of these bones must not be part of the source
+                muted = solver.layer_mute_previous(chains)
 
             # ---- Phase 1: read (nothing is modified) ----
             source = solver.sample_source(chains)
@@ -1551,35 +2180,54 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
             start_pose = solver.capture_pose(chains)
 
             # ---- Phase 3: write ----
-            touched = True
-            solver.delete_keys(chains)
-            solver.restore_pose(chains, start_pose)
-            solver.write_results(chains, results, start_pose)
+            if use_layer:
+                # transactional: leaves nothing behind if it raises
+                layer = solver.write_layer(
+                    chains, source, results, start_pose,
+                    cycle=bool(props.cycle),
+                )
+                solver.layer_commit_previous(muted)
+                muted = []
+                solver.rename_layer_track(layer["track"])
+            else:
+                nla_warn = solver.nla_animates_chain(obj, chains)
+                touched = True
+                solver.delete_keys(chains)
+                solver.restore_pose(chains, start_pose)
+                solver.write_results(chains, results, start_pose)
 
-            # ---- Post-processing (best effort) ----
-            try:
-                solver.reduce_keys(chains)
-            except Exception as exc:
-                traceback.print_exc()
-                self.report({'WARNING'}, "Key reduction skipped: {}".format(exc))
+                try:
+                    solver.filled_keys = solver.fill_missing_keys(chains)
+                except Exception as exc:
+                    traceback.print_exc()
+                    self.report({'WARNING'}, "Key check skipped: {}".format(exc))
 
-            try:
-                if props.cycle:
-                    solver.close_cycle_seam(chains)
-                    solver.smooth_cycle_seam(chains)
-                    solver.add_cycle_modifiers(chains)
-                else:
-                    solver.remove_cycle_modifiers(chains)
-            except Exception as exc:
-                traceback.print_exc()
-                self.report({'WARNING'}, "Cycle step skipped: {}".format(exc))
+                # ---- Post-processing (best effort) ----
+                try:
+                    solver.reduce_keys(chains)
+                except Exception as exc:
+                    traceback.print_exc()
+                    self.report({'WARNING'}, "Key reduction skipped: {}".format(exc))
+
+                try:
+                    if props.cycle:
+                        solver.close_cycle_seam(chains)
+                        solver.smooth_cycle_seam(chains)
+                        solver.add_cycle_modifiers(chains)
+                    else:
+                        solver.remove_cycle_modifiers(chains)
+                except Exception as exc:
+                    traceback.print_exc()
+                    self.report({'WARNING'}, "Cycle step skipped: {}".format(exc))
 
             bone_count = sum(1 for _ in solver.iter_bones(chains))
             self.report(
                 {'INFO'},
-                "Baked overlap on {} bone(s), frames {} to {} "
+                "Baked overlap on {} bone(s){}, frames {} to {} "
                 "(largest offset {:.1f} deg)".format(
-                    bone_count, props.start_frame, props.end_frame,
+                    bone_count,
+                    " onto the '{}' NLA layer (Add)".format(LAYER_NAME) if use_layer else "",
+                    props.start_frame, props.end_frame,
                     math.degrees(solver.max_overlap_angle),
                 ),
             )
@@ -1606,10 +2254,34 @@ class PERFECTOVERLAP_OT_calculate(bpy.types.Operator):
                         _short_list(solver.model_mismatch),
                     ),
                 )
+            if use_layer and solver.layer_static:
+                self.report(
+                    {'WARNING'},
+                    "{} have a pose that is not the rest pose and no keys "
+                    "below the layer; outside the baked range they return to "
+                    "the rest pose.".format(_short_list(solver.layer_static)),
+                )
+            if not use_layer and solver.filled_keys:
+                self.report(
+                    {'WARNING'},
+                    "Blender skipped {} baked key(s); they were re-inserted.".format(
+                        solver.filled_keys,
+                    ),
+                )
+            if not use_layer and nla_warn:
+                self.report(
+                    {'WARNING'},
+                    "These bones are animated through the NLA. Baking "
+                    "directly writes an override Action on top of it, which "
+                    "can look like keys jumping or missing outside the range. "
+                    "Tick Anim Layer to bake onto a separate NLA track instead.",
+                )
             _report_failures(self, solver)
 
         except Exception as exc:
             traceback.print_exc()
+            if use_layer and muted:
+                solver.layer_unmute(muted)
             if touched:
                 # The animation was already partly rewritten. Return FINISHED
                 # so Blender pushes ONE undo step for it.
@@ -1641,7 +2313,8 @@ class PERFECTOVERLAP_OT_delete(bpy.types.Operator):
     bl_label = "Delete Keys"
     bl_description = (
         "Delete the rotation keys (and location keys when Translation is on) "
-        "of the selected chain in the frame range"
+        "of the selected chain in the frame range. With Anim Layer on, the "
+        "selected bones are removed from the Perfect Overlap NLA layer instead"
     )
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -1687,6 +2360,16 @@ class PERFECTOVERLAP_OT_delete(bpy.types.Operator):
             if not chains:
                 self.report({'WARNING'}, "No chain detected")
                 return {'CANCELLED'}
+
+            if props.use_anim_layer:
+                removed = solver.layer_remove(chains)
+                self.report(
+                    {'INFO'},
+                    "Removed {} curve(s) from the '{}' layer".format(
+                        removed, LAYER_NAME,
+                    ),
+                )
+                return result
 
             snapshot = solver.capture_pose(chains)
             scene.frame_set(props.start_frame)
@@ -1794,6 +2477,7 @@ class PERFECTOVERLAP_PT_panel(bpy.types.Panel):
         box.prop(props, "cycle")
         if props.cycle:
             box.prop(props, "cycle_preroll")
+        box.prop(props, "use_anim_layer")
 
         box = layout.box()
         box.prop(props, "debug")
