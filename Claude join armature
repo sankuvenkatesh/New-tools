@@ -1,0 +1,532 @@
+import bpy
+import re
+from bpy_extras import anim_utils
+
+# Blender 5.1 - 5.2.x (5.2 LTS) conservative armature/mesh merger.
+# Run in Object Mode on a saved duplicate. Select >=2 armatures and only
+# their meshes. Make the intended surviving armature active.
+#
+# Changes in this version:
+#  - FCurve creation uses group_name="" (channelbag API) instead of
+#    action_group=None, which raised TypeError.
+#  - constraint.subtarget is read with getattr (Limit Location/Rotation/...
+#    have no subtarget and crashed the warning pass).
+#  - Matrix.is_identity is exact-equality, so a tolerance helper is used.
+#  - Preflight check for the 63-byte bone / vertex-group name limit, for
+#    name collisions after prefixing, and for a new bone name that equals
+#    another existing bone name of the same armature.
+#  - Meshes are detached (parent + Armature modifiers removed) BEFORE bones
+#    are renamed, so Blender cannot auto-rename vertex groups behind our
+#    back; rename_groups is the single source of group names.
+#  - New Armature modifier is moved to the top of the stack and keeps the
+#    old Preserve Volume / Multi-Modifier settings (warns if meshes differ).
+#  - Warnings for shape keys / shape-key animation and non-bone channels.
+#  - F-Curves without a group are created without group_name.
+
+MIN_VERSION = (5, 1, 0)
+PREFIX = "_"
+ACTION_NAME = "MERGED_Combined_Action"
+MAX_NAME_BYTES = 63  # Blender name limit (64 incl. terminator)
+
+
+def log(msg):
+    print("[Safe Rig Merger] " + str(msg))
+
+
+def unique_name(collection, base):
+    if base not in collection:
+        return base
+    i = 1
+    while f"{base}.{i:03d}" in collection:
+        i += 1
+    return f"{base}.{i:03d}"
+
+
+def deselect_all():
+    for obj in bpy.context.view_layer.objects:
+        if obj.select_get():
+            obj.select_set(False)
+
+
+def is_identity(matrix, eps=1e-5):
+    for i in range(4):
+        for j in range(4):
+            expected = 1.0 if i == j else 0.0
+            if abs(matrix[i][j] - expected) > eps:
+                return False
+    return True
+
+
+def remap_bone_path(path, mapping):
+    """Single-pass replacement prevents cascading bone-name substitutions."""
+    escape = getattr(bpy.utils, "escape_identifier", None)
+    if escape is None:
+        raise RuntimeError(
+            "bpy.utils.escape_identifier is unavailable in this Blender build."
+        )
+    replacements = {}
+    for old, new in mapping.items():
+        source = f'pose.bones["{escape(old)}"]'
+        target = f'pose.bones["{escape(new)}"]'
+        replacements[source] = target
+    if not replacements:
+        return path
+    pattern = re.compile("|".join(
+        re.escape(token) for token in sorted(replacements, key=len, reverse=True)
+    ))
+    return pattern.sub(lambda m: replacements[m.group(0)], path)
+
+
+def rig_for_mesh(mesh, armatures):
+    found = []
+    for mod in mesh.modifiers:
+        if mod.type == 'ARMATURE' and mod.object in armatures:
+            if mod.object not in found:
+                found.append(mod.object)
+    if mesh.parent in armatures and mesh.parent not in found:
+        found.append(mesh.parent)
+    if len(found) > 1:
+        raise RuntimeError(
+            f'{mesh.name}: linked to multiple selected armatures; resolve manually.'
+        )
+    return found[0] if found else None
+
+
+def bone_mapping(arm):
+    return {b.name: arm.name + PREFIX + b.name for b in arm.data.bones}
+
+
+def check_names(arms, maps):
+    """Names must fit Blender's limit and stay unique after prefixing."""
+    seen = {}
+    for arm in arms:
+        old_names = set(maps[arm].keys())
+        for old, new in maps[arm].items():
+            if new in old_names and new != old:
+                raise RuntimeError(
+                    f'{arm.name}: bone "{new}" already exists; renaming '
+                    f'"{old}" -> "{new}" would collide. Rename one bone first.'
+                )
+            if len(new.encode("utf-8")) > MAX_NAME_BYTES:
+                raise RuntimeError(
+                    f'{arm.name}: new bone name "{new}" is longer than '
+                    f"{MAX_NAME_BYTES} bytes and would be truncated. Shorten "
+                    "the armature object name or the bone name first."
+                )
+            if new in seen:
+                raise RuntimeError(
+                    f'Name collision after prefixing: "{new}" '
+                    f"({seen[new]} and {arm.name}). Rename one armature."
+                )
+            seen[new] = arm.name
+
+
+def validate_groups(mesh, mapping):
+    names = {g.name for g in mesh.vertex_groups}
+    for old, new in mapping.items():
+        if new in names and old not in names and old != new:
+            raise RuntimeError(
+                f'{mesh.name}: vertex group "{new}" already exists, but the '
+                f'corresponding source group "{old}" does not. It may be an '
+                "unrelated group that would accidentally bind to a renamed bone."
+            )
+        if old in names and new in names and old != new:
+            raise RuntimeError(
+                f'{mesh.name}: vertex-group collision "{new}". Resolve first.'
+            )
+
+
+def rename_groups(mesh, mapping):
+    jobs = [(g, mapping[g.name]) for g in mesh.vertex_groups
+            if g.name in mapping and mapping[g.name] != g.name]
+    for i, (group, _) in enumerate(jobs):
+        group.name = f"__MERGE_TEMP_{i:05d}__"
+    for group, new_name in jobs:
+        group.name = new_name
+
+
+def armature_mod_settings(mesh, rig):
+    for mod in mesh.modifiers:
+        if mod.type == 'ARMATURE' and mod.object == rig:
+            return {
+                "use_deform_preserve_volume": mod.use_deform_preserve_volume,
+                "use_multi_modifier": mod.use_multi_modifier,
+            }
+    return {}
+
+
+def move_modifier_first(obj, modifier_name):
+    try:
+        obj.modifiers.move(len(obj.modifiers) - 1, 0)
+        return
+    except Exception:
+        pass
+    try:
+        with bpy.context.temp_override(object=obj, active_object=obj):
+            bpy.ops.object.modifier_move_to_index(
+                modifier=modifier_name, index=0)
+    except Exception as exc:
+        log(f"WARNING: could not move the Armature modifier to the top of "
+            f"{obj.name}'s stack ({exc}). Move it manually.")
+
+
+def copy_fcurve(src, bag, mapping):
+    path = remap_bone_path(src.data_path, mapping)
+    idx = src.array_index
+    if bag.fcurves.find(path, index=idx) is not None:
+        raise RuntimeError(
+            f"Duplicate animation channel: {path}[{idx}]. Non-bone channels "
+            "(object transform, custom properties) from several rigs cannot "
+            "be merged; remove them from the source actions first."
+        )
+    kwargs = {"index": idx}
+    if src.group:
+        kwargs["group_name"] = src.group.name
+    try:
+        dst = bag.fcurves.new(path, **kwargs)
+    except TypeError as exc:
+        raise RuntimeError(
+            "Channelbag fcurves.new(group_name=...) failed before scene "
+            "joins: " + str(exc)
+        )
+    dst.extrapolation = src.extrapolation
+    dst.auto_smoothing = src.auto_smoothing
+    dst.mute = src.mute
+    dst.lock = src.lock
+
+    n = len(src.keyframe_points)
+    if n:
+        dst.keyframe_points.add(n)
+        for a, b in zip(src.keyframe_points, dst.keyframe_points):
+            b.co = a.co
+            b.interpolation = a.interpolation
+            b.easing = a.easing
+            b.type = a.type
+            b.handle_left_type = a.handle_left_type
+            b.handle_right_type = a.handle_right_type
+            b.handle_left = a.handle_left
+            b.handle_right = a.handle_right
+            for attr in ("back", "amplitude", "period"):
+                if hasattr(a, attr) and hasattr(b, attr):
+                    try:
+                        setattr(b, attr, getattr(a, attr))
+                    except Exception:
+                        pass
+
+    for src_mod in src.modifiers:
+        try:
+            dst_mod = dst.modifiers.new(src_mod.type)
+        except Exception as exc:
+            log(f"Could not copy FCurve modifier {src_mod.type}: {exc}")
+            continue
+        for prop in src_mod.bl_rna.properties:
+            key = prop.identifier
+            if key in {"rna_type", "type"} or prop.is_readonly:
+                continue
+            try:
+                setattr(dst_mod, key, getattr(src_mod, key))
+            except Exception:
+                pass
+    dst.update()
+
+
+def collect_actions(armatures, maps):
+    sources = []
+    for arm in armatures:
+        ad = arm.animation_data
+        if not ad or not ad.action:
+            log(f"{arm.name}: no active action; skipped.")
+            continue
+        action, slot = ad.action, ad.action_slot
+        if slot is None:
+            log(f"{arm.name}: active action has no slot; skipped.")
+            continue
+        bag = anim_utils.action_get_channelbag_for_slot(action, slot)
+        if bag is None:
+            log(f"{arm.name}: no channelbag; skipped.")
+            continue
+        # Validate every path before any destructive changes.
+        non_bone = 0
+        for fc in bag.fcurves:
+            remap_bone_path(fc.data_path, maps[arm])
+            if not fc.data_path.startswith("pose.bones["):
+                non_bone += 1
+        if non_bone:
+            log(f"WARNING: {arm.name} has {non_bone} non-bone channel(s) "
+                "(object transform, custom props...). They are copied as-is "
+                "onto the surviving armature object.")
+        sources.append({
+            "mapping": maps[arm],
+            "curves": list(bag.fcurves),
+            "start": action.frame_start,
+            "end": action.frame_end,
+            "use_range": action.use_frame_range,
+        })
+    return sources
+
+
+def build_action(sources, survivor):
+    """Create/populate the action before joins so API errors are non-destructive."""
+    if not sources:
+        return None, None
+    action = bpy.data.actions.new(unique_name(bpy.data.actions, ACTION_NAME))
+    action.use_fake_user = True
+    try:
+        slot = action.slots.new(id_type='OBJECT', name=survivor.name)
+        bag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
+        starts, ends = [], []
+        for source in sources:
+            if source["use_range"]:
+                starts.append(source["start"])
+                ends.append(source["end"])
+            for fc in source["curves"]:
+                copy_fcurve(fc, bag, source["mapping"])
+        if starts:
+            action.use_frame_range = True
+            action.frame_start = min(starts)
+            action.frame_end = max(ends)
+        return action, slot
+    except Exception:
+        try:
+            action.use_fake_user = False
+            bpy.data.actions.remove(action)
+        except Exception:
+            pass
+        raise
+
+
+def warn_rig_state(armatures, survivor):
+    selected_ids = set(armatures)
+
+    for arm in armatures:
+        ad = arm.animation_data
+        if ad and len(ad.nla_tracks):
+            log(f"WARNING: {arm.name} has {len(ad.nla_tracks)} NLA track(s); "
+                "non-survivor NLA is not merged.")
+
+        if ad:
+            for driver in ad.drivers:
+                log(f"REVIEW: {arm.name} driver data_path="
+                    f'"{driver.data_path}" (verify after merge)')
+                for variable in driver.driver.variables:
+                    for target in variable.targets:
+                        target_id = target.id
+                        if target_id is not None and target_id in selected_ids:
+                            log(
+                                f"REVIEW: {arm.name} driver -> "
+                                f"{target_id.name}, "
+                                f'bone_target="{target.bone_target}", '
+                                f'data_path="{driver.data_path}" '
+                                "(cross-rig driver; verify after merge)"
+                            )
+
+        for pose_bone in arm.pose.bones:
+            if arm != survivor and not is_identity(pose_bone.matrix_basis):
+                log(f"WARNING: {arm.name}/{pose_bone.name} has non-identity "
+                    "pose transforms; verify after joining.")
+
+            for constraint in pose_bone.constraints:
+                subtarget = getattr(constraint, "subtarget", "")
+                target = getattr(constraint, "target", None)
+                if subtarget and target is not None and target in selected_ids:
+                    log(
+                        f"REVIEW: {arm.name}/{pose_bone.name} constraint "
+                        f'"{constraint.name}" target="{target.name}" '
+                        f'subtarget="{subtarget}" '
+                        "(verify the bone subtarget after merge)"
+                    )
+
+
+def validate():
+    if bpy.app.version < MIN_VERSION:
+        raise RuntimeError(
+            "Requires Blender %d.%d.%d or newer." % MIN_VERSION
+        )
+    if bpy.context.mode != 'OBJECT':
+        raise RuntimeError("Switch to Object Mode.")
+    selected = list(bpy.context.selected_objects)
+    arms = [o for o in selected if o.type == 'ARMATURE']
+    meshes = [o for o in selected if o.type == 'MESH']
+    if len(arms) < 2:
+        raise RuntimeError("Select at least two armature objects.")
+    ids = [a.data.as_pointer() for a in arms]
+    if len(ids) != len(set(ids)):
+        raise RuntimeError(
+            "Selected armature objects share armature data. Make data single-user "
+            "or deselect one of the offending objects."
+        )
+    active = bpy.context.view_layer.objects.active
+    survivor = active if active in arms else arms[0]
+    return arms, meshes, survivor
+
+
+def main():
+    created_action = None
+    try:
+        arms, meshes, survivor = validate()
+        log(f"Survivor: {survivor.name}")
+
+        mesh_rigs = {m: rig_for_mesh(m, arms) for m in meshes}
+        maps = {a: bone_mapping(a) for a in arms}
+        check_names(arms, maps)
+        mesh_world = {m: m.matrix_world.copy() for m in meshes}
+
+        active_obj = bpy.context.view_layer.objects.active
+        active_mesh = (active_obj if active_obj in meshes
+                       else (meshes[0] if meshes else None))
+
+        # Preflight all meshes before modifying the scene.
+        for mesh in meshes:
+            rig = mesh_rigs[mesh]
+            if rig is None:
+                raise RuntimeError(
+                    f'{mesh.name}: no selected rig detected. Deselect it or '
+                    "assign it to the correct selected armature."
+                )
+            validate_groups(mesh, maps[rig])
+            if mesh != active_mesh:
+                unsupported = [mod.name for mod in mesh.modifiers
+                               if mod.type != 'ARMATURE']
+                if unsupported:
+                    raise RuntimeError(
+                        f'{mesh.name}: non-active mesh has modifiers that Join '
+                        f"would discard: {', '.join(unsupported)}. Apply or "
+                        "resolve them before merging."
+                    )
+            keys = mesh.data.shape_keys
+            if keys and len(meshes) > 1:
+                log(f"WARNING: {mesh.name} has shape keys; Join only merges "
+                    "matching key layouts and the active mesh's Basis wins.")
+            if keys and keys.animation_data:
+                log(f"WARNING: {mesh.name} has shape-key animation/drivers; "
+                    "these are not merged by Join.")
+            for mod in mesh.modifiers:
+                if (mod.type == 'ARMATURE' and mod.object == rig
+                        and mod.use_bone_envelopes):
+                    log(f"WARNING: {mesh.name}/{mod.name} uses bone envelopes; "
+                        "the new modifier will use vertex groups only.")
+
+        mod_settings = {}
+        if active_mesh:
+            mod_settings = armature_mod_settings(active_mesh, mesh_rigs[active_mesh])
+        variants = {}
+        for mesh in meshes:
+            s = armature_mod_settings(mesh, mesh_rigs[mesh])
+            if s:
+                variants.setdefault(tuple(sorted(s.items())), []).append(mesh.name)
+        if len(variants) > 1:
+            log("WARNING: meshes have different Armature modifier settings "
+                "(Preserve Volume / Multi-Modifier); the merged mesh uses the "
+                f"active mesh's settings ({active_mesh.name}).")
+
+        action_sources = collect_actions(arms, maps)
+
+        # Create/populate the action before destructive joins.
+        created_action, combined_slot = build_action(action_sources, survivor)
+
+        # Warnings are captured while original objects and references still exist.
+        warn_rig_state(arms, survivor)
+
+        # Create an undo boundary immediately before the first scene mutation.
+        try:
+            bpy.ops.ed.undo_push(message="Safe Armature and Mesh Merge")
+        except Exception:
+            pass
+
+        # Detach meshes FIRST (preserving world transforms, removing only
+        # selected-rig Armature modifiers). With no parent/modifier link,
+        # renaming a bone cannot auto-rename vertex groups.
+        for mesh in meshes:
+            mesh.parent = None
+            mesh.matrix_world = mesh_world[mesh]
+            for mod in list(mesh.modifiers):
+                if mod.type == 'ARMATURE' and mod.object in arms:
+                    mesh.modifiers.remove(mod)
+
+        # Rename bones (preflight guarantees no collisions, so no ".001").
+        for arm in arms:
+            mapping = maps[arm]
+            for bone in arm.data.bones:
+                bone.name = mapping[bone.name]
+
+        # Rename vertex groups deterministically.
+        for mesh, rig in mesh_rigs.items():
+            rename_groups(mesh, maps[rig])
+
+        # Join meshes. Only the active mesh's modifiers survive, hence preflight.
+        joined_mesh = None
+        if meshes:
+            deselect_all()
+            for mesh in meshes:
+                mesh.select_set(True)
+            bpy.context.view_layer.objects.active = active_mesh
+            bpy.ops.object.join()
+            joined_mesh = active_mesh
+            joined_mesh.name = unique_name(
+                bpy.data.objects, survivor.name + "_JoinedMesh"
+            )
+
+        # Join armatures into the chosen survivor.
+        deselect_all()
+        for arm in arms:
+            arm.select_set(True)
+        bpy.context.view_layer.objects.active = survivor
+        bpy.ops.object.join()
+
+        survivor.name = unique_name(
+            bpy.data.objects, survivor.name + "_CombinedRig"
+        )
+        survivor.data.name = unique_name(
+            bpy.data.armatures, survivor.name + "_ArmatureData"
+        )
+
+        if created_action:
+            ad = survivor.animation_data or survivor.animation_data_create()
+            ad.action = created_action
+            ad.action_slot = combined_slot
+
+        if joined_mesh:
+            world = joined_mesh.matrix_world.copy()
+            joined_mesh.parent = survivor
+            joined_mesh.parent_type = 'OBJECT'
+            joined_mesh.parent_bone = ""
+            joined_mesh.matrix_world = world
+            mod = joined_mesh.modifiers.new("Combined Armature", 'ARMATURE')
+            mod.object = survivor
+            mod.use_vertex_groups = True
+            mod.use_bone_envelopes = False
+            for key, value in mod_settings.items():
+                try:
+                    setattr(mod, key, value)
+                except Exception:
+                    pass
+            move_modifier_first(joined_mesh, mod.name)
+
+        deselect_all()
+        survivor.select_set(True)
+        if joined_mesh:
+            joined_mesh.select_set(True)
+        bpy.context.view_layer.objects.active = survivor
+        if joined_mesh:
+            log("Merge completed. Thoroughly test deformation, animation, "
+                "constraints, drivers, NLA and custom rig controls before "
+                "production use.")
+        else:
+            log("Armature-only merge completed (no meshes selected). Test "
+                "animation, constraints, drivers and NLA before production use.")
+
+    except Exception as exc:
+        log("STOPPED: " + str(exc))
+        if created_action and created_action.name in bpy.data.actions:
+            try:
+                created_action.use_fake_user = False
+                if created_action.users == 0:
+                    bpy.data.actions.remove(created_action)
+            except Exception:
+                pass
+        log("If any scene changes occurred, use Ctrl+Z or reopen your backup.")
+        raise
+
+
+if __name__ == "__main__":
+    main()
