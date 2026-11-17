@@ -12,6 +12,14 @@ from bpy_extras import anim_utils
 #    other) no longer matched any bone and the rig/mesh broke. Now a bone is
 #    renamed only if its name is already used by the survivor or an earlier
 #    armature (a real clash, which Blender cannot keep anyway).
+#  - IDENTICAL RIGS (same bone names, same mesh): linked-duplicate mesh or
+#    armature data is made single-user right before the merge. Vertex-group
+#    names live on the mesh DATA, so renaming the second mesh's groups also
+#    renamed the first mesh's groups (shared data) and its weights broke.
+#    Clashing bones/groups of the second rig are renamed only at this point,
+#    then merged. The second rig's original actions are parked (fake user)
+#    before the rename so Blender cannot rewrite their bone paths.
+#  - After the merge every vertex group is checked against the bones.
 #  - Everything else from the previous version is unchanged (channelbag
 #    F-Curve creation, getattr for constraint.subtarget, tolerance identity
 #    check, 63-byte name check, meshes detached before bone renames, etc.).
@@ -283,6 +291,7 @@ def collect_actions(armatures, maps):
                 "(object transform, custom props...). They are copied as-is "
                 "onto the surviving armature object.")
         sources.append({
+            "arm": arm,
             "mapping": maps[arm],
             "curves": list(bag.fcurves),
             "start": action.frame_start,
@@ -364,6 +373,45 @@ def warn_rig_state(armatures, survivor):
                     )
 
 
+def make_single_user(arms, meshes):
+    """Vertex-group names are stored on the mesh data and bone names on the
+    armature data. With linked duplicates, renaming the second rig's groups or
+    bones would also rename the first rig's, so separate them first."""
+    for arm in arms:
+        if arm.data.users > 1:
+            log(f"{arm.name}: armature data is shared; making it single-user.")
+            arm.data = arm.data.copy()
+    for mesh in meshes:
+        if mesh.data.users > 1:
+            log(f"{mesh.name}: mesh data is shared; making it single-user.")
+            mesh.data = mesh.data.copy()
+
+
+def park_original_actions(sources):
+    """Keep the original actions (fake user) but unassign them, so Blender's
+    bone-rename path fixing cannot rewrite them. Their curves are already
+    copied into the combined action."""
+    for source in sources:
+        ad = source["arm"].animation_data
+        if ad and ad.action:
+            try:
+                ad.action.use_fake_user = True
+                ad.action = None
+            except Exception as exc:
+                log(f"Could not unassign action on {source['arm'].name}: {exc}")
+
+
+def verify_groups(mesh, rig):
+    bones = {b.name for b in rig.data.bones}
+    orphans = [g.name for g in mesh.vertex_groups if g.name not in bones]
+    if orphans:
+        log(f"WARNING: {len(orphans)} vertex group(s) on {mesh.name} match no "
+            "bone (fine for masks, a problem for weights): "
+            + ", ".join(orphans[:20]) + (" ..." if len(orphans) > 20 else ""))
+    else:
+        log(f"Weights check OK: every vertex group on {mesh.name} matches a bone.")
+
+
 def validate():
     if bpy.app.version < MIN_VERSION:
         raise RuntimeError(
@@ -378,10 +426,8 @@ def validate():
         raise RuntimeError("Select at least two armature objects.")
     ids = [a.data.as_pointer() for a in arms]
     if len(ids) != len(set(ids)):
-        raise RuntimeError(
-            "Selected armature objects share armature data. Make data single-user "
-            "or deselect one of the offending objects."
-        )
+        log("Selected armatures share armature data (linked duplicate). "
+            "It will be made single-user right before the merge.")
     active = bpy.context.view_layer.objects.active
     survivor = active if active in arms else arms[0]
     return arms, meshes, survivor
@@ -460,6 +506,10 @@ def main():
         except Exception:
             pass
 
+        # Identical/linked rigs: separate shared data, protect source actions.
+        make_single_user(arms, meshes)
+        park_original_actions(action_sources)
+
         # Detach meshes FIRST (preserving world transforms, removing only
         # selected-rig Armature modifiers). With no parent/modifier link,
         # renaming a bone cannot auto-rename vertex groups.
@@ -530,6 +580,7 @@ def main():
                 except Exception:
                     pass
             move_modifier_first(joined_mesh, mod.name)
+            verify_groups(joined_mesh, survivor)
 
         deselect_all()
         survivor.select_set(True)
