@@ -1,0 +1,865 @@
+bl_info = {
+    "name": "Safe Scale Normalizer",
+    "author": "Venkatesh Sanku",
+    "version": (3, 2, 0),
+    "blender": (5, 2, 0),
+    "location": "View3D > Sidebar > Scale Fix",
+    "description": "Safely detect and normalize negative object scales",
+    "category": "Object",
+}
+
+import bpy
+from mathutils import Matrix
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+EPS = 1.0e-7
+ZERO_EPS = 1.0e-4
+MATRIX_TOLERANCE = 1.0e-5
+
+SUPPORTED_TYPES = {
+    'MESH',
+    'CURVE',
+    'SURFACE',
+    'FONT',
+    'META',
+    'LATTICE',
+}
+
+ADDON_PREFIX = "[Safe Scale Normalizer]"
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+def log(message):
+    print(f"{ADDON_PREFIX} {message}")
+
+
+# ============================================================
+# SCALE UTILITIES
+# ============================================================
+
+def has_negative(values):
+    return any(float(v) < -EPS for v in values)
+
+
+def has_zero(values):
+    return any(abs(float(v)) <= ZERO_EPS for v in values)
+
+
+def is_identity_scale(values):
+    return all(abs(float(v) - 1.0) <= MATRIX_TOLERANCE for v in values)
+
+
+def scale_text(values):
+    return "(" + ", ".join(f"{float(v):.4f}" for v in values) + ")"
+
+
+def matrix_equal(a, b, tolerance=MATRIX_TOLERANCE):
+    for row in range(4):
+        for col in range(4):
+            if abs(a[row][col] - b[row][col]) > tolerance:
+                return False
+    return True
+
+
+def world_determinant(obj):
+    return obj.matrix_world.to_3x3().determinant()
+
+
+def negative_sources(obj):
+    result = []
+
+    if has_negative(obj.scale):
+        result.append("LOCAL")
+
+    if has_negative(obj.delta_scale):
+        result.append("DELTA")
+
+    parent = obj.parent
+    while parent:
+        if has_negative(parent.scale):
+            result.append(f"PARENT:{parent.name}")
+
+        if has_negative(parent.delta_scale):
+            result.append(f"PARENT_DELTA:{parent.name}")
+
+        parent = parent.parent
+
+    return result
+
+
+# ============================================================
+# HIERARCHY UTILITIES
+# ============================================================
+
+def collect_hierarchy(selected_objects):
+    """Collect selected objects, their ancestors and descendants."""
+
+    collected = set()
+    stack = list(selected_objects)
+
+    while stack:
+        obj = stack.pop()
+
+        if obj is None or obj in collected:
+            continue
+
+        collected.add(obj)
+
+        if obj.parent:
+            stack.append(obj.parent)
+
+        for child in obj.children:
+            stack.append(child)
+
+    def depth(obj):
+        result = 0
+        parent = obj.parent
+
+        while parent:
+            result += 1
+            parent = parent.parent
+
+        return result
+
+    return sorted(collected, key=depth)
+
+
+def is_bone_parented(obj):
+    return (
+        obj.parent is not None
+        and obj.parent_type == 'BONE'
+    )
+
+
+def has_mirrored_armature_ancestor(obj):
+    parent = obj.parent
+
+    while parent:
+        if parent.type == 'ARMATURE':
+            if (
+                has_negative(parent.scale)
+                or has_negative(parent.delta_scale)
+            ):
+                return parent
+
+        parent = parent.parent
+
+    return None
+
+
+def has_mirrored_ancestor(obj):
+    parent = obj.parent
+    depth = 0
+
+    while parent and depth < 256:
+        try:
+            if world_determinant(parent) < -EPS:
+                return parent
+            parent = parent.parent
+        except (ReferenceError, RuntimeError):
+            return None
+
+        depth += 1
+
+    return None
+
+
+# ============================================================
+# ANIMATION AND EDITABILITY CHECKS
+# ============================================================
+
+def animation_data_exists(id_block):
+    if id_block is None:
+        return False
+
+    try:
+        return id_block.animation_data is not None
+    except (AttributeError, ReferenceError):
+        return False
+
+
+def has_animation_or_drivers(obj):
+    if animation_data_exists(obj):
+        return True
+
+    if animation_data_exists(obj.data):
+        return True
+
+    if obj.type == 'MESH':
+        shape_keys = getattr(obj.data, "shape_keys", None)
+
+        if animation_data_exists(shape_keys):
+            return True
+
+    return False
+
+
+def object_is_editable(obj):
+    if obj.library is not None:
+        return False
+
+    if obj.override_library is not None:
+        return False
+
+    data = getattr(obj, "data", None)
+
+    if data is not None:
+        if data.library is not None:
+            return False
+
+        if data.override_library is not None:
+            return False
+
+    return True
+
+
+def has_constraints(obj):
+    return len(obj.constraints) > 0
+
+
+# ============================================================
+# CHILD STATE
+# ============================================================
+
+def capture_children(obj):
+    states = {}
+
+    for child in obj.children:
+        states[child] = {
+            "world": child.matrix_world.copy(),
+            "parent_inverse": child.matrix_parent_inverse.copy(),
+        }
+
+    return states
+
+
+def restore_children(states):
+    for child, state in states.items():
+        try:
+            child.matrix_parent_inverse = state["parent_inverse"]
+        except (ReferenceError, RuntimeError):
+            pass
+
+
+def verify_children(states):
+    """Verify child world transforms only.
+
+    Parent inverse is intentionally modified during compensation.
+    """
+    for child, state in states.items():
+        try:
+            current_world = child.matrix_world.copy()
+        except (ReferenceError, RuntimeError):
+            continue
+
+        if not matrix_equal(current_world, state["world"]):
+            raise RuntimeError(
+                f"Child world matrix changed: {child.name}"
+            )
+
+
+# ============================================================
+# OBJECT SNAPSHOT / ROLLBACK
+# ============================================================
+
+def capture_object_state(obj):
+    return {
+        "data": obj.data,
+        "matrix_basis": obj.matrix_basis.copy(),
+        "matrix_world": obj.matrix_world.copy(),
+        "scale": obj.scale.copy(),
+        "children": capture_children(obj),
+    }
+
+
+def restore_object_state(obj, snapshot, working_data=None):
+    try:
+        obj.data = snapshot["data"]
+        obj.matrix_basis = snapshot["matrix_basis"]
+    except (ReferenceError, RuntimeError, TypeError) as exc:
+        log(f"RESTORE WARNING: {exc}")
+
+    restore_children(snapshot["children"])
+
+    bpy.context.view_layer.update()
+
+    if working_data is not None:
+        try:
+            if working_data.users == 0:
+                bpy.data.batch_remove(ids=[working_data])
+        except (RuntimeError, TypeError) as exc:
+            log(f"ORPHAN CLEANUP WARNING: {exc}")
+
+
+# ============================================================
+# DATA BACKUP
+# ============================================================
+
+def create_working_data(obj):
+    """Create a private data copy before destructive operations."""
+
+    if obj.data is None:
+        return None, None, "Object has no data"
+
+    try:
+        original_data = obj.data
+        working_data = original_data.copy()
+        obj.data = working_data
+
+        return original_data, working_data, None
+
+    except Exception as exc:
+        return None, None, f"Data backup failed: {exc}"
+
+
+# ============================================================
+# EMPTY SCALE CORRECTION
+# ============================================================
+
+def apply_empty_scale(context, obj):
+    if not has_negative(obj.scale):
+        return False, "Empty has no negative local scale"
+
+    if has_zero(obj.scale):
+        return False, "Empty has zero or near-zero scale"
+
+    if not object_is_editable(obj):
+        return False, "Empty is linked or overridden"
+
+    if has_animation_or_drivers(obj):
+        return False, "Empty has animation or drivers"
+
+    if has_constraints(obj):
+        return False, "Empty has constraints"
+
+    # Parent animation or constraints can make compensation unsafe.
+    if obj.parent:
+        if has_animation_or_drivers(obj.parent):
+            return False, "Parent has animation or drivers"
+
+        if has_constraints(obj.parent):
+            return False, "Parent has constraints"
+
+    snapshot = capture_object_state(obj)
+    old_world = obj.matrix_world.copy()
+    child_states = snapshot["children"]
+
+    try:
+        obj.scale = (1.0, 1.0, 1.0)
+        context.view_layer.update()
+
+        new_world = obj.matrix_world.copy()
+
+        if abs(new_world.to_3x3().determinant()) <= ZERO_EPS:
+            raise RuntimeError(
+                "Empty or parent hierarchy has a singular transform"
+            )
+
+        compensation = new_world.inverted_safe() @ old_world
+
+        for child, state in child_states.items():
+            if child.parent_type == 'BONE':
+                raise RuntimeError(
+                    f"Bone-parented child is unsupported: {child.name}"
+                )
+
+            child.matrix_parent_inverse = (
+                compensation @ state["parent_inverse"]
+            )
+
+        context.view_layer.update()
+
+        # The Empty's own world matrix is intentionally allowed to change.
+        # Only its children must preserve their world transforms.
+        for child, state in child_states.items():
+            if not matrix_equal(child.matrix_world, state["world"]):
+                raise RuntimeError(
+                    f"Child world matrix changed: {child.name}"
+                )
+
+        log(f"EMPTY FIXED: {obj.name}")
+        return True, "Empty normalized"
+
+    except Exception as exc:
+        restore_object_state(obj, snapshot)
+        log(f"EMPTY ROLLBACK: {obj.name}: {exc}")
+        return False, str(exc)
+
+
+# ============================================================
+# MESH / DATA OBJECT SCALE CORRECTION
+# ============================================================
+
+def apply_local_scale(context, obj):
+    if obj.type == 'EMPTY':
+        return apply_empty_scale(context, obj)
+
+    if obj.type not in SUPPORTED_TYPES:
+        return False, "Unsupported object type"
+
+    if not has_negative(obj.scale):
+        return False, "No negative local scale"
+
+    if has_zero(obj.scale):
+        return False, "Zero or near-zero scale"
+
+    if is_bone_parented(obj):
+        return False, "Bone-parented object; manual correction required"
+
+    if not object_is_editable(obj):
+        return False, "Linked or overridden object/data"
+
+    if has_animation_or_drivers(obj):
+        return False, "Object or data has animation/drivers"
+
+    if has_constraints(obj):
+        return False, "Object has constraints"
+
+    ancestor = has_mirrored_ancestor(obj)
+
+    if ancestor:
+        return False, (
+            f"Mirrored ancestor: {ancestor.name}. "
+            "Correct or inspect the ancestor first."
+        )
+
+    # Avoid changing child relationships involving bone-parented objects.
+    for child in obj.children:
+        if child.parent_type == 'BONE':
+            return False, (
+                f"Bone-parented child requires manual handling: {child.name}"
+            )
+
+    snapshot = capture_object_state(obj)
+    original_world = snapshot["matrix_world"].copy()
+
+    original_data, working_data, error = create_working_data(obj)
+
+    if error:
+        return False, error
+
+    try:
+        # Apply only scale. Blender bakes the scale into the copied data.
+        with context.temp_override(
+            object=obj,
+            active_object=obj,
+            selected_objects=[obj],
+            selected_editable_objects=[obj],
+        ):
+            result = bpy.ops.object.transform_apply(
+                location=False,
+                rotation=False,
+                scale=True,
+            )
+
+        if 'FINISHED' not in result:
+            raise RuntimeError("Transform apply did not finish")
+
+        context.view_layer.update()
+
+        if has_negative(obj.scale) or not is_identity_scale(obj.scale):
+            raise RuntimeError("Scale was not normalized")
+
+        # The object's own world matrix is expected to change:
+        # its scale has been baked into the geometry.
+        new_world = obj.matrix_world.copy()
+
+        if abs(new_world.to_3x3().determinant()) <= ZERO_EPS:
+            raise RuntimeError("Resulting object transform is singular")
+
+        # Preserve child world transforms using parent inverse compensation.
+        compensation = new_world.inverted_safe() @ original_world
+
+        for child, state in snapshot["children"].items():
+            child.matrix_parent_inverse = (
+                compensation @ state["parent_inverse"]
+            )
+
+        context.view_layer.update()
+
+        verify_children(snapshot["children"])
+
+        det = world_determinant(obj)
+
+        if det < -EPS:
+            log(
+                f"WARNING: {obj.name} is still mirrored in world space "
+                "because of an ancestor or delta transform."
+            )
+
+        log(
+            f"FIXED: {obj.name} "
+            f"{scale_text(snapshot['scale'])} -> (1.0000, 1.0000, 1.0000)"
+        )
+
+        return True, "Scale normalized"
+
+    except Exception as exc:
+        restore_object_state(
+            obj,
+            snapshot,
+            working_data
+        )
+
+        log(f"CORRECTION ROLLBACK: {obj.name}: {exc}")
+        return False, str(exc)
+
+
+# ============================================================
+# HIERARCHY REPAIR
+# ============================================================
+
+def repair_hierarchy(context, objects):
+    fixed = 0
+    skipped = 0
+    failed = 0
+    unchanged = 0
+
+    for obj in objects:
+
+        # Armatures are deliberately protected.
+        if obj.type == 'ARMATURE':
+            if has_negative(obj.scale) or has_negative(obj.delta_scale):
+                log(
+                    f"PROTECTED ARMATURE: {obj.name} — "
+                    "manual rest-space correction required"
+                )
+                skipped += 1
+            else:
+                unchanged += 1
+
+            continue
+
+        local_neg = has_negative(obj.scale)
+        delta_neg = has_negative(obj.delta_scale)
+
+        if delta_neg:
+            log(
+                f"REVIEW DELTA: {obj.name} — "
+                "negative delta scale left unchanged"
+            )
+
+        if not local_neg:
+            unchanged += 1
+            continue
+
+        # Continue to correct eligible local scale.
+        success, message = apply_local_scale(context, obj)
+
+        if success:
+            fixed += 1
+        else:
+            skipped += 1
+            log(f"SKIPPED: {obj.name}: {message}")
+
+    return fixed, skipped, failed, unchanged
+
+
+# ============================================================
+# ANALYSIS
+# ============================================================
+
+def analyze_hierarchy(objects):
+    issues = 0
+
+    log("=" * 65)
+    log("SAFE SCALE NORMALIZER — ANALYSIS")
+    log("=" * 65)
+
+    for obj in objects:
+        sources = negative_sources(obj)
+        det = world_determinant(obj)
+
+        log(f"OBJECT: {obj.name}")
+        log(f"  TYPE: {obj.type}")
+        log(f"  LOCAL SCALE: {scale_text(obj.scale)}")
+        log(f"  DELTA SCALE: {scale_text(obj.delta_scale)}")
+        log(f"  WORLD DETERMINANT: {det:.6f}")
+
+        if sources:
+            issues += 1
+            log(f"  NEGATIVE SOURCES: {', '.join(sources)}")
+        else:
+            log("  STATUS: No detected negative scale")
+
+        if has_zero(obj.scale):
+            log("  WARNING: Zero or near-zero local scale")
+
+        if has_animation_or_drivers(obj):
+            log("  PROTECTION: Animation or drivers detected")
+
+        if has_constraints(obj):
+            log("  PROTECTION: Constraints detected")
+
+        if is_bone_parented(obj):
+            log("  PROTECTION: Bone-parented object")
+
+        if obj.type == 'ARMATURE':
+            log("  PROTECTION: Armature rest-space correction disabled")
+
+        log("-" * 50)
+
+    log(f"ANALYSIS COMPLETE — {issues} objects with negative scale detected")
+    return issues
+
+
+# ============================================================
+# VERIFICATION
+# ============================================================
+
+def verify_hierarchy(objects):
+    problems = 0
+
+    log("=" * 65)
+    log("SAFE SCALE NORMALIZER — VERIFICATION")
+    log("=" * 65)
+
+    for obj in objects:
+        local_negative = has_negative(obj.scale)
+        local_zero = has_zero(obj.scale)
+        delta_negative = has_negative(obj.delta_scale)
+        det = world_determinant(obj)
+
+        log(f"VERIFY: {obj.name}")
+
+        if local_negative:
+            log("  FAIL: Negative local scale remains")
+            problems += 1
+
+        elif local_zero:
+            log("  WARNING: Zero or near-zero local scale")
+            problems += 1
+
+        else:
+            log("  PASS: Local scale is non-negative")
+
+        if delta_negative:
+            log("  WARNING: Negative delta scale remains")
+
+        if det < -EPS:
+            log("  WARNING: World transform is still mirrored")
+            log("           Check ancestors and delta transforms")
+
+        elif abs(det) <= ZERO_EPS:
+            log("  WARNING: World transform is singular")
+            problems += 1
+
+        else:
+            log("  PASS: World determinant is positive")
+
+    log(f"VERIFICATION COMPLETE — {problems} remaining problems")
+    return problems
+
+
+# ============================================================
+# OPERATORS
+# ============================================================
+
+class SCALE_OT_analyze(bpy.types.Operator):
+    bl_idname = "scale_normalizer.analyze"
+    bl_label = "Analyze Hierarchy"
+    bl_description = "Analyze selected objects and their hierarchy"
+
+    def execute(self, context):
+        selected = list(context.selected_objects)
+
+        if not selected:
+            self.report({'WARNING'}, "Select at least one object")
+            return {'CANCELLED'}
+
+        objects = collect_hierarchy(selected)
+        issues = analyze_hierarchy(objects)
+
+        self.report(
+            {'INFO'},
+            f"Analysis complete: {issues} objects with negative scale"
+        )
+
+        return {'FINISHED'}
+
+
+class SCALE_OT_fix_mesh(bpy.types.Operator):
+    bl_idname = "scale_normalizer.fix_mesh"
+    bl_label = "Fix Mesh Hierarchy"
+    bl_description = "Safely normalize eligible negative scales"
+
+    def execute(self, context):
+        if context.mode != 'OBJECT':
+            self.report(
+                {'ERROR'},
+                "Switch to Object Mode first"
+            )
+            return {'CANCELLED'}
+
+        selected = list(context.selected_objects)
+
+        if not selected:
+            self.report({'WARNING'}, "Select at least one object")
+            return {'CANCELLED'}
+
+        objects = collect_hierarchy(selected)
+
+        fixed, skipped, failed, unchanged = repair_hierarchy(
+            context, objects
+        )
+
+        self.report(
+            {'INFO'},
+            (
+                f"Fixed: {fixed}, Skipped: {skipped}, "
+                f"Failed: {failed}, Unchanged: {unchanged}. "
+                "See system console for details."
+            )
+        )
+
+        return {'FINISHED'}
+
+
+class SCALE_OT_fix_armature(bpy.types.Operator):
+    bl_idname = "scale_normalizer.fix_armature"
+    bl_label = "Inspect Armature Hierarchy"
+    bl_description = (
+        "Inspect armature and descendants; armature rest-space "
+        "transforms are protected"
+    )
+
+    def execute(self, context):
+        selected = list(context.selected_objects)
+
+        armatures = [
+            obj for obj in selected
+            if obj.type == 'ARMATURE'
+        ]
+
+        if not armatures:
+            self.report({'WARNING'}, "Select an armature")
+            return {'CANCELLED'}
+
+        objects = collect_hierarchy(armatures)
+
+        analyze_hierarchy(objects)
+
+        protected = sum(
+            1 for obj in objects
+            if obj.type == 'ARMATURE'
+        )
+
+        self.report(
+            {'INFO'},
+            (
+                f"Inspected {len(objects)} objects. "
+                f"{protected} armature(s) protected. "
+                "See system console."
+            )
+        )
+
+        return {'FINISHED'}
+
+
+class SCALE_OT_verify(bpy.types.Operator):
+    bl_idname = "scale_normalizer.verify"
+    bl_label = "Verify Hierarchy"
+    bl_description = "Verify local and world scale status"
+
+    def execute(self, context):
+        selected = list(context.selected_objects)
+
+        if not selected:
+            self.report({'WARNING'}, "Select at least one object")
+            return {'CANCELLED'}
+
+        objects = collect_hierarchy(selected)
+        problems = verify_hierarchy(objects)
+
+        if problems:
+            self.report(
+                {'WARNING'},
+                f"Verification found {problems} problem(s)"
+            )
+        else:
+            self.report({'INFO'}, "Verification complete")
+
+        return {'FINISHED'}
+
+
+# ============================================================
+# UI PANEL
+# ============================================================
+
+class SCALE_PT_normalizer(bpy.types.Panel):
+    bl_label = "Safe Scale Normalizer"
+    bl_idname = "SCALE_PT_normalizer"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Scale Fix"
+
+    def draw(self, context):
+        layout = self.layout
+
+        layout.label(text="Hierarchy Tools", icon='OUTLINER')
+
+        col = layout.column(align=True)
+        col.operator(
+            "scale_normalizer.analyze",
+            icon='VIEWZOOM'
+        )
+        col.operator(
+            "scale_normalizer.fix_mesh",
+            icon='CHECKMARK'
+        )
+        col.operator(
+            "scale_normalizer.fix_armature",
+            icon='ARMATURE_DATA'
+        )
+        col.operator(
+            "scale_normalizer.verify",
+            icon='FILE_TICK'
+        )
+
+        layout.separator()
+
+        layout.label(text="Safety Information", icon='INFO')
+        layout.label(text="Armatures are protected.")
+        layout.label(text="Animated objects are skipped.")
+        layout.label(text="Original data is backed up.")
+        layout.label(text="Check the system console for logs.")
+
+
+# ============================================================
+# REGISTRATION
+# ============================================================
+
+CLASSES = (
+    SCALE_OT_analyze,
+    SCALE_OT_fix_mesh,
+    SCALE_OT_fix_armature,
+    SCALE_OT_verify,
+    SCALE_PT_normalizer,
+)
+
+
+def register():
+    for cls in CLASSES:
+        try:
+            bpy.utils.register_class(cls)
+        except (ValueError, RuntimeError) as exc:
+            log(f"Registration warning: {cls.__name__}: {exc}")
+
+
+def unregister():
+    for cls in reversed(CLASSES):
+        try:
+            bpy.utils.unregister_class(cls)
+        except (ValueError, RuntimeError):
+            pass
+
+
+if __name__ == "__main__":
+    register()
