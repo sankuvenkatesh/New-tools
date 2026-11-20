@@ -1,0 +1,956 @@
+bl_info = {
+    "name": "Armature Transform Apply Pro",
+    "author": "OpenAI",
+    "version": (1, 0, 3),
+    "blender": (5, 2, 0),
+    "location": "3D Viewport > Sidebar > Animation > Armature Transform Apply Pro",
+    "description": "Apply armature object transforms with verified animation preservation",
+    "category": "Animation",
+}
+
+import bpy
+import json
+import math
+import uuid
+from bpy.props import BoolProperty, IntProperty, PointerProperty
+
+BACKUP_DATA_KEY    = "_atap_backup_data"
+BACKUP_ACTION_KEY  = "_atap_backup_action"
+BACKUP_SLOT_KEY    = "_atap_backup_slot"
+BACKUP_STATE_KEY   = "_atap_backup_state"
+BACKUP_ID_KEY      = "_atap_backup_id"
+BACKUP_VERSION_KEY = "_atap_backup_version"
+BACKUP_VERSION     = 3
+
+BACKUP_PROP_KEYS = (
+    BACKUP_DATA_KEY, BACKUP_ACTION_KEY, BACKUP_SLOT_KEY,
+    BACKUP_STATE_KEY, BACKUP_ID_KEY, BACKUP_VERSION_KEY,
+)
+
+TRANSFORM_PATHS = {
+    "location", "scale",
+    "rotation_euler", "rotation_quaternion", "rotation_axis_angle",
+}
+
+BONE_VERIFY_EPSILON = 1e-4
+MAX_VERIFY_FRAMES   = 4000
+
+
+# ---------------------------------------------------------------------------
+# Slot helpers (legacy vs layered actions handled explicitly)
+# ---------------------------------------------------------------------------
+
+def _slot_identifier(slot):
+    return getattr(slot, "identifier", "") if slot else ""
+
+
+def _find_slot(action, identifier):
+    slots = getattr(action, "slots", None)
+    if slots is None or len(slots) == 0:
+        return None
+    if identifier:
+        for slot in slots:
+            if _slot_identifier(slot) == identifier:
+                return slot
+        return None
+    if len(slots) == 1:
+        return slots[0]
+    return None
+
+
+def _assign_action_slot(anim_data, action, slot_identifier=""):
+    """Restore an Action + Slot with explicit legacy/layered handling."""
+    anim_data.action = action
+    if not hasattr(anim_data, "action_slot"):
+        return
+    if action is None:
+        anim_data.action_slot = None
+        return
+
+    slots = getattr(action, "slots", None)
+    has_slots = slots is not None and len(slots) > 0
+
+    if not has_slots:
+        # Legacy (pre-4.4) or slotless action — no slot assignment needed.
+        try:
+            anim_data.action_slot = None
+        except Exception:
+            pass
+        return
+
+    slot = _find_slot(action, slot_identifier)
+    if slot is None:
+        if slot_identifier:
+            raise RuntimeError(
+                f"Action Slot '{slot_identifier}' not found on '{action.name}'. "
+                "Refusing to guess."
+            )
+        raise RuntimeError(
+            f"Action '{action.name}' has {len(slots)} slots but no identifier "
+            "was recorded. Cannot safely restore."
+        )
+    anim_data.action_slot = slot
+
+
+# ---------------------------------------------------------------------------
+# F-Curve iterators
+# ---------------------------------------------------------------------------
+
+def _iter_fcurves(action, slot):
+    if action is None:
+        return
+    layers = getattr(action, "layers", None)
+    if layers:
+        if slot is None:
+            return
+        for layer in layers:
+            for strip in layer.strips:
+                try:
+                    bag = strip.channelbag(slot)
+                except (AttributeError, TypeError, RuntimeError):
+                    bag = None
+                if bag is None:
+                    continue
+                for fc in getattr(bag, "fcurves", None) or ():
+                    yield fc
+        return
+    for fc in getattr(action, "fcurves", None) or ():
+        yield fc
+
+
+def _iter_all_fcurves(action):
+    if action is None:
+        return
+    layers = getattr(action, "layers", None)
+    if layers:
+        for layer in layers:
+            for strip in layer.strips:
+                for slot in getattr(action, "slots", None) or ():
+                    try:
+                        bag = strip.channelbag(slot)
+                    except (AttributeError, TypeError, RuntimeError):
+                        bag = None
+                    if bag is None:
+                        continue
+                    for fc in getattr(bag, "fcurves", None) or ():
+                        yield fc
+        return
+    for fc in getattr(action, "fcurves", None) or ():
+        yield fc
+
+
+# ---------------------------------------------------------------------------
+# Guardrails
+# ---------------------------------------------------------------------------
+
+def _object_transform_animation_issues(obj):
+    issues = []
+
+    if obj.parent is not None:
+        issues.append("Object has a parent; parent-space compensation is not implemented.")
+    if len(obj.constraints):
+        issues.append("Object has constraints; evaluated transform may differ from its channels.")
+
+    if obj.data is not None:
+        shared = sum(1 for o in bpy.data.objects if o.data is obj.data) - 1
+        if shared > 0:
+            issues.append(
+                f"Armature data is shared with {shared} other object(s); "
+                "applying will detach this object from the shared data."
+            )
+
+    anim_data = obj.animation_data
+    if anim_data is None:
+        return issues
+
+    for driver in getattr(anim_data, "drivers", ()) or ():
+        if driver.data_path in TRANSFORM_PATHS or driver.data_path.startswith("rotation_"):
+            issues.append("Object has a driver on a transform channel.")
+            break
+
+    action = anim_data.action
+    if action is not None:
+        slot = getattr(anim_data, "action_slot", None)
+        iterator = _iter_fcurves(action, slot) if slot is not None else _iter_all_fcurves(action)
+        for fc in iterator:
+            if fc.data_path in TRANSFORM_PATHS:
+                issues.append(
+                    f"Active Action animates object-level '{fc.data_path}'. "
+                    "Bake or remove object transform animation first."
+                )
+                break
+
+    for track in getattr(anim_data, "nla_tracks", ()) or ():
+        for strip in getattr(track, "strips", ()) or ():
+            nla_action = getattr(strip, "action", None)
+            if nla_action is None:
+                continue
+            found = False
+            for fc in _iter_all_fcurves(nla_action):
+                if fc.data_path in TRANSFORM_PATHS:
+                    issues.append(
+                        f"NLA track '{track.name}' animates object-level '{fc.data_path}'."
+                    )
+                    found = True
+                    break
+            if found:
+                break
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Transform helpers
+# ---------------------------------------------------------------------------
+
+def _has_nonzero_transform(obj, epsilon=1e-7):
+    loc_ok = all(abs(v) <= epsilon for v in obj.location)
+    scale_ok = all(abs(v - 1.0) <= epsilon for v in obj.scale)
+
+    if obj.rotation_mode == 'QUATERNION':
+        q = obj.rotation_quaternion
+        rot_ok = (
+            abs(q.x) <= epsilon and abs(q.y) <= epsilon and abs(q.z) <= epsilon
+            and (abs(q.w - 1.0) <= epsilon or abs(q.w + 1.0) <= epsilon)
+        )
+    elif obj.rotation_mode == 'AXIS_ANGLE':
+        angle = obj.rotation_axis_angle[0]
+        rot_ok = abs(math.remainder(angle, 2 * math.pi)) <= epsilon
+    else:
+        rot_ok = all(
+            abs(math.remainder(v, 2 * math.pi)) <= epsilon
+            for v in obj.rotation_euler
+        )
+    return not (loc_ok and scale_ok and rot_ok)
+
+
+def _serialize_state(obj):
+    return {
+        "location": list(obj.location),
+        "scale": list(obj.scale),
+        "rotation_mode": obj.rotation_mode,
+        "rotation_euler": list(obj.rotation_euler),
+        "rotation_quaternion": list(obj.rotation_quaternion),
+        "rotation_axis_angle": list(obj.rotation_axis_angle),
+        "data_use_fake_user": bool(obj.data.use_fake_user) if obj.data else False,
+    }
+
+
+def _restore_rotation_and_transform(obj, state):
+    obj.rotation_mode = state.get("rotation_mode", 'XYZ')
+    obj.location = state.get("location", (0.0, 0.0, 0.0))
+    obj.scale = state.get("scale", (1.0, 1.0, 1.0))
+    if obj.rotation_mode == 'QUATERNION':
+        obj.rotation_quaternion = state.get("rotation_quaternion", (1.0, 0.0, 0.0, 0.0))
+    elif obj.rotation_mode == 'AXIS_ANGLE':
+        obj.rotation_axis_angle = state.get("rotation_axis_angle", (0.0, 0.0, 1.0, 0.0))
+    else:
+        obj.rotation_euler = state.get("rotation_euler", (0.0, 0.0, 0.0))
+
+
+# ---------------------------------------------------------------------------
+# World-space bone verification (Issues 1 & 2)
+# ---------------------------------------------------------------------------
+
+def _world_matrix(obj, pose_bone):
+    """True world-space matrix, not armature-object-space."""
+    return obj.matrix_world @ pose_bone.matrix
+
+
+def _compute_verification_frames(scene, anim_data, subframe_samples):
+    """Every integer frame in the evaluated animation range, plus optional subframes."""
+    values = set()
+
+    if anim_data is not None:
+        action = anim_data.action
+        if action is not None:
+            try:
+                s, e = action.frame_range
+                for f in range(int(math.floor(s)), int(math.ceil(e)) + 1):
+                    values.add(float(f))
+            except Exception:
+                pass
+
+        for track in getattr(anim_data, "nla_tracks", ()) or ():
+            if getattr(track, "mute", False):
+                continue
+            for strip in getattr(track, "strips", ()) or ():
+                if getattr(strip, "mute", False):
+                    continue
+                try:
+                    s = int(math.floor(strip.frame_start))
+                    e = int(math.ceil(strip.frame_end))
+                    for f in range(s, e + 1):
+                        values.add(float(f))
+                except Exception:
+                    pass
+
+    if not values:
+        values.add(float(scene.frame_current))
+
+    if subframe_samples > 0:
+        extra = set()
+        sorted_v = sorted(values)
+        for i in range(len(sorted_v) - 1):
+            a, b = sorted_v[i], sorted_v[i + 1]
+            if b - a == 1.0:
+                for k in range(1, subframe_samples + 1):
+                    extra.add(a + k / (subframe_samples + 1))
+        values |= extra
+
+    return sorted(values)
+
+
+def _sample_bone_world_matrices(obj, scene, frame_values):
+    if obj.pose is None or not obj.pose.bones:
+        return {}
+
+    old_frame = scene.frame_current
+    old_subframe = scene.frame_subframe
+    result = {}
+
+    try:
+        for fv in frame_values:
+            fi = int(math.floor(fv))
+            sf = fv - fi
+            scene.frame_set(fi, subframe=sf)
+            bpy.context.view_layer.update()
+            for pb in obj.pose.bones:
+                result[(pb.name, fv)] = _world_matrix(obj, pb).copy()
+    finally:
+        scene.frame_set(old_frame, subframe=old_subframe)
+        bpy.context.view_layer.update()
+
+    return result
+
+
+def _compare_bone_matrices(before, after, epsilon=BONE_VERIFY_EPSILON):
+    issues = []
+    for key, mb in before.items():
+        ma = after.get(key)
+        if ma is None:
+            issues.append(f"{key[0]} @ frame {key[1]:.3f}: missing after apply")
+            continue
+        max_diff = max(abs(mb[i][j] - ma[i][j]) for i in range(4) for j in range(4))
+        if max_diff > epsilon:
+            issues.append(f"{key[0]} @ frame {key[1]:.3f}: max diff {max_diff:.2e}")
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Backup helpers (UUID-based, rename-safe)
+# ---------------------------------------------------------------------------
+
+def _unique_name(collection, base):
+    name, index = base, 1
+    while collection.get(name) is not None:
+        name = f"{base}.{index:03d}"
+        index += 1
+    return name
+
+
+def _backup_exists(obj):
+    return bool(obj.get(BACKUP_DATA_KEY))
+
+
+def _remove_if_unused(datablock):
+    if datablock is None:
+        return
+    if datablock.users > 0 or datablock.use_fake_user:
+        return
+    try:
+        if isinstance(datablock, bpy.types.Armature):
+            bpy.data.armatures.remove(datablock)
+        elif isinstance(datablock, bpy.types.Action):
+            bpy.data.actions.remove(datablock)
+    except (ReferenceError, RuntimeError):
+        pass
+
+
+def _clear_backup_properties(obj):
+    for key in BACKUP_PROP_KEYS:
+        if key in obj:
+            del obj[key]
+
+
+def _find_backup_data(obj):
+    """Locate the tagged backup datablock by UUID (name-independent)."""
+    backup_id = obj.get(BACKUP_ID_KEY)
+    if not backup_id:
+        return None
+    for arm in bpy.data.armatures:
+        if arm.get(BACKUP_ID_KEY) == backup_id:
+            return arm
+    return None
+
+
+def _find_backup_action(obj):
+    """Locate the original Action reference (may be None)."""
+    name = obj.get(BACKUP_ACTION_KEY, "")
+    if not name:
+        return None
+    return bpy.data.actions.get(name)
+
+
+def _make_backup(obj):
+    """Tag the original datablock as backup; keep it alive with fake user."""
+    if _backup_exists(obj):
+        raise RuntimeError("A backup already exists. Restore or forget it first.")
+
+    original_data = obj.data
+    if original_data is None:
+        raise RuntimeError("Armature object has no data.")
+
+    backup_id = str(uuid.uuid4())
+    original_fake_user = original_data.use_fake_user
+
+    try:
+        original_data.use_fake_user = True
+        original_data[BACKUP_ID_KEY] = backup_id
+
+        anim = obj.animation_data
+        original_action = anim.action if anim else None
+        slot = getattr(anim, "action_slot", None) if anim else None
+        slot_id = _slot_identifier(slot)
+
+        state_json = json.dumps(_serialize_state(obj))
+
+        obj[BACKUP_DATA_KEY] = original_data.name
+        obj[BACKUP_ACTION_KEY] = original_action.name if original_action else ""
+        obj[BACKUP_SLOT_KEY] = slot_id
+        obj[BACKUP_STATE_KEY] = state_json
+        obj[BACKUP_ID_KEY] = backup_id
+        obj[BACKUP_VERSION_KEY] = BACKUP_VERSION
+
+        return original_data, backup_id, slot_id
+    except Exception:
+        # Roll back tagging on failure.
+        original_data.use_fake_user = original_fake_user
+        if BACKUP_ID_KEY in original_data:
+            del original_data[BACKUP_ID_KEY]
+        _clear_backup_properties(obj)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Transaction snapshot (Issues 3 & 4)
+# ---------------------------------------------------------------------------
+
+class _ApplyTransaction:
+    """Full pre-mutation snapshot; rollback() restores everything."""
+
+    def __init__(self, context, obj):
+        self.obj = obj
+        self.context = context
+        self.previous_active = context.view_layer.objects.active
+        self.previous_selected = list(context.selected_objects)
+        self.previous_mode = obj.mode
+        self.previous_data = obj.data
+        self.previous_state = _serialize_state(obj)
+
+        anim = obj.animation_data
+        self.previous_action = anim.action if anim else None
+        self.previous_slot_id = _slot_identifier(
+            getattr(anim, "action_slot", None) if anim else None
+        )
+
+        # Record whether the previous data had any backup-ID tag we must remove.
+        self.previous_backup_tag = (
+            self.previous_data.get(BACKUP_ID_KEY)
+            if self.previous_data is not None else None
+        )
+
+    def _restore_context(self):
+        context = self.context
+        obj = self.obj
+        try:
+            if obj.mode != self.previous_mode and self.previous_mode in {'OBJECT', 'POSE'}:
+                bpy.ops.object.mode_set(mode=self.previous_mode)
+        except Exception:
+            pass
+        try:
+            for sel in context.selected_objects:
+                sel.select_set(False)
+        except Exception:
+            pass
+        for sel in self.previous_selected:
+            try:
+                sel.select_set(True)
+            except ReferenceError:
+                pass
+        if self.previous_active is not None:
+            try:
+                context.view_layer.objects.active = self.previous_active
+            except Exception:
+                pass
+
+    def commit_context(self):
+        """Restore selection/active after a successful apply (mode already handled)."""
+        try:
+            for sel in self.context.selected_objects:
+                sel.select_set(False)
+        except Exception:
+            pass
+        for sel in self.previous_selected:
+            try:
+                sel.select_set(True)
+            except ReferenceError:
+                pass
+        if self.previous_active is not None:
+            try:
+                self.context.view_layer.objects.active = self.previous_active
+            except Exception:
+                pass
+
+    def rollback(self):
+        obj = self.obj
+        # 1. Restore data reference.
+        try:
+            if self.previous_data is not None:
+                obj.data = self.previous_data
+        except Exception:
+            pass
+
+        # 2. Restore fake-user and backup tag unconditionally from state.
+        try:
+            pd = self.previous_data
+            if pd is not None:
+                pd.use_fake_user = bool(self.previous_state.get("data_use_fake_user", False))
+                if self.previous_backup_tag is None:
+                    if BACKUP_ID_KEY in pd:
+                        del pd[BACKUP_ID_KEY]
+                else:
+                    pd[BACKUP_ID_KEY] = self.previous_backup_tag
+        except Exception:
+            pass
+
+        # 3. Restore transform.
+        try:
+            _restore_rotation_and_transform(obj, self.previous_state)
+        except Exception:
+            pass
+
+        # 4. Restore action + slot.
+        try:
+            if obj.animation_data is None:
+                obj.animation_data_create()
+            _assign_action_slot(
+                obj.animation_data, self.previous_action, self.previous_slot_id
+            )
+        except Exception:
+            pass
+
+        # 5. Clear backup props on object.
+        _clear_backup_properties(obj)
+
+        # 6. Restore mode + selection + active.
+        self._restore_context()
+
+
+# ---------------------------------------------------------------------------
+# Properties
+# ---------------------------------------------------------------------------
+
+class ATAP_PG_Settings(bpy.types.PropertyGroup):
+    apply_location: BoolProperty(name="Location", default=True)
+    apply_rotation: BoolProperty(name="Rotation", default=True)
+    apply_scale:    BoolProperty(name="Scale",    default=True)
+
+    confirm_guardrails: BoolProperty(
+        name="Use Safety Checks",
+        description="Reject parented, constrained, or object-transform-animated armatures",
+        default=True,
+    )
+    verify_bones: BoolProperty(
+        name="Verify Bone World Transforms",
+        description=(
+            "Sample every frame of pose-bone world matrices before/after apply. "
+            "Rollback if any matrix changes beyond tolerance. "
+            "Without this, FINISHED means only that transform_apply ran — "
+            "animation preservation is NOT guaranteed."
+        ),
+        default=True,
+    )
+    subframe_samples: IntProperty(
+        name="Subframe Samples",
+        description=(
+            "Extra samples between integer frames (0 = integer frames only). "
+            "Higher values catch sub-frame animation changes at the cost of speed."
+        ),
+        default=0, min=0, max=10,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Apply operator
+# ---------------------------------------------------------------------------
+
+class ATAP_OT_Apply(bpy.types.Operator):
+    bl_idname = "atap.apply_transforms"
+    bl_label = "Apply Armature Transforms"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.object is not None
+            and context.object.type == 'ARMATURE'
+            and context.mode in {'OBJECT', 'POSE'}
+        )
+
+    def execute(self, context):
+        obj = context.object
+        scene = context.scene
+        settings = scene.atap_settings
+
+        if context.mode not in {'OBJECT', 'POSE'}:
+            self.report({'ERROR'}, "Use Object Mode or Pose Mode.")
+            return {'CANCELLED'}
+        if not any((settings.apply_location, settings.apply_rotation, settings.apply_scale)):
+            self.report({'ERROR'}, "Enable at least one transform component.")
+            return {'CANCELLED'}
+        if _backup_exists(obj):
+            self.report({'ERROR'}, "A backup already exists. Restore or forget it first.")
+            return {'CANCELLED'}
+
+        if settings.confirm_guardrails:
+            issues = _object_transform_animation_issues(obj)
+            if issues:
+                self.report({'ERROR'}, issues[0])
+                print("[ATAP] Safety checks failed:")
+                for issue in issues:
+                    print(" - " + issue)
+                return {'CANCELLED'}
+        else:
+            print("[ATAP] WARNING: Guardrails disabled — applying without safety checks.")
+
+        if not _has_nonzero_transform(obj):
+            self.report({'INFO'}, "Armature object transforms are already identity.")
+            return {'CANCELLED'}
+
+        tx = _ApplyTransaction(context, obj)
+
+        verification_frames = None
+        before_bones = None
+        working_data = None
+
+        try:
+            # ---- Pre-apply verification sampling (world-space) ----
+            if settings.verify_bones and obj.pose is not None:
+                verification_frames = _compute_verification_frames(
+                    scene, obj.animation_data, settings.subframe_samples
+                )
+                if len(verification_frames) > MAX_VERIFY_FRAMES:
+                    raise RuntimeError(
+                        f"Verification would need {len(verification_frames)} samples, "
+                        f"exceeds limit {MAX_VERIFY_FRAMES}. Reduce range or disable verification."
+                    )
+                before_bones = _sample_bone_world_matrices(
+                    obj, scene, verification_frames
+                )
+
+            # ---- Backup + working copy ----
+            original_data, _backup_id, _slot_id = _make_backup(obj)
+            working_data = original_data.copy()
+            working_data.name = _unique_name(
+                bpy.data.armatures, obj.data.name + "_ATAP_APPLIED"
+            )
+            obj.data = working_data
+
+            # ---- Isolate for transform_apply ----
+            if context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            for sel in context.selected_objects:
+                sel.select_set(False)
+            obj.select_set(True)
+            context.view_layer.objects.active = obj
+
+            result = bpy.ops.object.transform_apply(
+                location=settings.apply_location,
+                rotation=settings.apply_rotation,
+                scale=settings.apply_scale,
+            )
+            if 'FINISHED' not in result:
+                raise RuntimeError("Blender transform_apply did not finish.")
+
+            # ---- Post-apply verification (world-space, every frame) ----
+            verified_frames = 0
+            if before_bones is not None:
+                after_bones = _sample_bone_world_matrices(
+                    obj, scene, verification_frames
+                )
+                issues = _compare_bone_matrices(before_bones, after_bones)
+                if issues:
+                    raise RuntimeError(
+                        f"Bone world transform mismatch ({len(issues)} of "
+                        f"{len(before_bones)} samples). Example: {issues[0]}"
+                    )
+                verified_frames = len(verification_frames)
+
+            # ---- Success: restore mode, then selection/active ----
+            if tx.previous_mode == 'POSE' and obj.mode != 'POSE':
+                bpy.ops.object.mode_set(mode='POSE')
+            context.view_layer.update()
+            tx.commit_context()
+
+            # ---- Report with honest verification scope ----
+            if before_bones is not None:
+                bone_count = len(obj.pose.bones) if obj.pose else 0
+                total = verified_frames * bone_count
+                self.report(
+                    {'INFO'},
+                    f"Applied. Verified {verified_frames} frames × {bone_count} bones "
+                    f"({total} world matrices) within tolerance {BONE_VERIFY_EPSILON:g}."
+                )
+            else:
+                self.report(
+                    {'WARNING'},
+                    "Applied WITHOUT verification. "
+                    "Animation preservation is NOT guaranteed. "
+                    "Enable 'Verify Bone World Transforms' next time."
+                )
+            return {'FINISHED'}
+
+        except Exception as exc:
+            tx.rollback()
+            if working_data is not None and working_data != tx.previous_data:
+                _remove_if_unused(working_data)
+            self.report({'ERROR'}, f"Apply failed; rolled back: {exc}")
+            return {'CANCELLED'}
+
+
+# ---------------------------------------------------------------------------
+# Restore operator (atomic)
+# ---------------------------------------------------------------------------
+
+class ATAP_OT_Restore(bpy.types.Operator):
+    bl_idname = "atap.restore_backup"
+    bl_label = "Restore Original"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == 'ARMATURE'
+
+    def execute(self, context):
+        obj = context.object
+
+        data_name = obj.get(BACKUP_DATA_KEY)
+        state_json = obj.get(BACKUP_STATE_KEY)
+        version = obj.get(BACKUP_VERSION_KEY)
+
+        if not data_name or not state_json:
+            self.report({'WARNING'}, "No valid backup found on this armature.")
+            return {'CANCELLED'}
+        if version != BACKUP_VERSION:
+            self.report(
+                {'ERROR'},
+                f"Backup version mismatch (have {version!r}, expected {BACKUP_VERSION}). "
+                "Refusing to restore unsafely."
+            )
+            return {'CANCELLED'}
+
+        backup_data = _find_backup_data(obj)
+        if backup_data is None:
+            self.report(
+                {'ERROR'},
+                "Backup Armature datablock not found (by UUID tag or name)."
+            )
+            return {'CANCELLED'}
+
+        backup_action = _find_backup_action(obj)
+        if obj.get(BACKUP_ACTION_KEY) and backup_action is None:
+            self.report({'ERROR'}, "Original Action datablock is missing.")
+            return {'CANCELLED'}
+
+        # Snapshot for rollback.
+        old_data = obj.data
+        old_state = _serialize_state(obj)
+        old_anim = obj.animation_data
+        old_action = old_anim.action if old_anim else None
+        old_slot_id = _slot_identifier(
+            getattr(old_anim, "action_slot", None) if old_anim else None
+        )
+        old_backup_props = {k: obj[k] for k in BACKUP_PROP_KEYS if k in obj}
+
+        try:
+            state = json.loads(state_json)
+
+            obj.data = backup_data
+            backup_data.use_fake_user = bool(state.get("data_use_fake_user", False))
+            # Remove the backup UUID tag now that it's no longer a backup.
+            if BACKUP_ID_KEY in backup_data:
+                del backup_data[BACKUP_ID_KEY]
+
+            if obj.animation_data is None:
+                obj.animation_data_create()
+            _assign_action_slot(
+                obj.animation_data, backup_action, obj.get(BACKUP_SLOT_KEY, "")
+            )
+
+            _restore_rotation_and_transform(obj, state)
+            context.view_layer.update()
+
+            # Only now is restoration complete — clear backup props atomically.
+            _clear_backup_properties(obj)
+
+            if old_data is not None and old_data != backup_data:
+                _remove_if_unused(old_data)
+
+        except Exception as exc:
+            # Rollback to the pre-restore state, preserving backup props.
+            try:
+                obj.data = old_data
+                if old_data is not None:
+                    old_data.use_fake_user = bool(
+                        old_state.get("data_use_fake_user", False)
+                    )
+                if obj.animation_data is None:
+                    obj.animation_data_create()
+                _assign_action_slot(obj.animation_data, old_action, old_slot_id)
+                _restore_rotation_and_transform(obj, old_state)
+                for k, v in old_backup_props.items():
+                    obj[k] = v
+                context.view_layer.update()
+            except Exception:
+                pass
+            self.report({'ERROR'}, f"Restore failed; rolled back: {exc}")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, "Original Armature data, Action and transforms restored.")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Forget operator (restores original fake-user state)
+# ---------------------------------------------------------------------------
+
+class ATAP_OT_Forget_Backup(bpy.types.Operator):
+    bl_idname = "atap.forget_backup"
+    bl_label = "Forget Backup"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == 'ARMATURE'
+
+    def execute(self, context):
+        obj = context.object
+        if not _backup_exists(obj):
+            self.report({'INFO'}, "No backup reference exists.")
+            return {'CANCELLED'}
+
+        try:
+            state = json.loads(obj.get(BACKUP_STATE_KEY, "{}"))
+        except Exception:
+            state = {}
+
+        backup_data = _find_backup_data(obj)
+        if backup_data is not None:
+            # Restore original fake-user intent and remove the UUID tag.
+            backup_data.use_fake_user = bool(
+                state.get("data_use_fake_user", False)
+            )
+            if BACKUP_ID_KEY in backup_data:
+                del backup_data[BACKUP_ID_KEY]
+
+        _clear_backup_properties(obj)
+
+        self.report(
+            {'WARNING'},
+            "Backup reference forgotten. Orphan datablocks are now purgeable."
+        )
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Panel
+# ---------------------------------------------------------------------------
+
+class ATAP_PT_Panel(bpy.types.Panel):
+    bl_label = "Armature Transform Apply Pro"
+    bl_idname = "ATAP_PT_main"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Animation"
+
+    @classmethod
+    def poll(cls, context):
+        return context.object is not None and context.object.type == 'ARMATURE'
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.object
+        s = context.scene.atap_settings
+
+        layout.label(text="Apply Object Transforms", icon='ARMATURE_DATA')
+        col = layout.column(align=True)
+        col.prop(s, "apply_location")
+        col.prop(s, "apply_rotation")
+        col.prop(s, "apply_scale")
+
+        layout.prop(s, "confirm_guardrails")
+        layout.prop(s, "verify_bones")
+        if s.verify_bones:
+            layout.prop(s, "subframe_samples")
+
+        if context.mode not in {'OBJECT', 'POSE'}:
+            layout.label(text="Switch to Object or Pose mode.", icon='INFO')
+        else:
+            layout.operator("atap.apply_transforms", icon='CHECKMARK')
+
+        if not s.confirm_guardrails:
+            box = layout.box()
+            box.label(text="Guardrails disabled — unsafe apply possible.", icon='ERROR')
+        if not s.verify_bones:
+            box = layout.box()
+            box.label(
+                text="Verification off — FINISHED ≠ animation preserved.",
+                icon='ERROR',
+            )
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Backup & Recovery", icon='DUPLICATE')
+        backup_name = obj.get(BACKUP_DATA_KEY)
+        if backup_name:
+            box.label(text=f"Backup: {backup_name}", icon='FILE_TICK')
+            box.operator("atap.restore_backup", icon='LOOP_BACK')
+            box.operator("atap.forget_backup", icon='TRASH')
+        else:
+            box.label(text="No backup stored", icon='INFO')
+
+        layout.separator()
+        layout.label(text="v1.0.3 safety:")
+        layout.label(text="• World-space bone matrix verification")
+        layout.label(text="• Every frame in action + NLA range")
+        layout.label(text="• Optional subframe sampling")
+        layout.label(text="• Full transactional rollback")
+        layout.label(text="• UUID-tagged backup (rename-safe)")
+        layout.label(text="• Original Action reference preserved")
+
+
+CLASSES = (
+    ATAP_PG_Settings,
+    ATAP_OT_Apply,
+    ATAP_OT_Restore,
+    ATAP_OT_Forget_Backup,
+    ATAP_PT_Panel,
+)
+
+
+def register():
+    for cls in CLASSES:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.atap_settings = PointerProperty(type=ATAP_PG_Settings)
+
+
+def unregister():
+    if hasattr(bpy.types.Scene, "atap_settings"):
+        del bpy.types.Scene.atap_settings
+    for cls in reversed(CLASSES):
+        bpy.utils.unregister_class(cls)
+
+
+if __name__ == "__main__":
+    register()
