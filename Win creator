@@ -2408,6 +2408,7 @@ _classes = (
 )
 
 
+
 def _unregister_existing():
     """Clean up an older copy of this add-on that is still registered
     (for example when the script is run again from the Text Editor)."""
@@ -2417,4 +2418,30 @@ def _unregister_existing():
         except Exception:
             pass
     for cls in reversed(_classes):
-      
+        old = getattr(bpy.types, cls.__name__, None)
+        if old is not None:
+            try:
+                bpy.utils.unregister_class(old)
+            except Exception:
+                pass
+
+
+def register():
+    _unregister_existing()
+    for cls in _classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.win_anim = bpy.props.PointerProperty(type=WinAnimProps)
+
+
+def unregister():
+    if hasattr(bpy.types.Scene, "win_anim"):
+        del bpy.types.Scene.win_anim
+    for cls in reversed(_classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    register()
