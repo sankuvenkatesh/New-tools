@@ -1,13 +1,24 @@
 bl_info = {
     "name": "Win Animations - 12 Variations + Rig Creator",
     "author": "Your Name",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar (N) > Win Anim",
     "description": "Create win rigs (MASSIVE/BIG/HUGE) + 12 Entry/Idle/Exit animations",
     "category": "Animation",
 }
 
+# Changes in 1.4.0:
+#  - ONE armature per win text, built like this: GLOBAL_MASTER > one parent (ROOT) bone per
+#    word > one bone per letter. The first word is on top, the next word below it
+#    (MASSIVE over WIN). All animations understand words: letters are animated in reading
+#    order (top word first), the accordion fans out around the middle of EACH word, and the
+#    word parent bones get their own secondary motion.
+#  - "Organic" slider (Settings): 0 = the original pure-math motion (sine waves, perfectly
+#    even stagger). Higher = irregular multi-frequency motion, uneven start times, every
+#    letter a little different (size, tilt, timing), words that lag / overshoot on their own.
+#    "Seed" gives a different but repeatable variation.
+#
 # Changes in 1.3.0 (Blender 5.2 LTS):
 #  - Clip layout is the same for all 12 variations:
 #        ENTRY  1..30    (last frame 30)
@@ -33,6 +44,7 @@ import math
 import random
 import re
 import traceback
+import zlib
 
 # ============================================================
 # CONSTANTS
@@ -57,10 +69,17 @@ F_LOOP_START, F_IDLE_END = 31, 85
 F_EXIT_START, F_END = 86, 100
 HIDDEN = 0.001
 
+# Organic motion defaults (the panel has a slider and a seed)
+ORGANIC_DEFAULT = 0.7
+SEED_DEFAULT = 1
+
 # Rig creator layout
+STACK_WORDS = True       # True: every word on its own line (MASSIVE over WIN). False: one line
 LETTER_SPACING = 1.0     # distance between two letters
-WORD_GAP = 0.5           # extra distance for a space between words
+LINE_HEIGHT = 1.25       # distance between two lines of words
+WORD_GAP = 0.5           # extra distance between words when STACK_WORDS is False
 LETTER_SIZE = 0.9
+LETTER_CENTER = 0.5      # height of the middle of a letter above its bone
 LETTER_EXTRUDE = 0.05
 BONE_LENGTH = 0.5
 
@@ -371,16 +390,99 @@ def alt(i):
 
 
 # ============================================================
-# LETTER POSITION CONTEXT
+# WORDS, LETTER POSITIONS, ORGANIC HELPERS
 # ============================================================
 
-CTX = {"wx": {}, "k": {}, "center": 0.0, "span": 0.0}
+CTX = {"wx": {}, "k": {}, "center": 0.0, "span": 0.0,
+       "gc": {}, "gspan": {}, "gpos": {}, "groups": [], "roots": [],
+       "organic": 0.0, "seed": 1, "vid": 0, "np": {}}
 
 
-def prepare_context(armature, letters, master=None, auto_axes=True):
+def _is_letter_bone(pb):
+    n = pb.name
+    return n != "GLOBAL_MASTER" and not n.endswith("_ROOT") and n.endswith("_BONE")
+
+
+def _world_pos(armature, pb):
+    mw = armature.matrix_world
+    h = pb.bone.head_local
+    return tuple(mw[r][0] * h[0] + mw[r][1] * h[1] + mw[r][2] * h[2] + mw[r][3] for r in range(3))
+
+
+def _split_rows(items, pos):
+    """Letters that have no word parent bone: split them into text rows by their height."""
+    if len(items) < 2:
+        return [list(items)]
+    xs = sorted(pos(b)[0] for b in items)
+    gaps = sorted(b - a for a, b in zip(xs, xs[1:]) if b - a > 1e-6)
+    typical = gaps[len(gaps) // 2] if gaps else 1.0
+    tol = max(0.5 * typical, 1e-3)
+    rows = []
+    for b in sorted(items, key=lambda p: -pos(p)[2]):
+        z = pos(b)[2]
+        if rows and abs(z - rows[-1][0]) <= tol:
+            rows[-1][1].append(b)
+        else:
+            rows.append([z, [b]])
+    return [r[1] for r in rows]
+
+
+def get_word_groups(armature):
+    """[(root bone or None, [letter bones left -> right]), ...] in reading order:
+    the top word first, then the words below it.  A word is every letter that shares the
+    same parent bone (MASSIVE_ROOT, WIN_ROOT ...). Letters that hang directly on
+    GLOBAL_MASTER are split into text rows by their height instead."""
+    like = [pb for pb in armature.pose.bones if _is_letter_bone(pb)]
+    carriers = {pb.parent.name for pb in like if pb.parent is not None}
+    letters = [pb for pb in like if pb.name not in carriers]    # a bone that carries letters is a word parent
+    if not letters:
+        return []
+    pos = {pb.name: _world_pos(armature, pb) for pb in letters}
+    by_parent, order = {}, []
+    for pb in letters:
+        p = pb.parent
+        key = p.name if (p is not None and p.name != "GLOBAL_MASTER") else None
+        if key not in by_parent:
+            by_parent[key] = []
+            order.append(key)
+        by_parent[key].append(pb)
+    groups = []
+    for key in order:
+        members = by_parent[key]
+        if key is None:
+            for row in _split_rows(members, lambda b: pos[b.name]):
+                groups.append([None, row])
+        else:
+            groups.append([armature.pose.bones.get(key), members])
+    if SORT_LEFT_TO_RIGHT:
+        for g in groups:
+            g[1].sort(key=lambda b: pos[b.name][0])
+
+        def gkey(g):
+            zs = [pos[b.name][2] for b in g[1]]
+            xs = [pos[b.name][0] for b in g[1]]
+            return (-round(sum(zs) / len(zs), 3), round(sum(xs) / len(xs), 3))
+        groups.sort(key=gkey)
+    return [(r, ls) for r, ls in groups]
+
+
+def get_letter_bones(armature):
+    """All letter bones in reading order (top word first, each word left to right)."""
+    return [b for _root, ls in get_word_groups(armature) for b in ls]
+
+
+def prepare_context(armature, letters, master=None, auto_axes=True, groups=None,
+                    organic=0.0, seed=SEED_DEFAULT, vid=0):
     CTX["wx"], CTX["k"], CTX["center"], CTX["span"] = {}, {}, 0.0, 0.0
+    CTX["gc"], CTX["gspan"], CTX["gpos"], CTX["np"] = {}, {}, {}, {}
+    CTX["organic"] = max(0.0, min(1.0, float(organic)))
+    CTX["seed"], CTX["vid"] = int(seed), int(vid)
+    if groups is None:
+        groups = get_word_groups(armature)
+    CTX["groups"] = groups
+    CTX["roots"] = [r for r, _ in groups if r is not None]
     AXINFO.clear()
-    for pb in ([master] if master is not None else []) + list(letters):
+    for pb in ([master] if master is not None else []) + CTX["roots"] + list(letters):
         fr = _bone_frame(armature, pb) if auto_axes else None
         AXINFO[pb.name] = fr if fr is not None else _manual_info()
     try:
@@ -400,6 +502,14 @@ def prepare_context(armature, letters, master=None, auto_axes=True):
         xs = list(CTX["wx"].values())
         CTX["center"] = (min(xs) + max(xs)) / 2.0
         CTX["span"] = max(xs) - min(xs)
+        for gi, (_root, ls) in enumerate(groups):
+            gx = [CTX["wx"][b.name] for b in ls if b.name in CTX["wx"]]
+            if not gx:
+                continue
+            c, sp = (min(gx) + max(gx)) / 2.0, max(gx) - min(gx)
+            for k, b in enumerate(ls):
+                CTX["gc"][b.name], CTX["gspan"][b.name] = c, sp
+                CTX["gpos"][b.name] = (gi, k, len(ls))
     except Exception as err:
         print("WARNING prepare_context:", err)
 
@@ -408,36 +518,119 @@ def side_by(b, dx_world):
     return dx_world * CTX["k"].get(b.name, 1.0)
 
 
+def group_info(b, i, n):
+    """(index of the letter inside its word, number of letters of that word)"""
+    g = CTX["gpos"].get(b.name)
+    return (g[1], g[2]) if g is not None else (i, n)
+
+
+def tpos_word(b, i, n):
+    """0..1 position of the letter inside ITS word (tpos() counts over the whole text)."""
+    k, m = group_info(b, i, n)
+    return k / float(m - 1) if m > 1 else 0.0
+
+
 def letter_offset(b, i, n):
-    if b.name in CTX["wx"] and CTX["span"] > 1e-4:
-        return CTX["wx"][b.name] - CTX["center"]
-    return (i - (n - 1) / 2.0) * 0.5
+    """World distance of a letter from the middle of its own word."""
+    if b.name in CTX["wx"] and CTX["gspan"].get(b.name, CTX["span"]) > 1e-4:
+        return CTX["wx"][b.name] - CTX["gc"].get(b.name, CTX["center"])
+    k, m = group_info(b, i, n)
+    return (k - (m - 1) / 2.0) * 0.5
 
 
-# ============================================================
-# FIND BONES
-# ============================================================
+# ---- organic helpers: every one of them is an exact no-op when "Organic" is 0 ----
 
-def get_letter_bones(armature):
-    result = []
-    for bone in armature.pose.bones:
-        if bone.name == "GLOBAL_MASTER":
-            continue
-        if bone.name.endswith("_ROOT"):
-            continue
-        if bone.name.endswith("_BONE"):
-            result.append(bone)
-    if SORT_LEFT_TO_RIGHT and len(result) > 1:
-        try:
-            m = armature.matrix_world
+def rng_for(b, tag=""):
+    """Repeatable random numbers for one bone / purpose (same seed -> same result)."""
+    s = CTX["seed"] * 1000003 + CTX["vid"] * 7919 + zlib.crc32(("%s/%s" % (b.name, tag)).encode("utf-8"))
+    return random.Random(s & 0x7FFFFFFF)
 
-            def world_x(pb):
-                h = pb.bone.head_local
-                return m[0][0] * h[0] + m[0][1] * h[1] + m[0][2] * h[2] + m[0][3]
-            result.sort(key=world_x)
-        except Exception as err:
-            print("WARNING sort:", err)
-    return result
+
+def jit(b, tag, amount=1.0):
+    """A repeatable value between -amount and +amount, scaled by Organic (0 when Organic is 0)."""
+    a = CTX["organic"]
+    if a <= 0.0 or amount == 0.0:
+        return 0.0
+    return rng_for(b, tag).uniform(-1.0, 1.0) * amount * a
+
+
+def vary(b, tag, spread=0.2):
+    """Multiplier 1 +- spread (scaled by Organic). Exactly 1.0 when Organic is 0."""
+    return 1.0 + jit(b, tag, spread)
+
+
+def dv(value, b, tag, spread=0.2):
+    """Vary the DEVIATION of a scale-like value from 1 (1.0 stays 1.0, 0.76 -> 0.7 ...)."""
+    v = vary(b, tag, spread)
+    return value if v == 1.0 else 1.0 + (value - 1.0) * v
+
+
+def SQ(b, tag, up, side, spread=0.25):
+    """SCL() for a squash / stretch pose where height and width change together."""
+    return SCL(1.0, up=dv(up, b, tag, spread), side=dv(side, b, tag, spread))
+
+
+def ostagger(b, i, n, frames, reverse=False, jitter=1.5):
+    """stagger() with a little irregularity: the letters do not start on a perfect grid."""
+    return max(0, int(round(stagger(i, n, frames, reverse) + jit(b, "stg", jitter))))
+
+
+def _noise_params(b, ch, cycles):
+    key_ = (b.name, ch, cycles)
+    p = CTX["np"].get(key_)
+    if p is None:
+        r = rng_for(b, "noise/" + ch)
+        p = [(0.80, cycles * r.uniform(0.75, 1.30), r.uniform(0.0, _TWO_PI)),
+             (0.36, cycles * r.uniform(1.60, 2.40), r.uniform(0.0, _TWO_PI)),
+             (0.13, cycles * r.uniform(2.80, 4.00), r.uniform(0.0, _TWO_PI))]
+        CTX["np"][key_] = p
+    return p
+
+
+def wave(b, ch, f, cycles, phase=0.0):
+    """Idle motion (about -1.3 .. 1.3) that is exactly 0 on the first and last frame of the loop.
+    Organic 0: the pure sine of the original.  Organic 1: an irregular blend of three
+    frequencies with a random phase per letter (the phase offset still travels along the text)."""
+    base = swing(f, F_LOOP_START, F_IDLE_END, cycles, phase)
+    a = CTX["organic"]
+    if a <= 0.0:
+        return base
+    u = (f - F_LOOP_START) / float(F_IDLE_END - F_LOOP_START)
+    s = 0.0
+    for k, (amp, fr, ph) in enumerate(_noise_params(b, ch, cycles)):
+        s += amp * math.sin(_TWO_PI * fr * u - phase * (1.0, 0.6, 0.3)[k] + ph)
+    return base * (1.0 - a) + s * math.sin(math.pi * u) * a
+
+
+def word_layer(entry=True, loop=True, exit_=True):
+    """Secondary motion on the word parent bones (MASSIVE_ROOT, WIN_ROOT ...): the words
+    settle a little late with a small overshoot, drift slowly while idling and part
+    company while leaving. Everything is 0 when Organic is 0 and on the clip borders."""
+    a = CTX["organic"]
+    roots = CTX["roots"]
+    if a <= 0.0 or not roots:
+        return
+    for g, r in enumerate(roots):
+        side = -1.0 if g % 2 else 1.0
+        if entry:
+            dip = 0.10 * a * vary(r, "dip", 0.3) * (1.0 + 0.5 * g)
+            tilt = 3.0 * a * side * vary(r, "tilt", 0.3)
+            key(r, F_START, LOC(up=-dip), ROT(roll=tilt), SCL(), style=S("QUAD", "EASE_OUT"))
+            key(r, min(26, 20 + 2 * g), LOC(up=0.35 * dip), ROT(roll=-0.35 * tilt), SCL())
+            key(r, F_ENTRY_END, LOC(), ROT(), SCL())
+        if loop:
+            ph0 = g * 1.1
+
+            def drift(f, r=r, ph0=ph0):
+                w1 = wave(r, "up", f, 1.3, ph0)
+                w2 = wave(r, "rl", f, 1.1, ph0 + 0.9)
+                w3 = wave(r, "sc", f, 1.7, ph0 + 1.7)
+                return LOC(up=0.03 * a * w1), ROT(roll=1.4 * a * w2), SCL(1.0 + 0.012 * a * w3)
+            sample(r, F_LOOP_START, F_IDLE_END, 3, drift)
+        if exit_:
+            key_all(r, F_EXIT_START, style=S("QUAD", "EASE_IN"))
+            key(r, F_END, LOC(up=0.16 * a * side * vary(r, "xl", 0.3)),
+                ROT(roll=3.5 * a * side * vary(r, "xr", 0.3)), SCL())
 
 
 # ============================================================
@@ -448,34 +641,44 @@ def v1_elastic_pop(master, letters):
     n = len(letters)
     # ---- ENTRY (1..30) ----
     key_all(master, F_START, scl=SCL(0.88), style=S("QUAD", "EASE_OUT"))
-    key_all(master, 18, scl=SCL(1.05))
+    key_all(master, 18 + int(round(jit(master, "m18", 2.0))), scl=SCL(dv(1.05, master, "m18a", 0.4)))
     key_all(master, F_ENTRY_END)
     for i, b in enumerate(letters):
-        f0 = F_START + stagger(i, n, 8)
-        low, tilt, gone = LOC(up=-0.35), ROT(roll=25*alt(i)), SCL(HIDDEN)
+        f0 = F_START + ostagger(b, i, n, 8)
+        low = LOC(up=-0.35 * vary(b, "low", 0.25))
+        tilt = ROT(roll=25 * alt(i) * vary(b, "tilt", 0.35))
+        gone = SCL(HIDDEN)
         key_all(b, F_START, low, tilt, gone)
-        key_all(b, f0, low, tilt, gone, style=S("ELASTIC", "EASE_OUT", 0.4))
+        key_all(b, f0, low, tilt, gone, style=S("ELASTIC", "EASE_OUT", 0.4 * vary(b, "per", 0.25)))
         key_all(b, F_ENTRY_END)
     # ---- LOOP (31..85) ----
     beat = [(30,1.00),(34,1.07),(38,1.00),(41,1.04),(46,1.00),
             (52,1.00),(56,1.07),(60,1.00),(63,1.04),(68,1.00),(75,1.00)]
-    for f, s in beat: key_all(master, LF(f), scl=SCL(s))
+    for f, s in beat:
+        ff = LF(f)
+        if f not in (30, 75):
+            ff += int(round(jit(master, "bt%d" % f, 1.0)))
+        key_all(master, ff, scl=SCL(dv(s, master, "ba%d" % f, 0.5)))
     for i, b in enumerate(letters):
         ph, a = tpos(i, n)*math.pi, alt(i)
-        def breathe(f, ph=ph, a=a):
-            w = swing(f, F_LOOP_START, F_IDLE_END, 2, ph)
-            return LOC(up=0.035*w), ROT(roll=2.5*a*w), SCL(1.0 + 0.035*w)
+        up_a = 0.035 * vary(b, "bu", 0.3)
+        roll_a = 2.5 * vary(b, "br", 0.3)
+        sc_a = 0.035 * vary(b, "bs", 0.3)
+        def breathe(f, b=b, ph=ph, a=a, up_a=up_a, roll_a=roll_a, sc_a=sc_a):
+            w = wave(b, "w", f, 2, ph)
+            return LOC(up=up_a*w), ROT(roll=roll_a*a*w), SCL(1.0 + sc_a*w)
         sample(b, F_LOOP_START, F_IDLE_END, 3, breathe)
     # ---- EXIT (86..100) ----
     key_all(master, F_EXIT_START, style=S("SINE", "EASE_IN_OUT"))
-    key_all(master, XF(88), scl=SCL(1.04))
-    key_all(master, F_END, scl=SCL(0.9))
+    key_all(master, XF(88), scl=SCL(dv(1.04, master, "x88", 0.4)))
+    key_all(master, F_END, scl=SCL(dv(0.9, master, "x100", 0.4)))
     for i, b in enumerate(letters):
-        f0 = F_EXIT_START + stagger(i, n, XS(6), reverse=True)
+        f0 = F_EXIT_START + ostagger(b, i, n, XS(6), reverse=True)
         a = alt(i)
         key_all(b, F_EXIT_START); key_all(b, f0, style=S("QUAD", "EASE_OUT"))
-        key_all(b, f0+XS(4), LOC(up=0.06), ROT(roll=6*a), SCL(1.18), style=S("QUAD", "EASE_IN"))
-        key_all(b, F_END, LOC(up=0.2), ROT(roll=-20*a), SCL(HIDDEN))
+        key_all(b, f0+XS(4), LOC(up=0.06 * vary(b, "xu", 0.3)), ROT(roll=6*a*vary(b, "xr", 0.4)),
+                SCL(dv(1.18, b, "xs", 0.3)), style=S("QUAD", "EASE_IN"))
+        key_all(b, F_END, LOC(up=0.2 * vary(b, "xe", 0.3)), ROT(roll=-20*a*vary(b, "xk", 0.4)), SCL(HIDDEN))
 
 
 # ============================================================
@@ -487,40 +690,46 @@ def v2_bounce_drop(master, letters):
     # ---- ENTRY (1..30) ----
     key_all(master, F_START); key_all(master, F_ENTRY_END)
     for i, b in enumerate(letters):
-        f0 = F_START + stagger(i, n, 9); dur = F_ENTRY_END - f0; a = alt(i)
+        f0 = F_START + ostagger(b, i, n, 9); dur = F_ENTRY_END - f0; a = alt(i)
+        drop = DROP * vary(b, "drop", 0.12)
+        tilt = ROT(roll=14*a*vary(b, "rl", 0.35))
         f_hit1 = f0 + int(round(dur*HIT1)); f_hit2 = f0 + int(round(dur*HIT2))
-        key(b, F_START, loc=LOC(up=DROP))
-        key(b, f0, loc=LOC(up=DROP), style=S("BOUNCE", "EASE_OUT"))
+        key(b, F_START, loc=LOC(up=drop))
+        key(b, f0, loc=LOC(up=drop), style=S("BOUNCE", "EASE_OUT"))
         key(b, F_ENTRY_END, loc=LOC())
-        key(b, F_START, rot=ROT(roll=14*a))
-        key(b, f0, rot=ROT(roll=14*a), style=S("QUAD", "EASE_OUT"))
+        key(b, F_START, rot=tilt)
+        key(b, f0, rot=tilt, style=S("QUAD", "EASE_OUT"))
         key(b, f_hit1, rot=ROT()); key(b, F_ENTRY_END, rot=ROT())
         key(b, F_START, scl=SCL(HIDDEN))
         key(b, f0, scl=SCL(HIDDEN), style=S("QUAD", "EASE_OUT"))
-        key(b, f0+4, scl=SCL(1.0, up=1.12, side=0.94))
-        key(b, f_hit1-1, scl=SCL(1.0, up=1.10, side=0.95))
-        key(b, f_hit1, scl=SCL(1.0, up=0.76, side=1.15))
-        key(b, f_hit1+3, scl=SCL(1.0, up=1.05, side=0.98))
-        key(b, f_hit2-1, scl=SCL(1.0, up=1.04, side=0.98))
-        key(b, f_hit2, scl=SCL(1.0, up=0.90, side=1.05))
+        key(b, f0+4, scl=SQ(b, "q1", 1.12, 0.94))
+        key(b, f_hit1-1, scl=SQ(b, "q2", 1.10, 0.95))
+        key(b, f_hit1, scl=SQ(b, "q3", 0.76, 1.15))
+        key(b, f_hit1+3, scl=SQ(b, "q4", 1.05, 0.98))
+        key(b, f_hit2-1, scl=SQ(b, "q5", 1.04, 0.98))
+        key(b, f_hit2, scl=SQ(b, "q6", 0.90, 1.05))
         key(b, f_hit2+3, scl=SCL()); key(b, F_ENTRY_END, scl=SCL())
     # ---- LOOP (31..85) ----
     key_all(master, F_LOOP_START); key_all(master, F_IDLE_END)
     for i, b in enumerate(letters):
         t = tpos(i, n); key_all(b, F_LOOP_START)
-        for start in (F_LOOP_START+2+int(round(t*12)), F_LOOP_START+31+int(round(t*10))):
+        st1 = F_LOOP_START+2+int(round(t*12)) + int(round(jit(b, "h1", 1.0)))
+        st2 = F_LOOP_START+31+int(round(t*10)) + int(round(jit(b, "h2", 1.0)))
+        for hn, start in enumerate((st1, st2)):
             key_all(b, start, style=S("QUAD", "EASE_OUT"))
-            key_all(b, start+4, LOC(up=0.13), scl=SCL(1.0, up=1.07, side=0.96), style=S("QUAD", "EASE_IN"))
-            key_all(b, start+8, scl=SCL(1.0, up=0.92, side=1.05))
+            key_all(b, start+4, LOC(up=0.13 * vary(b, "hu%d" % hn, 0.3)),
+                    scl=SQ(b, "hs%d" % hn, 1.07, 0.96), style=S("QUAD", "EASE_IN"))
+            key_all(b, start+8, scl=SQ(b, "hq%d" % hn, 0.92, 1.05))
             key_all(b, start+11)
         key_all(b, F_IDLE_END)
     # ---- EXIT (86..100) ----
     key_all(master, F_EXIT_START); key_all(master, F_END)
     for i, b in enumerate(letters):
-        f0 = F_EXIT_START + stagger(i, n, XS(6)); a = alt(i)
+        f0 = F_EXIT_START + ostagger(b, i, n, XS(6)); a = alt(i)
         key_all(b, F_EXIT_START); key_all(b, f0, style=S("QUAD", "EASE_OUT"))
-        key_all(b, f0+XS(3), LOC(up=0.12), ROT(roll=-6*a), SCL(1.0, up=1.08, side=0.96), style=S("QUAD", "EASE_IN"))
-        key_all(b, F_END, LOC(up=-2.2), ROT(roll=35*a), SCL(HIDDEN))
+        key_all(b, f0+XS(3), LOC(up=0.12 * vary(b, "xu", 0.3)), ROT(roll=-6*a*vary(b, "xr", 0.4)),
+                SQ(b, "xs", 1.08, 0.96), style=S("QUAD", "EASE_IN"))
+        key_all(b, F_END, LOC(up=-2.2 * vary(b, "xe", 0.15)), ROT(roll=35*a*vary(b, "xk", 0.4)), SCL(HIDDEN))
 
 
 # ============================================================
@@ -533,30 +742,34 @@ def v3_spin_flip(master, letters):
     key_all(master, F_START, scl=SCL(0.85), style=S("BACK", "EASE_OUT"))
     key_all(master, F_ENTRY_END)
     for i, b in enumerate(letters):
-        f0 = F_START + stagger(i, n, 8); spun = ROT(yaw=360*alt(i)); low = LOC(up=-0.25)
+        f0 = F_START + ostagger(b, i, n, 8); spun = ROT(yaw=360*alt(i)); low = LOC(up=-0.25 * vary(b, "lo", 0.3))
         key(b, F_START, loc=low, rot=spun, scl=SCL(HIDDEN))
         key(b, f0, loc=low, rot=spun, style=S("BACK", "EASE_OUT"))
         key(b, f0, scl=SCL(HIDDEN), style=S("QUAD", "EASE_OUT"))
-        key(b, f0+8, scl=SCL()); key(b, F_ENTRY_END, loc=LOC(), rot=ROT(), scl=SCL())
+        key(b, f0+8+int(round(jit(b, "gr", 1.0))), scl=SCL()); key(b, F_ENTRY_END, loc=LOC(), rot=ROT(), scl=SCL())
     # ---- LOOP (31..85) ----
     key_all(master, F_LOOP_START, style=S("SINE", "EASE_IN_OUT"))
-    key_all(master, LF(52), scl=SCL(1.03), style=S("SINE", "EASE_IN_OUT"))
+    key_all(master, LF(52) + int(round(jit(master, "m52", 2.0))), scl=SCL(dv(1.03, master, "m52a", 0.4)),
+            style=S("SINE", "EASE_IN_OUT"))
     key_all(master, F_IDLE_END)
     for i, b in enumerate(letters):
         ph = tpos(i, n) * math.pi * 1.5
-        def wobble(f, ph=ph):
-            w = swing(f, F_LOOP_START, F_IDLE_END, 2, ph)
-            return LOC(up=0.02*w), ROT(yaw=16*w, roll=2*w), None
+        up_a = 0.02 * vary(b, "wu", 0.3)
+        yaw_a = 16 * vary(b, "wy", 0.3)
+        roll_a = 2 * vary(b, "wr", 0.4)
+        def wobble(f, b=b, ph=ph, up_a=up_a, yaw_a=yaw_a, roll_a=roll_a):
+            w = wave(b, "w", f, 2, ph)
+            return LOC(up=up_a*w), ROT(yaw=yaw_a*w, roll=roll_a*w), None
         sample(b, F_LOOP_START, F_IDLE_END, 3, wobble)
     # ---- EXIT (86..100) ----
     key_all(master, F_EXIT_START, style=S("BACK", "EASE_IN"))
-    key_all(master, F_END, scl=SCL(0.7))
+    key_all(master, F_END, scl=SCL(dv(0.7, master, "x100", 0.3)))
     for i, b in enumerate(letters):
-        f0 = F_EXIT_START + stagger(i, n, XS(6))
+        f0 = F_EXIT_START + ostagger(b, i, n, XS(6))
         key_all(b, F_EXIT_START)
         key(b, f0, loc=LOC(), rot=ROT(), style=S("BACK", "EASE_IN"))
         key(b, f0, scl=SCL(), style=S("QUAD", "EASE_IN"))
-        key(b, F_END, loc=LOC(up=0.35), rot=ROT(yaw=-360*alt(i)), scl=SCL(HIDDEN))
+        key(b, F_END, loc=LOC(up=0.35 * vary(b, "xe", 0.3)), rot=ROT(yaw=-360*alt(i)), scl=SCL(HIDDEN))
 
 
 # ============================================================
@@ -568,9 +781,9 @@ def v4_slam_shake(master, letters):
     # ---- ENTRY (1..30) ----
     key(master, F_START, loc=LOC(up=0.3), scl=SCL(2.8), style=S("QUART", "EASE_IN"))
     key(master, F_START, rot=ROT())
-    key(master, IMPACT, loc=LOC(), rot=ROT(), scl=SCL(1.0, up=0.78, side=1.2))
-    key(master, IMPACT+3, scl=SCL(1.0, up=1.07, side=0.96))
-    key(master, IMPACT+6, scl=SCL(1.0, up=0.97, side=1.02))
+    key(master, IMPACT, loc=LOC(), rot=ROT(), scl=SQ(master, "i0", 0.78, 1.2, 0.15))
+    key(master, IMPACT+3, scl=SQ(master, "i1", 1.07, 0.96, 0.2))
+    key(master, IMPACT+6, scl=SQ(master, "i2", 0.97, 1.02, 0.2))
     key(master, IMPACT+10, scl=SCL())
     for k, f in enumerate(range(IMPACT+1, F_ENTRY_END-1)):
         decay = 0.72**k
@@ -580,12 +793,12 @@ def v4_slam_shake(master, letters):
             rot=ROT(roll=4.0*decay*sx), style=S("LINEAR", "AUTO"))
     key_all(master, F_ENTRY_END)
     for i, b in enumerate(letters):
-        d = stagger(i, n, 3); a = alt(i)
+        d = ostagger(b, i, n, 3); a = alt(i)
         key_all(b, F_START, scl=SCL(HIDDEN))
         key_all(b, F_START+d, scl=SCL(HIDDEN), style=S("QUAD", "EASE_OUT"))
         key_all(b, F_START+d+3); key_all(b, IMPACT+d)
         for dt, up, roll in ((3,0.08,9.0),(6,-0.02,-6.0),(9,0.03,3.5),(12,0.0,0.0)):
-            key_all(b, IMPACT+d+dt, LOC(up=up), ROT(roll=roll*a))
+            key_all(b, IMPACT+d+dt, LOC(up=up*vary(b, "ru%d" % dt, 0.3)), ROT(roll=roll*a*vary(b, "rr%d" % dt, 0.3)))
         key_all(b, F_ENTRY_END)
     # ---- LOOP (31..85) ----
     def master_idle(f):
@@ -603,7 +816,7 @@ def v4_slam_shake(master, letters):
         sample(b, F_LOOP_START, F_IDLE_END, 2, tremble)
     # ---- EXIT (86..100) ----
     key_all(master, F_EXIT_START, style=S("QUAD", "EASE_OUT"))
-    key_all(master, XF(79), scl=SCL(0.88), style=S("EXPO", "EASE_IN"))
+    key_all(master, XF(79), scl=SCL(dv(0.88, master, "x79", 0.2)), style=S("EXPO", "EASE_IN"))
     key_all(master, F_END, scl=SCL(3.6))
     for i, b in enumerate(letters):
         a = alt(i); key_all(b, F_EXIT_START)
@@ -622,34 +835,40 @@ def v5_pendulum_swing(master, letters):
     # ---- ENTRY (1..30) ----
     key_all(master, F_START); key_all(master, F_ENTRY_END)
     for i, b in enumerate(letters):
-        f0 = F_START + stagger(i, n, 7); tipped = ROT(roll=75*alt(i))
-        key(b, F_START, loc=LOC(up=1.4))
-        key(b, f0, loc=LOC(up=1.4), style=S("BACK", "EASE_OUT"))
+        f0 = F_START + ostagger(b, i, n, 7); tipped = ROT(roll=75*alt(i)*vary(b, "tip", 0.3))
+        hgt = 1.4 * vary(b, "hgt", 0.15)
+        key(b, F_START, loc=LOC(up=hgt))
+        key(b, f0, loc=LOC(up=hgt), style=S("BACK", "EASE_OUT"))
         key(b, F_ENTRY_END, loc=LOC())
         key(b, F_START, rot=tipped)
-        key(b, f0, rot=tipped, style=S("ELASTIC", "EASE_OUT", 0.25))
+        key(b, f0, rot=tipped, style=S("ELASTIC", "EASE_OUT", 0.25 * vary(b, "per", 0.3)))
         key(b, F_ENTRY_END, rot=ROT())
         key(b, F_START, scl=SCL(HIDDEN))
         key(b, f0, scl=SCL(HIDDEN), style=S("QUAD", "EASE_OUT"))
         key(b, f0+5, scl=SCL()); key(b, F_ENTRY_END, scl=SCL())
     # ---- LOOP (31..85) ----
     key_all(master, F_LOOP_START, style=S("SINE", "EASE_IN_OUT"))
-    key_all(master, LF(52), scl=SCL(1.02), style=S("SINE", "EASE_IN_OUT"))
+    key_all(master, LF(52) + int(round(jit(master, "m52", 2.0))), scl=SCL(dv(1.02, master, "m52a", 0.4)),
+            style=S("SINE", "EASE_IN_OUT"))
     key_all(master, F_IDLE_END)
     for i, b in enumerate(letters):
         ph = tpos(i, n) * math.pi * 1.2
-        def pendulum(f, ph=ph):
-            w = swing(f, F_LOOP_START, F_IDLE_END, 3, ph)
-            w2 = swing(f, F_LOOP_START, F_IDLE_END, 3, ph + math.pi/2)
-            return LOC(up=0.02*w*w), ROT(roll=10*w, pitch=2.0*w2), None
+        up_a = 0.02 * vary(b, "pu", 0.3)
+        roll_a = 10 * vary(b, "pr", 0.3)
+        pitch_a = 2.0 * vary(b, "pp", 0.4)
+        def pendulum(f, b=b, ph=ph, up_a=up_a, roll_a=roll_a, pitch_a=pitch_a):
+            w = wave(b, "w", f, 3, ph)
+            w2 = wave(b, "w2", f, 3, ph + math.pi/2)
+            return LOC(up=up_a*w*w), ROT(roll=roll_a*w, pitch=pitch_a*w2), None
         sample(b, F_LOOP_START, F_IDLE_END, 2, pendulum)
     # ---- EXIT (86..100) ----
     key_all(master, F_EXIT_START); key_all(master, F_END)
     for i, b in enumerate(letters):
-        f0 = F_EXIT_START + stagger(i, n, XS(6), reverse=True); a = alt(i)
+        f0 = F_EXIT_START + ostagger(b, i, n, XS(6), reverse=True); a = alt(i)
         key_all(b, F_EXIT_START)
-        key(b, f0, loc=LOC(), style=S("QUAD", "EASE_IN")); key(b, F_END, loc=LOC(up=-1.8))
-        key(b, f0, rot=ROT(), style=S("ELASTIC", "EASE_IN", 0.3)); key(b, F_END, rot=ROT(roll=70*a))
+        key(b, f0, loc=LOC(), style=S("QUAD", "EASE_IN")); key(b, F_END, loc=LOC(up=-1.8 * vary(b, "xe", 0.2)))
+        key(b, f0, rot=ROT(), style=S("ELASTIC", "EASE_IN", 0.3 * vary(b, "xp", 0.3)))
+        key(b, F_END, rot=ROT(roll=70*a*vary(b, "xr", 0.3)))
         key(b, f0, scl=SCL(), style=S("QUAD", "EASE_IN")); key(b, F_END, scl=SCL(HIDDEN))
 
 
@@ -662,40 +881,45 @@ def v6_rocket_rise(master, letters):
     # ---- ENTRY (1..30) ----
     key_all(master, F_START); key_all(master, F_ENTRY_END)
     for i, b in enumerate(letters):
-        f0 = F_START + stagger(i, n, 8); dur = F_ENTRY_END - f0
-        key(b, F_START, loc=LOC(up=-1.6))
-        key(b, f0, loc=LOC(up=-1.6), style=S("BACK", "EASE_OUT"))
+        f0 = F_START + ostagger(b, i, n, 8); dur = F_ENTRY_END - f0
+        rise = LOC(up=-1.6 * vary(b, "rise", 0.12))
+        key(b, F_START, loc=rise)
+        key(b, f0, loc=rise, style=S("BACK", "EASE_OUT"))
         key(b, F_ENTRY_END, loc=LOC())
         key(b, F_START, rot=ROT()); key(b, F_ENTRY_END, rot=ROT())
         key(b, F_START, scl=SCL(HIDDEN))
         key(b, f0, scl=SCL(HIDDEN), style=S("QUAD", "EASE_OUT"))
-        key(b, f0+4, scl=SCL(1.0, up=1.30, side=0.88))
-        key(b, f0+int(round(dur*0.40)), scl=SCL(1.0, up=1.15, side=0.93))
-        key(b, f0+int(round(dur*0.70)), scl=SCL(1.0, up=0.94, side=1.03))
+        key(b, f0+4, scl=SQ(b, "q1", 1.30, 0.88))
+        key(b, f0+int(round(dur*0.40)), scl=SQ(b, "q2", 1.15, 0.93))
+        key(b, f0+int(round(dur*0.70)), scl=SQ(b, "q3", 0.94, 1.03))
         key(b, F_ENTRY_END, scl=SCL())
     # ---- LOOP (31..85) ----
     key_all(master, F_LOOP_START, style=S("SINE", "EASE_IN_OUT"))
-    key_all(master, LF(52), scl=SCL(1.02), style=S("SINE", "EASE_IN_OUT"))
+    key_all(master, LF(52) + int(round(jit(master, "m52", 2.0))), scl=SCL(dv(1.02, master, "m52a", 0.4)),
+            style=S("SINE", "EASE_IN_OUT"))
     key_all(master, F_IDLE_END)
     for i, b in enumerate(letters):
         ph, a = tpos(i, n)*math.pi, alt(i)
-        def hover(f, ph=ph, a=a):
-            w = swing(f, F_LOOP_START, F_IDLE_END, 1.5, ph)
-            w2 = swing(f, F_LOOP_START, F_IDLE_END, 1.5, ph + math.pi/2)
-            return LOC(up=0.09*w), ROT(pitch=3.0*w2, roll=2.0*a*w), None
+        up_a = 0.09 * vary(b, "hu", 0.3)
+        pitch_a = 3.0 * vary(b, "hp", 0.4)
+        roll_a = 2.0 * vary(b, "hr", 0.4)
+        def hover(f, b=b, ph=ph, a=a, up_a=up_a, pitch_a=pitch_a, roll_a=roll_a):
+            w = wave(b, "w", f, 1.5, ph)
+            w2 = wave(b, "w2", f, 1.5, ph + math.pi/2)
+            return LOC(up=up_a*w), ROT(pitch=pitch_a*w2, roll=roll_a*a*w), None
         sample(b, F_LOOP_START, F_IDLE_END, 3, hover)
     # ---- EXIT (86..100) ----
     key_all(master, F_EXIT_START); key_all(master, F_END)
     for i, b in enumerate(letters):
-        d = stagger(i, n, XS(8)); a = alt(i); f_crouch = F_EXIT_START + d + XS(4)
+        d = ostagger(b, i, n, XS(8)); a = alt(i); f_crouch = F_EXIT_START + d + XS(4)
         key_all(b, F_EXIT_START); key_all(b, F_EXIT_START+d, style=S("QUAD", "EASE_OUT"))
         key(b, f_crouch, loc=LOC(up=-0.10), style=S("EXPO", "EASE_IN"))
-        key(b, F_END, loc=LOC(up=3.2))
-        key(b, f_crouch, scl=SCL(1.0, up=0.85, side=1.10))
-        key(b, f_crouch+XS(4), scl=SCL(1.0, up=1.70, side=0.76))
-        key(b, XF(96), scl=SCL(1.0, up=1.70, side=0.76), style=S("QUAD", "EASE_IN"))
+        key(b, F_END, loc=LOC(up=3.2 * vary(b, "xe", 0.15)))
+        key(b, f_crouch, scl=SQ(b, "c1", 0.85, 1.10))
+        key(b, f_crouch+XS(4), scl=SQ(b, "c2", 1.70, 0.76, 0.15))
+        key(b, XF(96), scl=SQ(b, "c2", 1.70, 0.76, 0.15), style=S("QUAD", "EASE_IN"))
         key(b, F_END, scl=SCL(HIDDEN))
-        key(b, f_crouch, rot=ROT()); key(b, F_END, rot=ROT(roll=4*a))
+        key(b, f_crouch, rot=ROT()); key(b, F_END, rot=ROT(roll=4*a*vary(b, "xr", 0.5)))
 
 
 # ============================================================
@@ -708,35 +932,42 @@ def v7_jelly_wobble(master, letters):
     key_all(master, F_START, scl=SCL(0.9), style=S("BACK", "EASE_OUT"))
     key_all(master, F_ENTRY_END)
     for i, b in enumerate(letters):
-        f0 = F_START + stagger(i, n, 8)
-        low, tilt = LOC(up=-0.25), ROT(roll=10*alt(i))
-        blob = SCL(1.0, up=0.25, side=1.6)
+        f0 = F_START + ostagger(b, i, n, 8)
+        low, tilt = LOC(up=-0.25 * vary(b, "lo", 0.3)), ROT(roll=10*alt(i)*vary(b, "tl", 0.4))
+        blob = SQ(b, "blob", 0.25, 1.6, 0.2)
         key(b, F_START, loc=low, rot=tilt)
-        key(b, f0+2, loc=low, rot=tilt, style=S("ELASTIC", "EASE_OUT", 0.35))
+        key(b, f0+2, loc=low, rot=tilt, style=S("ELASTIC", "EASE_OUT", 0.35 * vary(b, "per", 0.25)))
         key(b, F_ENTRY_END, loc=LOC(), rot=ROT())
         key(b, F_START, scl=SCL(HIDDEN))
         key(b, f0, scl=SCL(HIDDEN), style=S("QUAD", "EASE_OUT"))
-        key(b, f0+2, scl=blob, style=S("ELASTIC", "EASE_OUT", 0.35))
+        key(b, f0+2, scl=blob, style=S("ELASTIC", "EASE_OUT", 0.35 * vary(b, "per", 0.25)))
         key(b, F_ENTRY_END, scl=SCL())
     # ---- LOOP (31..85) ----
     key_all(master, F_LOOP_START, style=S("SINE", "EASE_IN_OUT"))
-    key_all(master, LF(52), scl=SCL(1.0, up=1.04, side=0.98), style=S("SINE", "EASE_IN_OUT"))
+    key_all(master, LF(52) + int(round(jit(master, "m52", 2.0))), scl=SQ(master, "m52a", 1.04, 0.98, 0.4),
+            style=S("SINE", "EASE_IN_OUT"))
     key_all(master, F_IDLE_END)
     for i, b in enumerate(letters):
         ph = tpos(i, n) * math.pi * 1.5
-        def jelly(f, ph=ph):
-            w = swing(f, F_LOOP_START, F_IDLE_END, 2.5, ph)
-            return (LOC(up=0.025*w), ROT(roll=2.0*w),
-                    SCL(1.0, up=1.0+0.09*w, side=1.0-0.06*w))
+        up_a = 0.025 * vary(b, "ju", 0.3)
+        roll_a = 2.0 * vary(b, "jr", 0.4)
+        sy_a = 0.09 * vary(b, "jy", 0.3)
+        sx_a = 0.06 * vary(b, "jx", 0.3)
+        def jelly(f, b=b, ph=ph, up_a=up_a, roll_a=roll_a, sy_a=sy_a, sx_a=sx_a):
+            w = wave(b, "w", f, 2.5, ph)
+            return (LOC(up=up_a*w), ROT(roll=roll_a*w),
+                    SCL(1.0, up=1.0+sy_a*w, side=1.0-sx_a*w))
         sample(b, F_LOOP_START, F_IDLE_END, 2, jelly)
     # ---- EXIT (86..100) ----
     key_all(master, F_EXIT_START); key_all(master, F_END)
     for i, b in enumerate(letters):
-        f0 = F_EXIT_START + stagger(i, n, XS(6), reverse=True); a = alt(i)
+        f0 = F_EXIT_START + ostagger(b, i, n, XS(6), reverse=True); a = alt(i)
         key_all(b, F_EXIT_START); key_all(b, f0, style=S("QUAD", "EASE_OUT"))
-        key_all(b, f0+XS(4), LOC(up=-0.05), ROT(roll=-4*a), SCL(1.0, up=0.55, side=1.30), style=S("QUAD", "EASE_IN"))
-        key_all(b, f0+XS(8), LOC(up=0.35), ROT(roll=6*a), SCL(1.0, up=1.50, side=0.75), style=S("QUAD", "EASE_IN"))
-        key_all(b, F_END, LOC(up=1.2), ROT(roll=-10*a), SCL(HIDDEN))
+        key_all(b, f0+XS(4), LOC(up=-0.05), ROT(roll=-4*a*vary(b, "xr", 0.4)), SQ(b, "x1", 0.55, 1.30),
+                style=S("QUAD", "EASE_IN"))
+        key_all(b, f0+XS(8), LOC(up=0.35 * vary(b, "xu", 0.3)), ROT(roll=6*a*vary(b, "xs", 0.4)),
+                SQ(b, "x2", 1.50, 0.75), style=S("QUAD", "EASE_IN"))
+        key_all(b, F_END, LOC(up=1.2 * vary(b, "xe", 0.2)), ROT(roll=-10*a*vary(b, "xk", 0.4)), SCL(HIDDEN))
 
 
 # ============================================================
@@ -753,22 +984,25 @@ def v8_spin_zoom(master, letters):
     key(master, F_START, loc=LOC(up=-0.4), style=S("QUAD", "EASE_OUT"))
     key(master, 24, loc=LOC()); key(master, F_ENTRY_END, loc=LOC())
     for i, b in enumerate(letters):
-        d = stagger(i, n, 4); dr = stagger(i, n, 6); a = alt(i)
+        d = ostagger(b, i, n, 4); dr = ostagger(b, i, n, 6); a = alt(i)
         key_all(b, F_START, scl=SCL(HIDDEN))
         key_all(b, F_START+d, scl=SCL(HIDDEN), style=S("QUAD", "EASE_OUT"))
         key_all(b, F_START+d+4)
-        key(b, 12+dr, rot=ROT(roll=16*a), style=S("ELASTIC", "EASE_OUT", 0.3))
+        key(b, 12+dr, rot=ROT(roll=16*a*vary(b, "wr", 0.4)), style=S("ELASTIC", "EASE_OUT", 0.3 * vary(b, "per", 0.3)))
         key_all(b, F_ENTRY_END)
     # ---- LOOP (31..85) ----
     def sway(f):
-        w = swing(f, F_LOOP_START, F_IDLE_END, 1.5, 0.0)
+        w = wave(master, "sw", f, 1.5, 0.0)
         return LOC(up=0.03*w), ROT(roll=1.8*w), SCL(1.0+0.025*w*w)
     sample(master, F_LOOP_START, F_IDLE_END, 3, sway)
     for i, b in enumerate(letters):
         a = alt(i); t = tpos(i, n); key_all(b, F_LOOP_START)
-        for start in (F_LOOP_START+2+int(round(t*16)), F_LOOP_START+29+int(round(t*16))):
+        st1 = F_LOOP_START+2+int(round(t*16)) + int(round(jit(b, "h1", 1.0)))
+        st2 = F_LOOP_START+29+int(round(t*16)) + int(round(jit(b, "h2", 1.0)))
+        for hn, start in enumerate((st1, st2)):
             key_all(b, start, style=S("QUAD", "EASE_OUT"))
-            key_all(b, start+3, LOC(up=0.05), ROT(roll=3*a), SCL(1.16))
+            key_all(b, start+3, LOC(up=0.05 * vary(b, "hu%d" % hn, 0.3)), ROT(roll=3*a*vary(b, "hr%d" % hn, 0.4)),
+                    SCL(dv(1.16, b, "hs%d" % hn, 0.3)))
             key_all(b, start+7)
         key_all(b, F_IDLE_END)
     # ---- EXIT (86..100) ----
@@ -794,14 +1028,14 @@ def v9_scatter_assemble(master, letters):
         return LOC(up=r*math.sin(ang), side=r*math.cos(ang))
     # ---- ENTRY (1..30) ----
     key_all(master, F_START); key_all(master, 22)
-    key_all(master, 25, scl=SCL(1.06)); key_all(master, F_ENTRY_END)
+    key_all(master, 25, scl=SCL(dv(1.06, master, "m25", 0.4))); key_all(master, F_ENTRY_END)
     for b in letters:
         f0 = F_START + rng.randint(0, 8); start = far(1.3, 2.4)
         spun = ROT(pitch=rng.uniform(-70,70), roll=rng.uniform(-200,200))
         key(b, F_START, loc=start); key(b, f0, loc=start, style=S("BACK", "EASE_OUT"))
         key(b, F_ENTRY_END, loc=LOC())
         key(b, F_START, rot=spun)
-        key(b, f0, rot=spun, style=S("ELASTIC", "EASE_OUT", 0.3))
+        key(b, f0, rot=spun, style=S("ELASTIC", "EASE_OUT", 0.3 * vary(b, "per", 0.3)))
         key(b, F_ENTRY_END, rot=ROT())
         key(b, F_START, scl=SCL(HIDDEN))
         key(b, f0, scl=SCL(HIDDEN), style=S("QUAD", "EASE_OUT"))
@@ -810,10 +1044,12 @@ def v9_scatter_assemble(master, letters):
     key_all(master, F_LOOP_START); key_all(master, F_IDLE_END)
     for i, b in enumerate(letters):
         ph = rng.uniform(0.0, 2.0*math.pi); a = alt(i)
-        def orbit(f, ph=ph, a=a):
+        cyc = 2 * vary(b, "orb", 0.35)
+        amp = 0.035 * vary(b, "oa", 0.3)
+        def orbit(f, ph=ph, a=a, cyc=cyc, amp=amp):
             u = (f - F_LOOP_START) / float(F_IDLE_END - F_LOOP_START)
-            env = math.sin(math.pi*u); ang = 2.0*math.pi*2*u + ph
-            return (LOC(up=0.035*env*math.sin(ang), side=0.035*env*math.cos(ang)),
+            env = math.sin(math.pi*u); ang = 2.0*math.pi*cyc*u + ph
+            return (LOC(up=amp*env*math.sin(ang), side=amp*env*math.cos(ang)),
                     ROT(roll=2.0*a*env*math.sin(ang+1.0)), None)
         sample(b, F_LOOP_START, F_IDLE_END, 3, orbit)
     # ---- EXIT (86..100) ----
@@ -828,7 +1064,7 @@ def v9_scatter_assemble(master, letters):
 
 
 # ============================================================
-# V10 - GLITCH FLICKER
+# V10 - GLITCH FLICKER  (already random - no organic changes, no word layer)
 # ============================================================
 
 def v10_glitch_flicker(master, letters):
@@ -889,6 +1125,9 @@ def v10_glitch_flicker(master, letters):
         put_state(b, F_END-2, OFF); key_all(b, F_END, scl=SCL(HIDDEN))
 
 
+v10_glitch_flicker.word_layer = False      # hard digital cuts: no smooth word drift
+
+
 # ============================================================
 # V11 - DOMINO FLIP
 # ============================================================
@@ -898,11 +1137,12 @@ def v11_domino_flip(master, letters):
     # ---- ENTRY (1..30) ----
     key_all(master, F_START); key_all(master, F_ENTRY_END)
     for i, b in enumerate(letters):
-        f0 = F_START + stagger(i, n, 12); flat = ROT(pitch=-90)
+        f0 = F_START + ostagger(b, i, n, 12); flat = ROT(pitch=-90 * vary(b, "flat", 0.08))
+        low = LOC(up=-0.15 * vary(b, "lo", 0.3))
         key(b, F_START, rot=flat); key(b, f0, rot=flat, style=S("BACK", "EASE_OUT"))
         key(b, F_ENTRY_END, rot=ROT())
-        key(b, F_START, loc=LOC(up=-0.15))
-        key(b, f0, loc=LOC(up=-0.15), style=S("BACK", "EASE_OUT"))
+        key(b, F_START, loc=low)
+        key(b, f0, loc=low, style=S("BACK", "EASE_OUT"))
         key(b, F_ENTRY_END, loc=LOC())
         key(b, F_START, scl=SCL(HIDDEN))
         key(b, f0, scl=SCL(HIDDEN), style=S("QUAD", "EASE_OUT"))
@@ -911,17 +1151,17 @@ def v11_domino_flip(master, letters):
     key_all(master, F_LOOP_START); key_all(master, F_IDLE_END)
     for i, b in enumerate(letters):
         t = tpos(i, n)
-        s1 = F_LOOP_START + 2 + int(round(t*14))
-        s2 = F_LOOP_START + 31 + int(round((1.0-t)*12))
+        s1 = F_LOOP_START + 2 + int(round(t*14)) + int(round(jit(b, "t1", 1.0)))
+        s2 = F_LOOP_START + 31 + int(round((1.0-t)*12)) + int(round(jit(b, "t2", 1.0)))
         key_all(b, F_LOOP_START); key_all(b, s1, style=S("QUAD", "EASE_IN"))
-        key_all(b, s1+4, LOC(up=-0.02), ROT(pitch=14), style=S("BACK", "EASE_OUT"))
+        key_all(b, s1+4, LOC(up=-0.02), ROT(pitch=14 * vary(b, "p1", 0.35)), style=S("BACK", "EASE_OUT"))
         key_all(b, s1+10); key_all(b, s2, style=S("QUAD", "EASE_IN"))
-        key_all(b, s2+4, LOC(up=-0.02), ROT(pitch=-12), style=S("BACK", "EASE_OUT"))
+        key_all(b, s2+4, LOC(up=-0.02), ROT(pitch=-12 * vary(b, "p2", 0.35)), style=S("BACK", "EASE_OUT"))
         key_all(b, s2+9); key_all(b, F_IDLE_END)
     # ---- EXIT (86..100) ----
     key_all(master, F_EXIT_START); key_all(master, F_END)
     for i, b in enumerate(letters):
-        f0 = F_EXIT_START + stagger(i, n, XS(8)); fl = f0 + XS(10)
+        f0 = F_EXIT_START + ostagger(b, i, n, XS(8)); fl = f0 + XS(10)
         key_all(b, F_EXIT_START)
         key(b, f0, rot=ROT(), style=S("BACK", "EASE_IN"))
         key(b, fl, rot=ROT(pitch=90)); key(b, F_END, rot=ROT(pitch=90))
@@ -932,7 +1172,7 @@ def v11_domino_flip(master, letters):
 
 
 # ============================================================
-# V12 - ACCORDION SPREAD
+# V12 - ACCORDION SPREAD  (fans out around the middle of EACH word)
 # ============================================================
 
 def v12_accordion_spread(master, letters):
@@ -942,9 +1182,9 @@ def v12_accordion_spread(master, letters):
     key_all(master, F_START, scl=SCL(0.9), style=S("BACK", "EASE_OUT"))
     key_all(master, F_ENTRY_END)
     for i, b in enumerate(letters):
-        s = 2.0*tpos(i, n) - 1.0
-        f0 = F_START + int(round(abs(s)*6))
-        packed = LOC(side=side_by(b, -off[b.name])); fan = ROT(roll=30*s)
+        s = 2.0*tpos_word(b, i, n) - 1.0
+        f0 = F_START + max(0, int(round(abs(s)*6 + jit(b, "f0", 1.0))))
+        packed = LOC(side=side_by(b, -off[b.name])); fan = ROT(roll=30*s*vary(b, "fan", 0.2))
         key(b, F_START, loc=packed, rot=fan)
         key(b, f0, loc=packed, rot=fan, style=S("BACK", "EASE_OUT"))
         key(b, F_ENTRY_END, loc=LOC(), rot=ROT())
@@ -954,23 +1194,27 @@ def v12_accordion_spread(master, letters):
     # ---- LOOP (31..85) ----
     key_all(master, F_LOOP_START); key_all(master, F_IDLE_END)
     for i, b in enumerate(letters):
-        s = 2.0*tpos(i, n) - 1.0; o = off[b.name]
-        def breathe(f, b=b, s=s, o=o):
-            w = swing(f, F_LOOP_START, F_IDLE_END, 2, 0.0)
-            return (LOC(side=side_by(b, o*0.07*w), up=0.02*(1.0-abs(s))*w*w),
-                    ROT(roll=3.0*s*w), SCL(1.0+0.02*w))
+        s = 2.0*tpos_word(b, i, n) - 1.0; o = off[b.name]
+        side_a = 0.07 * vary(b, "bx", 0.3)
+        up_a = 0.02 * vary(b, "bu", 0.3)
+        roll_a = 3.0 * vary(b, "br", 0.3)
+        sc_a = 0.02 * vary(b, "bs", 0.3)
+        def breathe(f, b=b, s=s, o=o, side_a=side_a, up_a=up_a, roll_a=roll_a, sc_a=sc_a):
+            w = wave(b, "w", f, 2, 0.0)
+            return (LOC(side=side_by(b, o*side_a*w), up=up_a*(1.0-abs(s))*w*w),
+                    ROT(roll=roll_a*s*w), SCL(1.0+sc_a*w))
         sample(b, F_LOOP_START, F_IDLE_END, 2, breathe)
     # ---- EXIT (86..100) ----
     key_all(master, F_EXIT_START, style=S("QUAD", "EASE_IN"))
-    key_all(master, F_END, scl=SCL(0.85))
+    key_all(master, F_END, scl=SCL(dv(0.85, master, "x100", 0.3)))
     for i, b in enumerate(letters):
-        s = 2.0*tpos(i, n) - 1.0
-        f0 = F_EXIT_START + int(round((1.0-abs(s))*XS(6)))
+        s = 2.0*tpos_word(b, i, n) - 1.0
+        f0 = F_EXIT_START + max(0, int(round((1.0-abs(s))*XS(6) + jit(b, "x0", 1.0))))
         key_all(b, F_EXIT_START)
         key(b, f0, loc=LOC(), style=S("BACK", "EASE_IN"))
         key(b, F_END, loc=LOC(side=side_by(b, -off[b.name])))
         key(b, f0, rot=ROT(), style=S("QUAD", "EASE_IN"))
-        key(b, F_END, rot=ROT(roll=-30*s))
+        key(b, F_END, rot=ROT(roll=-30*s*vary(b, "xr", 0.2)))
         key(b, f0, scl=SCL(), style=S("QUAD", "EASE_IN"))
         key(b, F_END, scl=SCL(HIDDEN))
 
@@ -1109,22 +1353,41 @@ def _rig_ok(rig_name):
 
 
 def _layout(word):
-    """[(CHAR, x)] for every letter. A space adds WORD_GAP. Centered on X = 0."""
-    items, x = [], 0.0
-    for c in word:
-        if c.isspace():
+    """Layout of a text: one row per word, the first word on top, every word centered on X = 0.
+    [{"word": "MASSIVE", "z": 0.625, "cx": 0.0, "letters": [("M", -3.0), ...]}, ...]
+    With STACK_WORDS = False all words sit side by side on one line instead."""
+    words = [w for w in word.split() if w]
+    if not words:
+        return []
+    rows = []
+    if STACK_WORDS and len(words) > 1:
+        count = len(words)
+        for k, w in enumerate(words):
+            z = ((count - 1) / 2.0 - k) * LINE_HEIGHT
+            xs = [(i - (len(w) - 1) / 2.0) * LETTER_SPACING for i in range(len(w))]
+            rows.append({"word": w.upper(), "z": z, "letters": [[c.upper(), x] for c, x in zip(w, xs)]})
+    else:
+        x = 0.0
+        for w in words:
+            items = []
+            for c in w:
+                items.append([c.upper(), x])
+                x += LETTER_SPACING
+            rows.append({"word": w.upper(), "z": 0.0, "letters": items})
             x += WORD_GAP
-            continue
-        items.append([c.upper(), x])
-        x += LETTER_SPACING
-    if items:
-        shift = (items[0][1] + items[-1][1]) / 2.0
-        for it in items:
-            it[1] -= shift
-    return [(c, px) for c, px in items]
+        allx = [it[1] for r in rows for it in r["letters"]]
+        shift = (min(allx) + max(allx)) / 2.0
+        for r in rows:
+            for it in r["letters"]:
+                it[1] -= shift
+    for r in rows:
+        xs = [it[1] for it in r["letters"]]
+        r["cx"] = (min(xs) + max(xs)) / 2.0
+        r["letters"] = [(c, x) for c, x in r["letters"]]
+    return rows
 
 
-def _make_letter_object(rig_name, bone_name, ch, x, col):
+def _make_letter_object(rig_name, bone_name, ch, x, zc, col):
     """One letter as a mesh object (standing up, facing the front view)."""
     obj_name = bone_name.replace("_BONE", "") + "_MESH"
     curve = bpy.data.curves.new("%s_%s_txt" % (rig_name, bone_name), 'FONT')
@@ -1135,7 +1398,7 @@ def _make_letter_object(rig_name, bone_name, ch, x, col):
     curve.extrude = LETTER_EXTRUDE
     tmp = bpy.data.objects.new(obj_name + "_tmp", curve)
     col.objects.link(tmp)
-    loc = (x, 0.0, 0.5)
+    loc = (x, 0.0, zc)
     rot = (math.radians(90.0), 0.0, 0.0)
     tmp.location = loc
     tmp.rotation_euler = rot
@@ -1190,7 +1453,10 @@ def _make_letter_object(rig_name, bone_name, ch, x, col):
 
 
 def _do_create_rig(rig_name, word):
-    """Build armature + letter meshes (deformed by the armature) in their own collection.
+    """Build ONE armature for a whole text, plus the letter meshes (deformed by the armature),
+    in their own collection:
+        GLOBAL_MASTER > <WORD>_ROOT (one parent bone per word) > one bone per letter
+    The first word is on top, the next word below it (MASSIVE over WIN).
     Returns True when the rig exists afterwards. Raises RuntimeError (after cleaning
     up, so no half-built rig stays in the scene) when something goes wrong."""
     existing = bpy.data.objects.get(rig_name)
@@ -1206,21 +1472,33 @@ def _do_create_rig(rig_name, word):
         else:
             return True
 
-    layout = _layout(word)
-    if not layout:
+    rows = _layout(word)
+    if not rows:
         raise RuntimeError("no letters found in '%s'" % word)
 
-    counts = {}
-    for ch, _x in layout:
-        counts[ch] = counts.get(ch, 0) + 1
-    seen, letter_info = {}, []
-    for ch, x in layout:
-        if counts[ch] > 1:
-            seen[ch] = seen.get(ch, 0) + 1
-            bone_name = "%s%d_BONE" % (ch, seen[ch])
+    counts, wcounts = {}, {}
+    for r in rows:
+        wcounts[r["word"]] = wcounts.get(r["word"], 0) + 1
+        for ch, _x in r["letters"]:
+            counts[ch] = counts.get(ch, 0) + 1
+    seen, wseen, plan = {}, {}, []
+    for r in rows:
+        items = []
+        for ch, x in r["letters"]:
+            if counts[ch] > 1:
+                seen[ch] = seen.get(ch, 0) + 1
+                bone_name = "%s%d_BONE" % (ch, seen[ch])
+            else:
+                bone_name = "%s_BONE" % ch
+            items.append((bone_name, ch, x))
+        if wcounts[r["word"]] > 1:
+            wseen[r["word"]] = wseen.get(r["word"], 0) + 1
+            root_name = "%s%d_ROOT" % (r["word"], wseen[r["word"]])
         else:
-            bone_name = "%s_BONE" % ch
-        letter_info.append((bone_name, ch, x))
+            root_name = "%s_ROOT" % r["word"]
+        plan.append((root_name, items, r["z"], r["cx"]))
+    total_letters = sum(len(p[1]) for p in plan)
+    z_master = sum(p[2] for p in plan) / len(plan) + LETTER_CENTER
 
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
@@ -1253,29 +1531,36 @@ def _do_create_rig(rig_name, word):
         _run_op(bpy.ops.object.mode_set, mode='EDIT')
         edit_bones = arm_data.edit_bones
         master = edit_bones.new("GLOBAL_MASTER")
-        master.head = (0.0, 0.0, 0.0)
-        master.tail = (0.0, BONE_LENGTH, 0.0)
-        for bone_name, ch, x in letter_info:
-            b = edit_bones.new(bone_name)
-            b.head = (x, 0.0, 0.0)
-            b.tail = (x, BONE_LENGTH, 0.0)
-            b.parent = master
-            b.use_connect = False
+        master.head = (0.0, 0.0, z_master)
+        master.tail = (0.0, BONE_LENGTH, z_master)
+        for root_name, items, z, cx in plan:
+            rb = edit_bones.new(root_name)                    # the parent bone of this word
+            rb.head = (cx, 0.0, z + LETTER_CENTER)
+            rb.tail = (cx, BONE_LENGTH, z + LETTER_CENTER)
+            rb.parent = master
+            rb.use_connect = False
+            for bone_name, ch, x in items:                    # one bone per letter
+                b = edit_bones.new(bone_name)
+                b.head = (x, 0.0, z)
+                b.tail = (x, BONE_LENGTH, z)
+                b.parent = rb
+                b.use_connect = False
         _run_op(bpy.ops.object.mode_set, mode='OBJECT')
 
         gold = _get_or_create_gold_material()
-        for bone_name, ch, x in letter_info:
-            obj = _make_letter_object(rig_name, bone_name, ch, x, col)
-            created.append(obj)
-            if not obj.data.materials:
-                obj.data.materials.append(gold)
-            mod = obj.modifiers.new("Armature", 'ARMATURE')
-            mod.object = arm_obj
-            vg = obj.vertex_groups.new(name=bone_name)
-            vg.add(list(range(len(obj.data.vertices))), 1.0, 'REPLACE')
-            obj.parent = arm_obj
-            obj.parent_type = 'OBJECT'
-            obj.matrix_parent_inverse.identity()
+        for root_name, items, z, cx in plan:
+            for bone_name, ch, x in items:
+                obj = _make_letter_object(rig_name, bone_name, ch, x, z + LETTER_CENTER, col)
+                created.append(obj)
+                if not obj.data.materials:
+                    obj.data.materials.append(gold)
+                mod = obj.modifiers.new("Armature", 'ARMATURE')
+                mod.object = arm_obj
+                vg = obj.vertex_groups.new(name=bone_name)
+                vg.add(list(range(len(obj.data.vertices))), 1.0, 'REPLACE')
+                obj.parent = arm_obj
+                obj.parent_type = 'OBJECT'
+                obj.matrix_parent_inverse.identity()
     except Exception as err:
         traceback.print_exc()
         try:
@@ -1302,7 +1587,8 @@ def _do_create_rig(rig_name, word):
         raise RuntimeError(str(err))
 
     _restore_selection(view_layer, prev_selected, prev_active)
-    print("[Win Anim] Created '%s' (%d letters) in collection '%s'" % (rig_name, len(letter_info), col_name))
+    print("[Win Anim] Created '%s': %d words, %d letters, one armature, in collection '%s'"
+          % (rig_name, len(plan), total_letters, col_name))
     return True
 
 
@@ -1538,10 +1824,13 @@ def reset_pose(pose_bones):
 
 
 def build_variation(armature, master, letters, action_name, builder):
-    reset_pose([master] + letters)
+    roots = CTX["roots"]
+    reset_pose([master] + roots + letters)
     TRACK.clear()
     builder(master, letters)
-    ensure_boundaries([master] + letters)      # frames 30 / 31 / 85 / 86 = identical rest pose
+    if getattr(builder, "word_layer", True):
+        word_layer()                           # secondary motion on the word parent bones
+    ensure_boundaries([master] + roots + letters)   # frames 30 / 31 / 85 / 86 = identical rest pose
     return write_action(armature, action_name)
 
 
@@ -1579,6 +1868,15 @@ class WinAnimProps(bpy.types.PropertyGroup):
         name="HUGE WIN", default=False, update=_make_create_cb(2))
 
     fps: bpy.props.IntProperty(name="FPS", default=30, min=1, max=120)
+
+    organic: bpy.props.FloatProperty(
+        name="Organic", default=ORGANIC_DEFAULT, min=0.0, max=1.0, subtype='FACTOR',
+        description="0 = pure math (plain sine waves, perfectly even stagger). 1 = organic: "
+                    "irregular multi-frequency motion, uneven start times, every letter a little "
+                    "different, words that lag and overshoot on their own")
+    seed: bpy.props.IntProperty(
+        name="Seed", default=SEED_DEFAULT, min=0, max=9999,
+        description="A different (but repeatable) organic variation")
 
     auto_axes: bpy.props.BoolProperty(
         name="Auto-detect bone axes", default=True,
@@ -1703,7 +2001,8 @@ def _verify_action(action, expected_fcurves):
 def _verify_rig(rig, repair=True):
     """-> ({variation: [problems]}, [notes]). A variation that was not built shows ['not built']."""
     result, notes = {}, []
-    expected = (len(get_letter_bones(rig)) + 1) * 9
+    groups = get_word_groups(rig)
+    expected = (1 + sum(1 for r, _ in groups if r is not None) + sum(len(ls) for _, ls in groups)) * 9
     for vname, _ in VARIATIONS:
         action = bpy.data.actions.get(_our_action_name(rig, vname))
         if action is None:
@@ -1724,14 +2023,15 @@ def _verify_rig(rig, repair=True):
     return result, notes
 
 
-def _build_one(rig, var_index, auto_axes=True):
+def _build_one(rig, var_index, auto_axes=True, organic=None, seed=None):
     """Build one variation on one rig. The new action is built under a temporary name and
     replaces the old one only after it succeeded - a failed build never costs you an action."""
     vname, builder = VARIATIONS[var_index - 1]
     master = rig.pose.bones.get("GLOBAL_MASTER")
     if master is None:
         raise _RigError("no GLOBAL_MASTER bone found")
-    letters = get_letter_bones(rig)
+    groups = get_word_groups(rig)
+    letters = [b for _r, ls in groups for b in ls]
     if not letters:
         raise _RigError("no letter bones (*_BONE) found")
     final = _our_action_name(rig, vname)
@@ -1742,7 +2042,9 @@ def _build_one(rig, var_index, auto_axes=True):
     _protect_foreign_action(rig)
     ad = rig.animation_data
     previous = ad.action if ad is not None else None
-    prepare_context(rig, letters, master, auto_axes)
+    prepare_context(rig, letters, master, auto_axes, groups=groups,
+                    organic=ORGANIC_DEFAULT if organic is None else organic,
+                    seed=SEED_DEFAULT if seed is None else seed, vid=var_index)
     try:
         action = build_variation(rig, master, letters, tmp, builder)
     except Exception:
@@ -1810,7 +2112,7 @@ class WIN_ANIM_OT_build_all(bpy.types.Operator):
                 prev = rig.animation_data.action.name
             for i in range(1, len(VARIATIONS) + 1):
                 try:
-                    _build_one(rig, i, props.auto_axes)
+                    _build_one(rig, i, props.auto_axes, props.organic, props.seed)
                 except _RigError as err:
                     self.report({'ERROR'}, "%s: %s" % (rig.name, err))
                     break
@@ -1823,7 +2125,7 @@ class WIN_ANIM_OT_build_all(bpy.types.Operator):
             if retry and rig.pose.bones.get("GLOBAL_MASTER") is not None and get_letter_bones(rig):
                 for i in retry:
                     try:
-                        _build_one(rig, i, props.auto_axes)
+                        _build_one(rig, i, props.auto_axes, props.organic, props.seed)
                     except Exception:
                         traceback.print_exc()
                 problems, notes = _verify_rig(rig)
@@ -1861,7 +2163,7 @@ class WIN_ANIM_OT_build_one(bpy.types.Operator):
         count = 0
         for rig in rigs:
             try:
-                if _build_one(rig, self.variation, props.auto_axes):
+                if _build_one(rig, self.variation, props.auto_axes, props.organic, props.seed):
                     count += 1
             except Exception as err:
                 traceback.print_exc()
@@ -1889,7 +2191,7 @@ class WIN_ANIM_OT_apply(bpy.types.Operator):
         for rig in rigs:
             try:
                 if not bpy.data.actions.get("%s_%s" % (rig.name, vname)):
-                    _build_one(rig, self.variation, props.auto_axes)
+                    _build_one(rig, self.variation, props.auto_axes, props.organic, props.seed)
                 if _apply_one(rig, self.variation):
                     count += 1
             except Exception as err:
@@ -1966,9 +2268,11 @@ class WIN_ANIM_OT_reset_pose(bpy.types.Operator):
         rigs = _enabled_rigs(context.scene)
         for rig in rigs:
             master = rig.pose.bones.get("GLOBAL_MASTER")
-            letters = get_letter_bones(rig)
+            groups = get_word_groups(rig)
+            roots = [r for r, _ in groups if r is not None]
+            letters = [b for _r, ls in groups for b in ls]
             if master:
-                reset_pose([master] + letters)
+                reset_pose([master] + roots + letters)
         self.report({'INFO'}, f"Reset {len(rigs)} rig(s)")
         return {'FINISHED'}
 
@@ -2050,6 +2354,8 @@ class VIEW3D_PT_win_animations(bpy.types.Panel):
         box.label(text="Settings", icon=_icon('SETTINGS'))
         box.prop(props, "fps")
         box.prop(props, "auto_axes")
+        box.prop(props, "organic", slider=True)
+        box.prop(props, "seed")
         box.label(text=f"Frames: {F_START}-{F_END} ({F_END - F_START + 1}f)", icon=_icon('TIME'))
         box.label(text=f"Entry {F_START}-{F_ENTRY_END} | Loop {F_LOOP_START}-{F_IDLE_END} | Exit {F_EXIT_START}-{F_END}")
 
@@ -2111,30 +2417,4 @@ def _unregister_existing():
         except Exception:
             pass
     for cls in reversed(_classes):
-        old = getattr(bpy.types, cls.__name__, None)
-        if old is not None:
-            try:
-                bpy.utils.unregister_class(old)
-            except Exception:
-                pass
-
-
-def register():
-    _unregister_existing()
-    for cls in _classes:
-        bpy.utils.register_class(cls)
-    bpy.types.Scene.win_anim = bpy.props.PointerProperty(type=WinAnimProps)
-
-
-def unregister():
-    if hasattr(bpy.types.Scene, "win_anim"):
-        del bpy.types.Scene.win_anim
-    for cls in reversed(_classes):
-        try:
-            bpy.utils.unregister_class(cls)
-        except Exception:
-            pass
-
-
-if __name__ == "__main__":
-    register()
+      
