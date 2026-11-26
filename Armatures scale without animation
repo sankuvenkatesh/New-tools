@@ -1,6 +1,6 @@
 bl_info = {
     "name": "Armature Transform Apply Pro",
-    "author": "OpenAI",
+    "author": "venkatesh sanku",
     "version": (1, 0, 3),
     "blender": (5, 2, 0),
     "location": "3D Viewport > Sidebar > Animation > Armature Transform Apply Pro",
