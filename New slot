@@ -1,0 +1,1120 @@
+bl_info = {
+    "name": "Slot Symbol Animation Generator",
+    "author": "Venkatesh Sanku",
+    "version": (9, 6, 0),
+    "blender": (5, 2, 4),
+    "location": "View3D > Sidebar > Slot Symbol",
+    "description": "AAA C2 Envelopes, SO(3)-Seamless Spin Loops, Custom Action Preservation, Logarithmic Lags, Juiciness & Blender 5.2.4 LTS Channel Bags API",
+    "category": "Animation",
+}
+
+import math
+import traceback
+
+import bmesh
+import bpy
+from bpy_extras import anim_utils
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, PointerProperty, StringProperty
+from bpy.types import Operator, Panel, PropertyGroup
+
+# ---------------------------------------------------------------------------
+# Production Frame Architecture
+# ---------------------------------------------------------------------------
+FPS = 30
+RIG_NAME = "SymbolRig"
+MESH_NAME = "SymbolCube"
+ROOT_BONE = "Root"
+
+# Frame Timings
+IDLE_PERIOD = 50
+WIN_DURATION = 100
+TOTAL_FRAMES = IDLE_PERIOD + WIN_DURATION + 1  # 151 Frames
+
+IDLE_STYLES = (
+    "FloatingSpin", "HoverDance", "JumpingIdle", "Lean",
+    "Orbit", "PulsingIdle", "Rocking", "Shake",
+    "SideHop", "SpinningIdle", "SpringBounce", "SquashStretchIdle",
+    "TiltingIdle", "Tumble", "Twist", "WobbleIdle",
+)
+
+# Styles with unidirectional continuous 360/720-deg SO(3) spin loops
+_CONTINUOUS_SPIN_META = {
+    "FloatingSpin": ("Y", 1, 3),   # Bone Y (= world Z): 1 rev/idle, 3 revs/total
+    "SpinningIdle": ("Y", 2, 6),   # Bone Y (= world Z): 2 revs/idle, 6 revs/total
+    "Tumble": ("X", 1, 3),         # Bone X (= world X): 1 rev/idle, 3 revs/total
+}
+
+_STYLE_ENUM_ITEMS = (
+    ("ALL", "All 16 Styles (Batch)", "Generate all 16 styles"),
+    *((s, s, f"Preview {s}") for s in IDLE_STYLES),
+)
+
+_ROOT_PROPS = ("location", "rotation_euler", "scale")
+_LN2 = math.log(2.0)
+_LAG_PROP_SCALE = {
+    "loc": 0.8,
+    "rot": 1.0,
+    "scale": 1.2,
+}
+_IS_LIVE_UPDATING = False
+
+
+def _version_string():
+    return bpy.app.version_string
+
+
+def _is_class_registered(cls):
+    """Uses Blender's RNAMeta.is_registered ('bl_rna' in cls.__dict__) safely."""
+    if hasattr(bpy.utils, "is_registered_class"):
+        return bool(bpy.utils.is_registered_class(cls))
+    return bool(getattr(cls, "is_registered", False))
+
+
+# ---------------------------------------------------------------------------
+# AAA C2 Mathematical Primitives & Validation
+# ---------------------------------------------------------------------------
+def safe_val(v, default=0.0):
+    """NaN / Infinity రక్షణ: ఏవైనా మ్యాథ్ ఎర్రర్స్ వస్తే సేఫ్ వాల్యూకి ఫాల్‌బ్యాక్ అవుతుంది."""
+    if math.isnan(v) or math.isinf(v):
+        return default
+    return v
+
+
+def smooth_step(edge0, edge1, x):
+    """Quintic Smootherstep: C0 + C1 + C2 Continuity (0 velocity & 0 acceleration at edges)."""
+    if edge1 == edge0:
+        return 0.0 if x < edge0 else 1.0
+    t = max(0.0, min(1.0, (x - edge0) / (edge1 - edge0)))
+    return t * t * t * (t * (6.0 * t - 15.0) + 10.0)
+
+
+def _bell_c2(u):
+    """C2 smooth bell curve on [0, 1]: peaks at 1.0 (u=0.5) with 0 pos/vel/acc at u=0 and u=1."""
+    if u <= 0.0 or u >= 1.0:
+        return 0.0
+    inv = 1.0 - u
+    return 64.0 * (u * u * u) * (inv * inv * inv)
+
+
+def _anticipation_ramp_c2(q):
+    """C2 smooth ramp 0->1 with anticipation pull-back (~ -0.11) and 0 vel/acc at both q=0 and q=1."""
+    if q <= 0.0:
+        return 0.0
+    if q >= 1.0:
+        return 1.0
+    q2 = q * q
+    q3 = q2 * q
+    inv = 1.0 - q
+    inv2 = inv * inv
+    quintic = q3 * (q * (6.0 * q - 15.0) + 10.0)
+    anticipation_dip = 45.0 * q3 * (inv2 * inv2)
+    return quintic - anticipation_dip
+
+
+# ---------------------------------------------------------------------------
+# C2-Continuous Envelopes & Cinematic Travel
+# ---------------------------------------------------------------------------
+def get_travel_envelope(t_win):
+    if t_win <= 0.0 or t_win >= 1.0:
+        return 0.0
+
+    if t_win < 0.15:
+        return _anticipation_ramp_c2(t_win / 0.15)
+    elif t_win < 0.85:
+        u = (t_win - 0.15) / 0.70
+        return 1.0 + 0.05 * _bell_c2(u)
+    else:
+        inv_q = 1.0 - ((t_win - 0.85) / 0.15)
+        return _anticipation_ramp_c2(inv_q)
+
+
+def get_squash_stretch(t_win, squash_intensity=1.0):
+    if t_win <= 0.0 or t_win >= 1.0 or squash_intensity <= 0.0:
+        return (1.0, 1.0, 1.0)
+
+    if t_win < 0.15:
+        q = _bell_c2(t_win / 0.15) * squash_intensity
+        return (
+            max(0.15, 1.0 - 0.1 * q),
+            max(0.15, 1.0 + 0.3 * q),
+            max(0.15, 1.0 - 0.1 * q),
+        )
+    elif t_win < 0.35:
+        u = (t_win - 0.15) / 0.20
+        attack = smooth_step(0.0, 0.15, u)
+        decay = (1.0 - u) ** 3
+        w = math.sin(u * math.pi * 3.0) * attack * decay * squash_intensity
+        return (
+            max(0.15, 1.0 + 0.2 * w),
+            max(0.15, 1.0 - 0.3 * w),
+            max(0.15, 1.0 + 0.2 * w),
+        )
+    elif t_win > 0.85:
+        q = _bell_c2((t_win - 0.85) / 0.15) * squash_intensity
+        return (
+            max(0.15, 1.0 - 0.1 * q),
+            max(0.15, 1.0 + 0.2 * q),
+            max(0.15, 1.0 - 0.1 * q),
+        )
+
+    return (1.0, 1.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# True Independent Dynamic Lag System (Logarithmic Micro-Optimized)
+# ---------------------------------------------------------------------------
+def _lag(base_offset, intensity, prop_type="rot"):
+    """
+    Smooth C-infinity logarithmic follow-through scaling.
+    I=0.1 -> ~1.32x (crisp, no hard clamp) | I=1.0 -> 1.00x | I=5.0 -> ~0.69x (snappy).
+    """
+    safe_i = max(0.0, intensity)
+    factor = 0.72 + 0.28 * (math.log1p(safe_i) / _LN2)
+    return (base_offset * _LAG_PROP_SCALE.get(prop_type, 1.0)) / factor
+
+
+# ---------------------------------------------------------------------------
+# Base Continuous C2 Math Motions (Retained Personalities + Juiciness Control)
+# ---------------------------------------------------------------------------
+def _idle_base(style, t, variant, intensity=1.0, squash_intensity=1.0):
+    p = 2.0 * math.pi * t
+    phase = variant * 0.37
+    wave = math.sin(p)
+    wave2 = math.sin(2.0 * p)
+
+    wx = wy = wz = 0.0
+    wrx = wry = wrz = 0.0
+    wsx = wsy = wsz = 1.0
+
+    if style == "FloatingSpin":
+        wz = (0.10 * math.sin(p - _lag(0.25, intensity, "loc"))) * intensity
+        wrz = t * (2.0 * math.pi) + (0.05 * math.sin(4.0 * p))
+    elif style == "HoverDance":
+        wx = (0.15 * math.sin(p + phase)) * intensity
+        wz = (0.10 * math.sin(2.0 * p - _lag(0.4, intensity, "loc"))) * intensity
+        wry = (0.15 * math.sin(p - _lag(0.1, intensity, "rot"))) * intensity
+    elif style == "JumpingIdle":
+        hop = max(0.0, wave)
+        wz = (0.25 * (hop * hop * hop)) * intensity
+        dsx = 0.1 * math.sin(2.0 * p + math.pi - _lag(0.25, intensity, "scale")) * intensity * squash_intensity
+        dsz = -0.15 * math.sin(2.0 * p + math.pi - _lag(0.25, intensity, "scale")) * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + dsx, 1.0 + dsx, 1.0 + dsz
+    elif style == "Lean":
+        wrx = (0.25 + 0.05 * wave) * intensity
+        wry = (0.10 * math.sin(p * 2.0 - _lag(0.5, intensity, "rot"))) * intensity
+    elif style == "Orbit":
+        wx = (0.20 * math.cos(p)) * intensity
+        wz = (0.10 * math.sin(2.0 * p - _lag(0.3, intensity, "loc"))) * intensity
+        wry = (0.15 * math.sin(p - _lag(0.2, intensity, "rot"))) * intensity
+    elif style == "PulsingIdle":
+        ds = 0.15 * math.sin(p - _lag(0.2, intensity, "scale")) * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + ds, 1.0 + ds, 1.0 - ds
+    elif style == "Rocking":
+        wrx = (0.35 * wave) * intensity
+        wz = (0.05 * math.sin(2.0 * p - _lag(0.6, intensity, "loc"))) * intensity
+    elif style == "Shake":
+        wx = (0.08 * math.sin(4.0 * p)) * intensity
+        wrz = (0.15 * math.sin(5.0 * p - _lag(0.15, intensity, "rot"))) * intensity
+    elif style == "SideHop":
+        wx = (0.20 * wave) * intensity
+        hop2 = max(0.0, wave2)
+        wz = (0.15 * (hop2 * hop2 * hop2)) * intensity
+        wrz = (0.20 * math.sin(p - _lag(0.35, intensity, "rot"))) * intensity
+    elif style == "SpinningIdle":
+        wrz = t * (4.0 * math.pi) + (0.08 * math.sin(2.0 * p))
+    elif style == "SpringBounce":
+        wz = (0.25 * (wave * wave)) * intensity
+        s_lag = math.sin(p - _lag(0.2, intensity, "scale"))
+        s_sq = s_lag * s_lag
+        dsx = -0.1 * s_sq * intensity * squash_intensity
+        dsz = 0.2 * s_sq * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + dsx, 1.0 + dsx, 1.0 + dsz
+    elif style == "SquashStretchIdle":
+        ds = 0.20 * math.sin(p - _lag(0.15, intensity, "scale")) * intensity * squash_intensity
+        dsz = -0.25 * math.sin(p - _lag(0.15, intensity, "scale")) * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + ds, 1.0 + ds, 1.0 + dsz
+    elif style == "TiltingIdle":
+        wry = (0.30 * wave) * intensity
+        wrx = (0.15 * math.sin(p + 1.5 - _lag(0.4, intensity, "rot"))) * intensity
+    elif style == "Tumble":
+        wrx = t * (2.0 * math.pi) + (0.08 * math.sin(2.0 * p))
+    elif style == "Twist":
+        wrz = (0.60 * wave) * intensity
+        wry = (0.15 * math.sin(2.0 * p - _lag(0.35, intensity, "rot"))) * intensity
+    elif style == "WobbleIdle":
+        wrx = (0.25 * wave) * intensity
+        wry = (0.25 * math.sin(p + 1.5 - _lag(0.5, intensity, "rot"))) * intensity
+
+    return wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz
+
+
+def world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz):
+    return (wx, wz, wy), (wrx, wrz, wry), (wsx, wsz, wsy)
+
+
+# ---------------------------------------------------------------------------
+# The Master Evaluator (C2 Envelopes, SO(3)-Seamless Spins & Decaying Tremor)
+# ---------------------------------------------------------------------------
+def _evaluate_frame(style, variant, frame, travel_y, idle_intensity, win_intensity, squash_intensity=1.0):
+    t_continuous = (frame - 1) / float(IDLE_PERIOD)
+
+    t_win = 0.0
+    if frame > IDLE_PERIOD + 1:
+        t_win = (frame - (IDLE_PERIOD + 1)) / float(WIN_DURATION)
+        t_win = max(0.0, min(1.0, t_win))
+
+    env = get_travel_envelope(t_win)
+
+    if t_win < 0.5:
+        blend_factor = smooth_step(0.0, 0.15, t_win)
+    else:
+        blend_factor = 1.0 - smooth_step(0.85, 1.0, t_win)
+    current_intensity = idle_intensity + (win_intensity - idle_intensity) * blend_factor
+
+    bx, by, bz, brx, bry, brz, bsx, bsy, bsz = _idle_base(
+        style, t_continuous, variant, current_intensity, squash_intensity
+    )
+    b0x, b0y, b0z, b0rx, b0ry, b0rz, b0sx, b0sy, b0sz = _idle_base(
+        style, 0.0, variant, current_intensity, squash_intensity
+    )
+
+    wx = bx - b0x
+    wy = by - b0y
+    wz = bz - b0z
+    wrx = brx - b0rx
+    wry = bry - b0ry
+    wrz = brz - b0rz
+
+    wsx = max(0.15, 1.0 + (bsx - b0sx))
+    wsy = max(0.15, 1.0 + (bsy - b0sy))
+    wsz = max(0.15, 1.0 + (bsz - b0sz))
+
+    wy += travel_y * env
+
+    ssx, ssy, ssz = get_squash_stretch(t_win, squash_intensity)
+    wsx *= ssx
+    wsy *= ssy
+    wsz *= ssz
+
+    # C2-Enveloped Decaying Impact Tremor (0 pos/vel/acc at both 0.15 and 0.35)
+    if 0.15 < t_win < 0.35:
+        tremor_time = (t_win - 0.15) / 0.20
+        attack = smooth_step(0.0, 0.12, tremor_time)
+        decay = (1.0 - tremor_time) ** 3
+        tremor_env = attack * decay
+
+        freq_decay = 1.0 + 0.5 * (1.0 - tremor_time)
+        freq_z = 15.0 * (0.8 + 0.2 * win_intensity) * freq_decay
+        freq_rot = 18.0 * (0.8 + 0.2 * win_intensity) * freq_decay
+        freq_scale = 24.0 * (0.8 + 0.2 * win_intensity) * freq_decay
+
+        punch_power = current_intensity ** 1.2
+
+        wz += math.sin(tremor_time * math.pi * freq_z) * 0.04 * tremor_env * punch_power
+        wrx += math.cos(tremor_time * math.pi * freq_rot) * 0.06 * tremor_env * punch_power
+
+        s_tremor = math.sin(tremor_time * math.pi * freq_scale) * 0.05 * tremor_env * punch_power * squash_intensity
+        wsx += s_tremor
+        wsz += s_tremor
+        wsy -= s_tremor * 1.5
+
+    wsx = max(0.1, min(4.0, safe_val(wsx, 1.0)))
+    wsy = max(0.1, min(4.0, safe_val(wsy, 1.0)))
+    wsz = max(0.1, min(4.0, safe_val(wsz, 1.0)))
+
+    return world_to_bone_space(
+        safe_val(wx), safe_val(wy), safe_val(wz),
+        safe_val(wrx), safe_val(wry), safe_val(wrz),
+        wsx, wsy, wsz,
+    )
+
+
+def _compute_endpoint_velocities(style, variant, travel_y, idle_intensity, win_intensity, squash_intensity):
+    """Computes exact 2nd-order one-sided frame velocities at Frame 1+ and Frame 151- for seamless Bezier loops."""
+    h = 1e-3
+
+    def _flat(f):
+        loc, rot, scl = _evaluate_frame(style, variant, f, travel_y, idle_intensity, win_intensity, squash_intensity)
+        return (*loc, *rot, *scl)
+
+    f1_0 = _flat(1.0)
+    f1_1 = _flat(1.0 + h)
+    f1_2 = _flat(1.0 + 2.0 * h)
+    v_start = [(-1.5 * f1_0[i] + 2.0 * f1_1[i] - 0.5 * f1_2[i]) / h for i in range(9)]
+
+    fn_0 = _flat(float(TOTAL_FRAMES))
+    fn_1 = _flat(float(TOTAL_FRAMES) - h)
+    fn_2 = _flat(float(TOTAL_FRAMES) - 2.0 * h)
+    v_end = [(1.5 * fn_0[i] - 2.0 * fn_1[i] + 0.5 * fn_2[i]) / h for i in range(9)]
+
+    return v_start, v_end
+
+
+# ---------------------------------------------------------------------------
+# Preview Action Clean Link / Unlink State & Custom Action Safety
+# ---------------------------------------------------------------------------
+def _reset_root_pose(rig):
+    if rig is not None and rig.type == "ARMATURE" and ROOT_BONE in rig.pose.bones:
+        pb = rig.pose.bones[ROOT_BONE]
+        pb.rotation_mode = "XYZ"
+        pb.location = (0.0, 0.0, 0.0)
+        pb.rotation_euler = (0.0, 0.0, 0.0)
+        pb.scale = (1.0, 1.0, 1.0)
+
+
+def _capture_custom_action(rig):
+    """Captures any non-slot-symbol user custom action & ActionSlot on the rig so it is never lost."""
+    if rig is None or rig.type != "ARMATURE" or rig.animation_data is None:
+        return None, None
+    act = rig.animation_data.action
+    if act is not None and not act.get("is_slot_symbol"):
+        return act, getattr(rig.animation_data, "action_slot", None)
+    return None, None
+
+
+def _restore_custom_action(rig, custom_action, custom_slot):
+    if rig is None or custom_action is None:
+        return
+    ad = rig.animation_data or rig.animation_data_create()
+    ad.action = custom_action
+    if custom_slot is not None:
+        ad.action_slot = custom_slot
+    rig.update_tag(refresh={"DATA"})
+
+
+def _bind_preview_action(rig, action, slot=None):
+    """Safely binds a Slot Symbol Action & its ActionSlot to the rig for preview."""
+    if rig is None or action is None:
+        return
+    ad = rig.animation_data or rig.animation_data_create()
+    ad.action = action
+    target_slot = slot or (action.slots[0] if action.slots else None)
+    if target_slot is not None:
+        ad.action_slot = target_slot
+    rig.update_tag(refresh={"DATA"})
+
+
+def _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=None):
+    """
+    Safely unlinks preview action & ActionSlot from SymbolRig to keep Action/NLA Editors clean.
+    When only_slot_symbol=True (default), user custom actions are strictly preserved.
+    """
+    if rig is None or rig.type != "ARMATURE":
+        return False
+
+    unlinked = False
+    has_custom = False
+    ad = rig.animation_data
+    if ad is not None and ad.action is not None:
+        if not only_slot_symbol or ad.action.get("is_slot_symbol"):
+            ad.action = None
+            ad.action_slot = None
+            unlinked = True
+        else:
+            has_custom = True
+
+    if reset_pose and not has_custom:
+        _reset_root_pose(rig)
+
+    if unlinked:
+        rig.update_tag(refresh={"DATA"})
+        if scene is not None:
+            scene.frame_set(1)
+
+    return unlinked
+
+
+def _get_active_preview_action(rig):
+    if rig is None or rig.type != "ARMATURE" or rig.animation_data is None:
+        return None
+    act = rig.animation_data.action
+    if act is not None and act.get("is_slot_symbol"):
+        return act
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Blender 5.2.4 LTS Action API (Side-Effect-Free Slots & Channel Bags)
+# ---------------------------------------------------------------------------
+def _add_scene_markers(scene):
+    scene.timeline_markers.clear()
+    scene.timeline_markers.new("Idle_Start", frame=1)
+    scene.timeline_markers.new("Win_Trigger", frame=51)
+    scene.timeline_markers.new("Win_Impact", frame=66)
+    scene.timeline_markers.new("Win_Return", frame=136)
+    scene.timeline_markers.new("Loop_End", frame=151)
+
+
+def _setup_action_metadata(action, style_name):
+    action["is_slot_symbol"] = True
+    action["style_name"] = style_name
+
+    if style_name in _CONTINUOUS_SPIN_META:
+        axis_name, idle_revs, total_revs = _CONTINUOUS_SPIN_META[style_name]
+        action["loop_type"] = "CONTINUOUS_SPIN_SO3"
+        action["spin_axis"] = axis_name
+        action["spin_cycles_idle"] = idle_revs
+        action["spin_cycles_total"] = total_revs
+    else:
+        action["loop_type"] = "EXACT_EULER_C2"
+
+    if len(action.pose_markers) == 0:
+        action.pose_markers.new("Idle_Loop").frame = 1
+        action.pose_markers.new("Win_Trigger").frame = 51
+        action.pose_markers.new("Win_Impact").frame = 66
+        action.pose_markers.new("Win_Return").frame = 136
+        action.pose_markers.new("Action_End").frame = 151
+
+
+def _ensure_slot_and_channelbag_5_2(rig, action):
+    """
+    Blender 5.2.4 LTS Native API: Ensures ActionSlot, Layer, Keyframe Strip & ChannelBag
+    directly on the Action datablock without mutating rig.animation_data (preserving custom actions).
+    """
+    slot = next(
+        (
+            s for s in action.slots
+            if s.target_id_type in {"OBJECT", "UNSPECIFIED"} and s.name_display == rig.name
+        ),
+        None,
+    )
+    if slot is None:
+        slot = action.slots.new(id_type="OBJECT", name=rig.name)
+
+    if hasattr(anim_utils, "action_ensure_channelbag_for_slot"):
+        channelbag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
+    else:
+        layer = action.layers[0] if len(action.layers) > 0 else action.layers.new(name="Base")
+        strip = layer.strips[0] if len(layer.strips) > 0 else layer.strips.new(type="KEYFRAME")
+        channelbag = strip.channelbag(slot, ensure=True)
+
+    return slot, channelbag
+
+
+def _bake_curves_5_2_safe(rig, action, samples, endpoint_velocities=None):
+    """
+    Blender 5.2.4 LTS Strict API: Fast ChannelBag F-Curve baking.
+    Always enforces consistent BEZIER interpolation & handles even during in-place updates,
+    plus exact analytical ALIGNED endpoint tangents at Frame 1 & Frame 151.
+    """
+    slot, channelbag = _ensure_slot_and_channelbag_5_2(rig, action)
+    sample_count = len(samples)
+
+    for prop_index, prop in enumerate(_ROOT_PROPS):
+        data_path = f'pose.bones["{ROOT_BONE}"].{prop}'
+        for axis in range(3):
+            if hasattr(channelbag.fcurves, "ensure"):
+                fc = channelbag.fcurves.ensure(data_path, index=axis, group_name=ROOT_BONE)
+            else:
+                fc = channelbag.fcurves.find(data_path, index=axis)
+                if fc is None:
+                    fc = channelbag.fcurves.new(data_path, index=axis, group_name=ROOT_BONE)
+
+            coords = []
+            for frame, pose in samples:
+                coords.append(float(frame))
+                coords.append(float(pose[prop_index][axis]))
+
+            if len(fc.keyframe_points) != sample_count:
+                if len(fc.keyframe_points) > 0:
+                    fc.keyframe_points.clear()
+                fc.keyframe_points.add(sample_count)
+
+            fc.keyframe_points.foreach_set("co", coords)
+
+            # Enforce consistent BEZIER + AUTO handles on every bake (prevents stale LINEAR/VECTOR curves)
+            for key in fc.keyframe_points:
+                key.interpolation = "BEZIER"
+                key.handle_left_type = "AUTO"
+                key.handle_right_type = "AUTO"
+
+            fc.update()
+
+            # Apply exact analytical ALIGNED loop tangents on Frame 1 & Frame 151
+            if endpoint_velocities is not None and sample_count >= 2:
+                v_start, v_end = endpoint_velocities
+                flat_idx = prop_index * 3 + axis
+                dt = 1.0 / 3.0
+
+                kp_start = fc.keyframe_points[0]
+                f0 = float(samples[0][0])
+                y0 = float(samples[0][1][prop_index][axis])
+                vs = float(v_start[flat_idx])
+                kp_start.handle_left_type = "ALIGNED"
+                kp_start.handle_right_type = "ALIGNED"
+                kp_start.handle_left = (f0 - dt, y0 - vs * dt)
+                kp_start.handle_right = (f0 + dt, y0 + vs * dt)
+
+                kp_end = fc.keyframe_points[sample_count - 1]
+                fn = float(samples[-1][0])
+                yn = float(samples[-1][1][prop_index][axis])
+                ve = float(v_end[flat_idx])
+                kp_end.handle_left_type = "ALIGNED"
+                kp_end.handle_right_type = "ALIGNED"
+                kp_end.handle_left = (fn - dt, yn - ve * dt)
+                kp_end.handle_right = (fn + dt, yn + ve * dt)
+
+                fc.update()
+
+    return slot
+
+
+def _evaluate_style_samples(style, travel_y, idle_intensity, win_intensity, squash_intensity):
+    """Pre-evaluates all 151 frames and exact endpoint velocities before mutating bpy.data.actions."""
+    style_index = IDLE_STYLES.index(style)
+    variant = style_index + 1
+    samples = [
+        (
+            frame,
+            _evaluate_frame(
+                style,
+                variant,
+                frame,
+                travel_y,
+                idle_intensity,
+                win_intensity,
+                squash_intensity,
+            ),
+        )
+        for frame in range(1, TOTAL_FRAMES + 1)
+    ]
+    endpoint_velocities = _compute_endpoint_velocities(
+        style, variant, travel_y, idle_intensity, win_intensity, squash_intensity
+    )
+    return samples, endpoint_velocities
+
+
+def _commit_style_action(rig, style, samples, endpoint_velocities, in_place=True):
+    """Writes pre-evaluated samples into Anim_{style} (in-place or fresh replacement) and returns (action, slot)."""
+    action_name = f"Anim_{style}"
+    action = bpy.data.actions.get(action_name) if in_place else None
+
+    if not in_place:
+        old = bpy.data.actions.get(action_name)
+        if old is not None:
+            bpy.data.actions.remove(old, do_unlink=True)
+
+    if action is None:
+        action = bpy.data.actions.new(action_name)
+        action.use_fake_user = True
+
+    _setup_action_metadata(action, style)
+    slot = _bake_curves_5_2_safe(rig, action, samples, endpoint_velocities)
+
+    if hasattr(action, "use_frame_range"):
+        action.use_frame_range = True
+        action.frame_start = 1.0
+        action.frame_end = float(TOTAL_FRAMES)
+
+    return action, slot
+
+
+def _bake_single_style(rig, style, travel_y, idle_intensity, win_intensity, squash_intensity, in_place=True):
+    samples, endpoint_velocities = _evaluate_style_samples(
+        style, travel_y, idle_intensity, win_intensity, squash_intensity
+    )
+    return _commit_style_action(rig, style, samples, endpoint_velocities, in_place=in_place)
+
+
+# ---------------------------------------------------------------------------
+# Real-Time Preview Callbacks (With Clean Auto-Unlink & Custom Action Safety)
+# ---------------------------------------------------------------------------
+def _on_live_preview_toggled(self, context):
+    global _IS_LIVE_UPDATING
+    if _IS_LIVE_UPDATING:
+        return
+
+    if self.live_preview:
+        _on_live_setting_changed(self, context)
+    else:
+        rig = bpy.data.objects.get(RIG_NAME)
+        scene = context.scene if context and context.scene else getattr(bpy.context, "scene", None)
+        if _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=scene):
+            self.status = "Live Preview OFF — Action unlinked (Clean State)"
+        else:
+            self.status = "Live Preview OFF"
+
+
+def _on_live_setting_changed(self, context):
+    global _IS_LIVE_UPDATING
+    if _IS_LIVE_UPDATING or not self.live_preview:
+        return
+
+    rig = bpy.data.objects.get(RIG_NAME)
+    if rig is None or rig.type != "ARMATURE" or ROOT_BONE not in rig.pose.bones:
+        return
+
+    _IS_LIVE_UPDATING = True
+    try:
+        scene = context.scene if context and context.scene else bpy.context.scene
+        if scene is not None and len(scene.timeline_markers) == 0:
+            _add_scene_markers(scene)
+
+        pb = rig.pose.bones[ROOT_BONE]
+        pb.rotation_mode = "XYZ"
+
+        prev_action = _get_active_preview_action(rig)
+        prev_style = None
+        if prev_action is not None:
+            candidate = prev_action.get("style_name")
+            if candidate in IDLE_STYLES:
+                prev_style = candidate
+
+        if self.live_sync_all:
+            styles_to_update = IDLE_STYLES
+            active_style = self.preview_style if self.preview_style != "ALL" else prev_style
+        elif self.preview_style != "ALL":
+            styles_to_update = (self.preview_style,)
+            active_style = self.preview_style
+        else:
+            _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=scene)
+            self.status = "Clean State: Pick a Target style or enable 'Sync All 16 Live'"
+            return
+
+        # Pre-evaluate atomically before committing
+        evaluated = {
+            style: _evaluate_style_samples(
+                style,
+                self.win_travel_y,
+                self.idle_intensity,
+                self.win_intensity,
+                self.squash_intensity,
+            )
+            for style in styles_to_update
+        }
+
+        baked = {
+            style: _commit_style_action(rig, style, samples, ep_vel, in_place=True)
+            for style, (samples, ep_vel) in evaluated.items()
+        }
+
+        if active_style and active_style in baked:
+            act, slot = baked[active_style]
+            _bind_preview_action(rig, act, slot)
+        else:
+            _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=scene)
+
+        if context and getattr(context, "view_layer", None):
+            context.view_layer.update()
+
+        is_playing = bool(context and getattr(context, "screen", None) and context.screen.is_animation_playing)
+        if not is_playing and scene is not None:
+            scene.frame_set(scene.frame_current)
+
+        if self.live_sync_all:
+            self.status = f"Live Synced ALL {len(styles_to_update)} Actions (v9.6)"
+        else:
+            self.status = f"Live Preview: {active_style} (v9.6)"
+    except Exception as exc:
+        traceback.print_exc()
+        self.status = f"ERROR: {exc}"
+    finally:
+        _IS_LIVE_UPDATING = False
+
+
+# ---------------------------------------------------------------------------
+# Setup & Generation Operators (Background-Mode Safe + Atomic Recovery)
+# ---------------------------------------------------------------------------
+def _deselect_all_safe(view_layer):
+    objects = getattr(view_layer, "objects", None)
+    if objects is not None:
+        try:
+            for obj in objects:
+                obj.select_set(False)
+            return
+        except TypeError:
+            pass
+    for obj in bpy.data.objects:
+        obj.select_set(False)
+
+
+def create_symbol():
+    if bpy.data.objects.get(RIG_NAME) is not None:
+        raise RuntimeError("SymbolRig already exists. Delete it first.")
+
+    context = bpy.context
+    scene = context.scene
+    collection = context.collection
+    view_layer = context.view_layer
+
+    if context.active_object and context.active_object.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    arm_data = bpy.data.armatures.new("SymbolArmature")
+    arm_data.display_type = "OCTAHEDRAL"
+    arm_data.show_axes = True
+
+    rig = bpy.data.objects.new(RIG_NAME, arm_data)
+    collection.objects.link(rig)
+
+    _deselect_all_safe(view_layer)
+    rig.select_set(True)
+    view_layer.objects.active = rig
+    bpy.ops.object.mode_set(mode="EDIT")
+    try:
+        bone = arm_data.edit_bones.new(ROOT_BONE)
+        bone.head = (0.0, 0.0, 0.0)
+        bone.tail = (0.0, 0.0, 1.0)
+        bone.roll = 0.0
+        bone.use_deform = True
+    finally:
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    mesh_data = bpy.data.meshes.new("SymbolCubeMesh")
+    bm = bmesh.new()
+    try:
+        bmesh.ops.create_cube(bm, size=0.58, calc_uvs=True)
+        bm.to_mesh(mesh_data)
+    finally:
+        bm.free()
+
+    if len(mesh_data.polygons) > 0:
+        mesh_data.polygons.foreach_set("use_smooth", [True] * len(mesh_data.polygons))
+    mesh_data.update()
+
+    mesh = bpy.data.objects.new(MESH_NAME, mesh_data)
+    collection.objects.link(mesh)
+
+    mesh.parent = rig
+    group = mesh.vertex_groups.new(name=ROOT_BONE)
+    if mesh.data.vertices:
+        group.add([v.index for v in mesh.data.vertices], 1.0, "REPLACE")
+
+    arm_mod = mesh.modifiers.new("Armature", "ARMATURE")
+    arm_mod.object = rig
+    arm_mod.use_vertex_groups = True
+
+    bevel = mesh.modifiers.new("Soft Rounded Edges", "BEVEL")
+    bevel.width = 0.055
+    bevel.segments = 4
+    bevel.limit_method = "ANGLE"
+
+    weighted = mesh.modifiers.new("Weighted Corner Normals", "WEIGHTED_NORMAL")
+    weighted.keep_sharp = True
+
+    if scene.camera is None:
+        camera_data = bpy.data.cameras.new("VR_StaticCamera")
+        camera_data.lens = 50.0
+        camera = bpy.data.objects.new("VR_StaticCamera", camera_data)
+        collection.objects.link(camera)
+        camera.location = (0.0, -2.5, 0.45)
+        camera.rotation_euler = (math.radians(82.0), 0.0, 0.0)
+        scene.camera = camera
+
+    scene.render.fps = FPS
+    scene.render.fps_base = 1.0
+    scene.frame_start = 1
+    scene.frame_end = TOTAL_FRAMES
+
+    _deselect_all_safe(view_layer)
+    rig.select_set(True)
+    view_layer.objects.active = rig
+    scene.frame_set(1)
+    return f"Created Rig & Cube successfully! [{_version_string()}]"
+
+
+def create_animations(rig, travel_y, idle_intensity, win_intensity, squash_intensity, target_style):
+    if rig is None or rig.type != "ARMATURE" or ROOT_BONE not in rig.pose.bones:
+        raise RuntimeError("Create the Symbol Cube rig first.")
+
+    scene = bpy.context.scene
+    scene.render.fps = FPS
+    scene.render.fps_base = 1.0
+    scene.frame_start = 1
+    scene.frame_end = TOTAL_FRAMES
+    _add_scene_markers(scene)
+
+    # Preserve any existing non-slot-symbol user custom action & slot strictly
+    custom_action, custom_slot = _capture_custom_action(rig)
+    rig.pose.bones[ROOT_BONE].rotation_mode = "XYZ"
+
+    styles_to_process = IDLE_STYLES if target_style == "ALL" else (target_style,)
+
+    # 1. Atomic pre-evaluation (if math/inputs fail, zero existing actions or rig state are touched)
+    evaluated = {}
+    for style in styles_to_process:
+        evaluated[style] = _evaluate_style_samples(
+            style,
+            travel_y,
+            idle_intensity,
+            win_intensity,
+            squash_intensity,
+        )
+
+    # 2. Commit actions cleanly without mutating rig.animation_data
+    created_map = {}
+    try:
+        for style in styles_to_process:
+            samples, endpoint_velocities = evaluated[style]
+            created_map[style] = _commit_style_action(
+                rig, style, samples, endpoint_velocities, in_place=False
+            )
+    except Exception:
+        if custom_action is not None:
+            _restore_custom_action(rig, custom_action, custom_slot)
+        else:
+            _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True)
+        raise
+
+    if target_style == "ALL":
+        if custom_action is not None:
+            _restore_custom_action(rig, custom_action, custom_slot)
+            return f"Generated {len(created_map)} Actions — Custom Action Preserved (v9.6 | 5.2.4 LTS)!"
+        _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=scene)
+        scene.frame_set(1)
+        return f"Generated {len(created_map)} Actions — Rig Clean/Unlinked (v9.6 | 5.2.4 LTS)!"
+    else:
+        act, slot = created_map[target_style]
+        _bind_preview_action(rig, act, slot)
+        scene.frame_set(scene.frame_current)
+        return f"Previewing: {target_style} (v9.6 | 5.2.4 LTS)"
+
+
+# ---------------------------------------------------------------------------
+# Settings & UI
+# ---------------------------------------------------------------------------
+class SlotSymbolSettings(PropertyGroup):
+    win_travel_y: FloatProperty(
+        name="Forward Pop Distance",
+        description="How far the object pops towards the camera",
+        default=0.80,
+        min=0.01,
+        max=5.0,
+        unit="LENGTH",
+        update=_on_live_setting_changed,
+    )
+    idle_intensity: FloatProperty(
+        name="Idle Intensity",
+        description="Multiplier for idle animation movements",
+        default=1.0,
+        min=0.1,
+        max=5.0,
+        update=_on_live_setting_changed,
+    )
+    win_intensity: FloatProperty(
+        name="Win Intensity",
+        description="Multiplier for win animation exaggerations",
+        default=1.3,
+        min=0.1,
+        max=5.0,
+        update=_on_live_setting_changed,
+    )
+    squash_intensity: FloatProperty(
+        name="Juiciness (Squash)",
+        description="Controls Squash & Stretch intensity across Idle and Win animations (0.0 = Rigid, 1.0 = Balanced, 2.0+ = Extra Juicy)",
+        default=1.0,
+        min=0.0,
+        max=3.0,
+        soft_min=0.0,
+        soft_max=2.5,
+        update=_on_live_setting_changed,
+    )
+    preview_style: EnumProperty(
+        name="Target Action",
+        description="Select a single style to preview, or ALL to generate everything",
+        items=_STYLE_ENUM_ITEMS,
+        default="ALL",
+        update=_on_live_setting_changed,
+    )
+    live_preview: BoolProperty(
+        name="Real-Time Preview",
+        description="Automatically update animation curves as you drag sliders (auto-unlinks cleanly when turned OFF)",
+        default=False,
+        update=_on_live_preview_toggled,
+    )
+    live_sync_all: BoolProperty(
+        name="Sync All 16 Live",
+        description="When Real-Time Preview is ON, update ALL 16 actions together instead of only the active preview action",
+        default=False,
+        update=_on_live_setting_changed,
+    )
+    status: StringProperty(name="Status", default="Ready")
+
+
+class SLOTSYMBOL_OT_create_symbol(Operator):
+    bl_idname = "slotsymbol.create_symbol"
+    bl_label = "Create Symbol Cube"
+    bl_description = "Create a beveled cube driven by a standard vertical single-bone Root rig"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        try:
+            context.scene.slot_symbol_settings.status = create_symbol()
+        except Exception as exc:
+            traceback.print_exc()
+            context.scene.slot_symbol_settings.status = f"ERROR: {exc}"
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class SLOTSYMBOL_OT_create_animations(Operator):
+    bl_idname = "slotsymbol.create_animations"
+    bl_label = "Generate AAA Master Actions"
+    bl_description = "Generates seamless C2-enveloped actions with Blender 5.2.4 LTS Channel Bags API"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.slot_symbol_settings
+        try:
+            settings.status = create_animations(
+                bpy.data.objects.get(RIG_NAME),
+                settings.win_travel_y,
+                settings.idle_intensity,
+                settings.win_intensity,
+                settings.squash_intensity,
+                settings.preview_style,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            settings.status = f"ERROR: {exc}"
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class SLOTSYMBOL_OT_unlink_preview(Operator):
+    bl_idname = "slotsymbol.unlink_preview"
+    bl_label = "Unlink Preview Action"
+    bl_description = "Safely unlink active preview action from SymbolRig and reset rest pose (Action remains saved via Fake User)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        global _IS_LIVE_UPDATING
+        settings = context.scene.slot_symbol_settings
+        rig = bpy.data.objects.get(RIG_NAME)
+        _IS_LIVE_UPDATING = True
+        try:
+            if settings.live_preview:
+                settings.live_preview = False
+            unlinked = _unlink_preview_action(
+                rig,
+                only_slot_symbol=True,
+                reset_pose=True,
+                scene=context.scene,
+            )
+        finally:
+            _IS_LIVE_UPDATING = False
+
+        if unlinked:
+            settings.status = "Preview Action unlinked — Clean State"
+        else:
+            settings.status = "Rig is already clean (no active preview)"
+        return {"FINISHED"}
+
+
+class SLOTSYMBOL_PT_main(Panel):
+    bl_label = "Slot Symbol Generator"
+    bl_idname = "SLOTSYMBOL_PT_main"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Slot Symbol"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.slot_symbol_settings
+        rig = bpy.data.objects.get(RIG_NAME)
+        active_preview = _get_active_preview_action(rig)
+
+        box = layout.box()
+        row = box.row()
+        row.alignment = "CENTER"
+        row.label(text="SLOT SYMBOL GENERATOR", icon="ACTION")
+
+        col = layout.column(align=True)
+        col.scale_y = 1.3
+        col.operator("slotsymbol.create_symbol", text="1. Create Rig & Cube", icon="ARMATURE_DATA")
+
+        layout.separator()
+
+        box = layout.box()
+        box.label(text="Win Animation", icon="OPTIONS")
+        col = box.column(align=True)
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(settings, "win_travel_y")
+
+        box = layout.box()
+        box.label(text="Intensities & Juiciness", icon="MODIFIER")
+        col = box.column(align=True)
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(settings, "idle_intensity")
+        col.prop(settings, "win_intensity")
+        col.prop(settings, "squash_intensity", slider=True)
+
+        box = layout.box()
+        box.label(text="Generation & Live Preview", icon="SCENE_DATA")
+        col = box.column(align=True)
+        col.prop(settings, "preview_style", text="Target")
+        col.separator(factor=0.5)
+        col.prop(settings, "live_preview", icon="PREVIEW_RANGE")
+        if settings.live_preview:
+            sub = col.column(align=True)
+            sub.prop(settings, "live_sync_all", icon="FILE_REFRESH")
+            if not settings.live_sync_all and settings.preview_style == "ALL":
+                sub.label(text="Tip: Pick a Target style or enable Sync All", icon="INFO")
+
+        if active_preview is not None:
+            col.separator(factor=0.5)
+            row = col.row(align=True)
+            row.label(text=f"Active: {active_preview.name}", icon="LINKED")
+            row.operator("slotsymbol.unlink_preview", text="Unlink", icon="UNLINKED")
+
+        layout.separator()
+
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        button_text = (
+            "Generate ALL Actions"
+            if settings.preview_style == "ALL"
+            else f"Preview {settings.preview_style}"
+        )
+        button_icon = "PLAY" if settings.preview_style == "ALL" else "RESTRICT_VIEW_OFF"
+        col.operator("slotsymbol.create_animations", text=button_text, icon=button_icon)
+
+        if settings.status != "Ready":
+            layout.separator()
+            row = layout.row()
+            row.alert = settings.status.startswith("ERROR")
+            row.label(text=settings.status, icon="ERROR" if row.alert else "CHECKMARK")
+
+
+_CLASSES = (
+    SlotSymbolSettings,
+    SLOTSYMBOL_OT_create_symbol,
+    SLOTSYMBOL_OT_create_animations,
+    SLOTSYMBOL_OT_unlink_preview,
+    SLOTSYMBOL_PT_main,
+)
+
+
+def register():
+    for cls in _CLASSES:
+        if not _is_class_registered(cls):
+            bpy.utils.register_class(cls)
+    if not hasattr(bpy.types.Scene, "slot_symbol_settings"):
+        bpy.types.Scene.slot_symbol_settings = PointerProperty(type=SlotSymbolSettings)
+
+
+def unregister():
+    try:
+        if hasattr(bpy.data, "objects"):
+            rig = bpy.data.objects.get(RIG_NAME)
+            _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True)
+    except Exception:
+        pass
+
+    if hasattr(bpy.types.Scene, "slot_symbol_settings"):
+        del bpy.types.Scene.slot_symbol_settings
+    for cls in reversed(_CLASSES):
+        if _is_class_registered(cls):
+            bpy.utils.unregister_class(cls)
+
+
+if __name__ == "__main__":
+    try:
+        unregister()
+    except Exception:
+        pass
+    register()
