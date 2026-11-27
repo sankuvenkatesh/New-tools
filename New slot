@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (9, 6, 0),
+    "version": (9, 6, 1),
     "blender": (5, 2, 4),
     "location": "View3D > Sidebar > Slot Symbol",
     "description": "AAA C2 Envelopes, SO(3)-Seamless Spin Loops, Custom Action Preservation, Logarithmic Lags, Juiciness & Blender 5.2.4 LTS Channel Bags API",
@@ -387,6 +387,11 @@ def _bind_preview_action(rig, action, slot=None):
     if rig is None or action is None:
         return
     ad = rig.animation_data or rig.animation_data_create()
+    previous = ad.action
+    if previous is not None and previous is not action and not previous.get("is_slot_symbol"):
+        # A preview is about to replace the user's own Action. With 0 users it would be purged on save/reload,
+        # so it is kept alive with a Fake User.
+        previous.use_fake_user = True
     ad.action = action
     target_slot = slot or (action.slots[0] if action.slots else None)
     if target_slot is not None:
@@ -407,8 +412,9 @@ def _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=No
     ad = rig.animation_data
     if ad is not None and ad.action is not None:
         if not only_slot_symbol or ad.action.get("is_slot_symbol"):
+            # Blender 5.2.4: clearing the Action also releases its Slot. Setting `action_slot = None`
+            # afterwards raises "Cannot set slot without an assigned Action".
             ad.action = None
-            ad.action_slot = None
             unlinked = True
         else:
             has_custom = True
@@ -702,9 +708,9 @@ def _on_live_setting_changed(self, context):
             scene.frame_set(scene.frame_current)
 
         if self.live_sync_all:
-            self.status = f"Live Synced ALL {len(styles_to_update)} Actions (v9.6)"
+            self.status = f"Live Synced ALL {len(styles_to_update)} Actions (v9.6.1)"
         else:
-            self.status = f"Live Preview: {active_style} (v9.6)"
+            self.status = f"Live Preview: {active_style} (v9.6.1)"
     except Exception as exc:
         traceback.print_exc()
         self.status = f"ERROR: {exc}"
@@ -859,15 +865,16 @@ def create_animations(rig, travel_y, idle_intensity, win_intensity, squash_inten
     if target_style == "ALL":
         if custom_action is not None:
             _restore_custom_action(rig, custom_action, custom_slot)
-            return f"Generated {len(created_map)} Actions — Custom Action Preserved (v9.6 | 5.2.4 LTS)!"
+            return f"Generated {len(created_map)} Actions — Custom Action Preserved (v9.6.1 | 5.2.4 LTS)!"
         _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=scene)
         scene.frame_set(1)
-        return f"Generated {len(created_map)} Actions — Rig Clean/Unlinked (v9.6 | 5.2.4 LTS)!"
+        return f"Generated {len(created_map)} Actions — Rig Clean/Unlinked (v9.6.1 | 5.2.4 LTS)!"
     else:
         act, slot = created_map[target_style]
         _bind_preview_action(rig, act, slot)
         scene.frame_set(scene.frame_current)
-        return f"Previewing: {target_style} (v9.6 | 5.2.4 LTS)"
+        note = f" | '{custom_action.name}' kept (Fake User)" if custom_action is not None else ""
+        return f"Previewing: {target_style} (v9.6.1 | 5.2.4 LTS){note}"
 
 
 # ---------------------------------------------------------------------------
