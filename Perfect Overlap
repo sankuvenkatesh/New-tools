@@ -1820,43 +1820,49 @@ class PERFECTOVERLAP_PT_panel(bpy.types.Panel):
     bl_context = "posemode"
     bl_options = {'DEFAULT_CLOSED'}
 
+    def draw_header(self, context):
+        self.layout.label(text="", icon='FORCE_HARMONIC')
+
     def draw(self, context):
         layout = self.layout
         props = context.scene.perfect_overlap_props
 
-        layout.label(text="Select the chain bones (not the driver)")
+        layout.label(
+            text="Select the chain bones (not the driver)",
+            icon='BONE_DATA',
+        )
         layout.separator()
 
         box = layout.box()
-        box.label(text="Frame Range")
+        box.label(text="Frame Range", icon='PREVIEW_RANGE')
         row = box.row(align=True)
         row.prop(props, "start_frame")
         row.prop(props, "end_frame")
 
         box = layout.box()
-        box.label(text="Solver")
+        box.label(text="Solver", icon='PHYSICS')
         row = box.row(align=True)
         row.prop(props, "delay")
         row.prop(props, "recursion")
         row.prop(props, "strength")
-        box.prop(props, "threshold")
+        box.prop(props, "threshold", icon='FCURVE')
 
         box = layout.box()
-        box.label(text="Options")
-        box.prop(props, "animate_translate")
-        box.prop(props, "cycle")
+        box.label(text="Options", icon='OPTIONS')
+        box.prop(props, "animate_translate", icon='EMPTY_ARROWS')
+        box.prop(props, "cycle", icon='FILE_REFRESH')
         if props.cycle:
-            box.prop(props, "cycle_preroll")
+            box.prop(props, "cycle_preroll", icon='TIME')
 
         box = layout.box()
-        box.prop(props, "debug")
+        box.prop(props, "debug", icon='CONSOLE')
 
         layout.separator()
         row = layout.row()
         row.scale_y = 1.6
-        row.operator("perfect_overlap.calculate", icon="KEYTYPE_KEYFRAME_VEC")
+        row.operator("perfect_overlap.calculate", icon="KEYFRAME_HLT")
         row = layout.row()
-        row.operator("perfect_overlap.delete", icon="KEYFRAME")
+        row.operator("perfect_overlap.delete", icon="TRASH")
         row = layout.row()
         row.operator("perfect_overlap.reset_settings", icon="LOOP_BACK")
 
