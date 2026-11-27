@@ -1,11 +1,10 @@
-
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (2, 6, 1),
+    "version": (2, 7, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Slot Symbol",
-    "description": "Stylish UI with perfectly mapped forward translations and specific frame ranges",
+    "description": "Stylish UI, Combined Idle+Win actions (1-106), and positive Z forward translation",
     "category": "Animation",
 }
 
@@ -24,14 +23,14 @@ RIG_NAME = "SymbolRig"
 MESH_NAME = "SymbolCube"
 ROOT_BONE = "Root"
 
-# మీరు అడిగిన ఖచ్చితమైన ఫ్రేమ్ రేంజెస్
+# మీరు అడిగిన కచ్చితమైన ఫ్రేమ్ రేంజెస్
 IDLE_START = 1
 IDLE_END = 45
 WIN_START = 46
 WIN_END = 106
 
 IDLE_KEY_STEP = 2
-WIN_FRAMES_COUNT = WIN_END - WIN_START  # 60 frames steps (46 to 106)
+WIN_FRAMES_COUNT = WIN_END - WIN_START  # 60 frames steps
 
 WIN_KEY_TIMES = (0.0, 0.05, 0.10, 0.205, 0.38, 0.56, 0.66, 0.78, 0.90, 1.0)
 
@@ -49,9 +48,11 @@ _REST_POSE = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
 # Axis Mapping (World to Vertical Bone Space)
 # ---------------------------------------------------------------------------
 def world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity=1.0):
-    # నిలువుగా ఉండే బోన్‌కు తగ్గట్టు పర్ఫెక్ట్ మ్యాపింగ్ (ముందుకు కెమెరా వైపు రావడానికి)
     lx = wx * intensity
     ly = wz * intensity  
+    
+    # ఎర్రర్ ఫిక్స్: నిలువు బోన్ కి Local Z అనేది ముందుకు (కెమెరా వైపు) చూపిస్తుంది.
+    # కాబట్టి పాజిటివ్ wy ఇస్తే, పాజిటివ్ Local Z అయ్యి ముందుకి వస్తుంది.
     lz = wy * intensity  
 
     lrx = wrx * intensity
@@ -101,7 +102,7 @@ def _set_action_range(action, start_frame, end_frame):
         action.frame_start = start_frame
         action.frame_end = end_frame
 
-def _bake_curves(rig, action, samples, cyclic=False):
+def _bake_curves(rig, action, samples):
     for prop_index, prop in enumerate(_ROOT_PROPS):
         data_path = f'pose.bones["{ROOT_BONE}"].{prop}'
         for axis in range(3):
@@ -119,11 +120,7 @@ def _bake_curves(rig, action, samples, cyclic=False):
                 key.interpolation = 'BEZIER'
                 key.handle_left_type = 'AUTO'
                 key.handle_right_type = 'AUTO'
-                
-            if cyclic and not any(mod.type == 'CYCLES' for mod in fc.modifiers):
-                mod = fc.modifiers.new(type='CYCLES')
-                mod.mode_before = 'REPEAT'
-                mod.mode_after = 'REPEAT'
+            
             fc.update()
 
 def _validate_rig(rig):
@@ -194,7 +191,6 @@ def create_symbol():
         camera_data.lens = 50
         camera = bpy.data.objects.new("VR_StaticCamera", camera_data)
         collection.objects.link(camera)
-        # కెమెరా -Y యాక్సిస్ నుండి చూసేలా సెట్టింగ్
         camera.location = (0.0, -2.5, 0.45)
         camera.rotation_euler = (math.radians(82.0), 0.0, 0.0)
         scene.camera = camera
@@ -334,7 +330,8 @@ def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
     if t <= 0.10:
         q = t / 0.10
         wx = 0.0
-        wy = (travel_y * 0.12) * q 
+        # wy ని మైనస్ లో ఇస్తే వెనక్కి వంగుతుంది (Anticipation)
+        wy = -(travel_y * 0.12) * q 
         wz = -0.025 * q
         wrx = angle * 0.12 * q
         wry = side * 0.08 * q
@@ -345,7 +342,8 @@ def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
         q = (t - 0.10) / 0.28
         ease = q*q*(3.0 - 2.0*q)
         wx = side * travel_y * 0.10 * ease
-        wy = -travel_y * (0.95 * ease) 
+        # wy ని పాజిటివ్ (+) చేస్తే ముందుకు కెమెరా వైపు వస్తుంది
+        wy = travel_y * (0.95 * ease) 
         wz = lift * math.sin(q * math.pi)
         wrx = angle * math.sin(q * math.pi)
         wry = side * 0.18 * math.sin(q * math.pi)
@@ -355,7 +353,7 @@ def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
     elif t <= 0.56:
         q = (t - 0.38) / 0.18
         wx = side * travel_y * 0.10 * (1.0-q)
-        wy = -travel_y * (0.95 + 0.16*math.sin(q*math.pi/2.0))
+        wy = travel_y * (0.95 + 0.16*math.sin(q*math.pi/2.0))
         wz = lift * (1.0-q)
         wrx = angle * (1.0-q)
         wry = side * 0.18 * (1.0-q)
@@ -366,7 +364,7 @@ def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
         q = (t - 0.56) / 0.22
         bounce = math.sin(q * math.pi)
         wx = 0.0
-        wy = -travel_y * (1.11 - 0.11*q)
+        wy = travel_y * (1.11 - 0.11*q)
         wz = lift * 0.55 * bounce
         wrx = angle * 0.35 * bounce
         wry = side * 0.10 * bounce
@@ -377,7 +375,7 @@ def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
         q = (t - 0.78) / 0.22
         decay = (1.0-q) ** 2
         wx = 0.0
-        wy = -travel_y * 0.12 * decay
+        wy = travel_y * 0.12 * decay
         wz = lift * 0.18 * math.sin(q*math.pi) * decay
         wrx = angle * 0.22 * decay
         wry = side * 0.06 * decay
@@ -431,21 +429,24 @@ def create_animations(rig, travel_y, travel_z, idle_intensity=1.0, win_intensity
     created = 0
 
     try:
+        # సింగిల్ యాక్షన్‌లో Idle మరియు Win ని కలుపుతున్నాం 
         for style_index, style in enumerate(IDLE_STYLES):
-            idle = _new_action(rig, f"Idle_{style}")
-            _bake_curves(rig, idle, _idle_samples(style, style_index + 1, idle_intensity), cyclic=True)
-            _set_action_range(idle, IDLE_START, IDLE_END)
+            action = _new_action(rig, f"Anim_{style}")
+            
+            # సాంపుల్స్ రెండింటిని కలుపుతున్నాం
+            combined_samples = []
+            combined_samples.extend(_idle_samples(style, style_index + 1, idle_intensity))
+            combined_samples.extend(_win_samples(style_index, travel_y, travel_z, win_intensity))
+            
+            _bake_curves(rig, action, combined_samples)
+            _set_action_range(action, IDLE_START, WIN_END)
             created += 1
 
-            win = _new_action(rig, f"Win_{style}")
-            _bake_curves(rig, win, _win_samples(style_index, travel_y, travel_z, win_intensity), cyclic=False)
-            _set_action_range(win, WIN_START, WIN_END)
-            created += 1
     finally:
         ad.action = None
         _reset_root(pb)
 
-    return f"Created {len(IDLE_STYLES)} idle & {len(IDLE_STYLES)} win actions!"
+    return f"Created {created} Combined Actions (Idle+Win)!"
 
 # ---------------------------------------------------------------------------
 # Settings and operators
@@ -454,12 +455,12 @@ def create_animations(rig, travel_y, travel_z, idle_intensity=1.0, win_intensity
 class SlotSymbolSettings(PropertyGroup):
     win_travel_y: FloatProperty(
         name="Towards Camera",
-        description="How far the object moves towards the camera during a win (-Y World Axis)",
+        description="How far the object moves towards the camera during a win (+Z Local Axis)",
         default=0.80, min=0.01, max=5.0, unit='LENGTH',
     )
     win_travel_z: FloatProperty(
         name="Jump Height",
-        description="How high the object jumps during a win (+Z World Axis)",
+        description="How high the object jumps during a win (+Y Local Axis)",
         default=0.35, min=0.0, max=5.0, unit='LENGTH',
     )
     idle_intensity: FloatProperty(
@@ -496,8 +497,8 @@ class SLOTSYMBOL_OT_create_symbol(Operator):
 
 class SLOTSYMBOL_OT_create_animations(Operator):
     bl_idname = "slotsymbol.create_animations"
-    bl_label = "Generate 32 Animations"
-    bl_description = f"Generates Idle loops ({IDLE_START}-{IDLE_END}) and Win actions ({WIN_START}-{WIN_END})"
+    bl_label = "Generate 16 Combined Actions"
+    bl_description = f"Generates merged actions with Idle ({IDLE_START}-{IDLE_END}) and Win ({WIN_START}-{WIN_END})"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -535,7 +536,6 @@ class SLOTSYMBOL_PT_main(Panel):
         box = layout.box()
         row = box.row()
         row.alignment = 'CENTER'
-        # SAFE ICON 'ACTION' వాడాను
         row.label(text="SLOT SYMBOL GENERATOR", icon='ACTION') 
 
         # ---- STEP 1: RIG ----
@@ -569,6 +569,7 @@ class SLOTSYMBOL_PT_main(Panel):
         col = box.column(align=True)
         col.label(text=f"• Idle Loop: {IDLE_START} to {IDLE_END}")
         col.label(text=f"• Win Action: {WIN_START} to {WIN_END}")
+        col.label(text="• Single Action (1-106) per style")
 
         layout.separator()
 
@@ -610,4 +611,3 @@ if __name__ == "__main__":
     except Exception:
         pass
     register()
-
