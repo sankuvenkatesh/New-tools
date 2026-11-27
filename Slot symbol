@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (2, 8, 0),
+    "version": (2, 9, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Slot Symbol",
-    "description": "Fine-tuned professional Slot animations (No vertical drift, minimal Y rotation)",
+    "description": "16 Unique Idles + Juicy Win Impacts (Proper Squash/Stretch & Hop)",
     "category": "Animation",
 }
 
@@ -23,7 +23,6 @@ RIG_NAME = "SymbolRig"
 MESH_NAME = "SymbolCube"
 ROOT_BONE = "Root"
 
-# ఖచ్చితమైన ఫ్రేమ్ రేంజెస్ (1 to 45 Idle, 46 to 106 Win)
 IDLE_START = 1
 IDLE_END = 45
 WIN_START = 46
@@ -203,7 +202,7 @@ def create_symbol():
     return f"Created Rig & Cube successfully! [{_version_string()}]"
 
 # ---------------------------------------------------------------------------
-# Idle motion profiles 
+# Idle motion profiles (Fixed: 16 Unique branches with proper amplitudes)
 # ---------------------------------------------------------------------------
 
 def _idle_pose(style, t, variant, intensity=1.0):
@@ -213,35 +212,103 @@ def _idle_pose(style, t, variant, intensity=1.0):
     wave = math.sin(p) * math.cos(phase) + 0.5 * math.sin(2.0*p) * math.sin(phase)
     wave2 = math.sin(2.0*p) * math.cos(phase) + 0.5 * math.sin(4.0*p) * math.sin(phase)
     wave15 = math.sin(p) * math.cos(phase + 1.5) + 0.5 * math.sin(2.0*p) * math.sin(phase + 1.5)
-    
+    wave12 = math.sin(p) * math.cos(phase + 1.2) + 0.5 * math.sin(2.0*p) * math.sin(phase + 1.2)
+    wave07 = math.sin(p) * math.cos(phase + 0.7) + 0.5 * math.sin(2.0*p) * math.sin(phase + 0.7)
+
     wx = wy = wz = 0.0
     wrx = wry = wrz = 0.0
     wsx = wsy = wsz = 1.0
-    amp = 0.5
 
-    # ఫైన్-ట్యూన్ చేయబడిన ఐడిల్ (మరీ ఎక్కువగా కదలకుండా)
     if style == "FloatingSpin":
-        wz = 0.04 * amp * wave
-        wrz = 0.15 * wave
+        wz = 0.15 * wave
+        wx = 0.05 * math.sin(p * 0.5 + phase) * (1.0 - math.cos(p))
+        wrz = 0.60 * wave + 0.18 * math.sin(2.0 * p)  # ~34 deg spin
+        wry = 0.15 * wave
+        
     elif style == "HoverDance":
-        wz = 0.03 * wave2
-        wrx = 0.08 * wave2
+        wz = 0.08 * wave2
+        wx = 0.10 * wave
+        wrx = 0.20 * wave2
+        wrz = 0.25 * wave
+        
     elif style == "JumpingIdle":
-        wz = 0.05 * (0.5 - 0.5 * math.cos(2.0 * p))
-        wsx = wsy = 1.0 + 0.03 * math.sin(2.0 * p + math.pi)
-        wsz = 1.0 - 0.05 * math.sin(2.0 * p + math.pi)
+        hop = 0.5 - 0.5 * math.cos(2.0 * p)
+        wz = 0.25 * hop  # Visible 25cm jump
+        wsx = wsy = 1.0 + 0.08 * math.sin(2.0 * p + math.pi)
+        wsz = 1.0 - 0.12 * math.sin(2.0 * p + math.pi)
+        wrx = 0.15 * math.sin(p)
+        
+    elif style == "Lean":
+        wrx = 0.25 + 0.05 * math.sin(2.0 * p)  # Static tilt + slight breathing
+        wry = 0.08 * math.sin(p * 2.0 + phase)
+        wx = 0.025 * (1.0 - math.cos(p))
+        
+    elif style == "Orbit":
+        wx = 0.15 * math.cos(p)
+        wry = 0.15 * math.sin(p) # Circular roll
+        wz = 0.05 * math.sin(2.0 * p)
+        
     elif style == "PulsingIdle":
-        wsx = wsy = 1.0 + 0.05 * wave
-        wsz = 1.0 - 0.04 * wave
+        pulse = wave
+        wsx = wsy = 1.0 + 0.12 * pulse
+        wsz = 1.0 - 0.10 * pulse
+        wz = 0.03 * pulse
+        
     elif style == "Rocking":
-        wrx = 0.12 * wave
+        wrx = 0.30 * wave
+        wrz = 0.15 * wave2
+        wx = 0.05 * wave
+        
+    elif style == "Shake":
+        wrx = 0.20 * math.sin(4.0 * p) # Fast, high-freq jitter (11 deg)
+        wry = 0.15 * math.sin(5.0 * p + phase)
+        wx = 0.05 * math.sin(3.0 * p + phase)
+        
+    elif style == "SideHop":
+        wx = 0.15 * math.sin(2.0 * p) # Left/right translation
+        wz = 0.10 * max(0.0, math.sin(2.0 * p)) ** 2 # Small arc hops
+        wrz = 0.15 * wave
+        wsx = 1.0 + 0.06 * math.sin(4.0 * p)
+        wsz = 1.0 - 0.08 * math.sin(4.0 * p)
+        
+    elif style == "SpinningIdle":
+        wrz = 1.5 * wave + 0.28 * math.sin(2.0 * p) # Huge spin (~85+ deg)
+        wz = 0.05 * math.sin(2.0 * p)
+        
+    elif style == "SpringBounce":
+        bounce = 0.5 - 0.5 * math.cos(2.0 * p)
+        wz = 0.20 * bounce
+        wsx = wsy = 1.0 - 0.08 * bounce
+        wsz = 1.0 + 0.15 * bounce
+        wrx = 0.10 * math.sin(2.0 * p)
+        
     elif style == "SquashStretchIdle":
-        wsx = wsy = 1.0 + 0.06 * wave
-        wsz = 1.0 - 0.08 * wave
-    else:
-        # Default subtle wobble for the rest
-        wrx = 0.08 * wave + 0.02 * math.sin(3.0 * p)
-        wry = 0.05 * wave15
+        pulse = wave
+        wsx = wsy = 1.0 + 0.15 * pulse
+        wsz = 1.0 - 0.18 * pulse
+        wz = 0.04 * pulse
+        
+    elif style == "TiltingIdle":
+        wrx = 0.25 * wave
+        wry = 0.25 * wave12
+        wrz = 0.15 * math.sin(2.0 * p)
+        
+    elif style == "Tumble":
+        wrx = 1.5 * wave # Huge back-and-forth tumble
+        wrz = 0.8 * wave
+        wz = 0.10 * (1.0 - math.cos(p))
+        
+    elif style == "Twist":
+        wrz = 0.70 * wave # Strong yaw twist
+        wry = 0.25 * wave2
+        wrx = 0.15 * wave07
+        
+    elif style == "WobbleIdle":
+        wrx = 0.25 * wave + 0.08 * math.sin(3.0 * p)
+        wry = 0.20 * wave15
+        wrz = 0.15 * wave2
+        wsx = 1.0 + 0.04 * math.sin(2.0 * p)
+        wsy = 1.0 - 0.04 * math.sin(2.0 * p)
 
     return world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity)
 
@@ -255,13 +322,13 @@ def _idle_pose_loop(style, t, variant, intensity=1.0):
     )
 
 # ---------------------------------------------------------------------------
-# Fine-Tuned Win animation profiles
+# Win animation profiles (Fixed: Juicy Squash + Vertical Hop)
 # ---------------------------------------------------------------------------
 
 def _win_pose(style_index, t, travel_y, intensity=1.0):
     spin_sign = -1.0 if style_index % 2 else 1.0
-    angle = 0.08 + (style_index % 5) * 0.02  # Very subtle pitch
-    side = math.sin(style_index * 1.37) * 0.1 # Very subtle roll
+    angle = 0.08 + (style_index % 5) * 0.02 
+    side = math.sin(style_index * 1.37) * 0.1 
 
     wx = wy = wz = 0.0
     wrx = wry = wrz = 0.0
@@ -269,41 +336,43 @@ def _win_pose(style_index, t, travel_y, intensity=1.0):
 
     if t <= 0.10: # Anticipation
         q = t / 0.10
-        wy = -(travel_y * 0.15) * q  # వెనక్కి లాగడం
-        wz = 0.0  # Translate Y 0.0 (ఎగరడం లేదు)
+        wy = -(travel_y * 0.15) * q 
+        wz = -0.03 * q # Squash down slightly
         wrx = angle * 0.5 * q
         wry = side * 0.5 * q
-        wrz = -spin_sign * 0.05 * q  # Rotate Y ని 90% తగ్గించాను
-        wsx, wsy, wsz = (1.0 + 0.02*q, 1.0 - 0.02*q, 1.0 + 0.02*q)
+        wrz = -spin_sign * 0.05 * q 
+        wsx, wsy, wsz = (1.0 + 0.05*q, 1.0 - 0.05*q, 1.0 + 0.05*q)
 
     elif t <= 0.38: # Forward Pop
         q = (t - 0.10) / 0.28
         ease = q*q*(3.0 - 2.0*q)
-        wy = travel_y * ease  # కెమెరా వైపు పంఛ్
-        wz = 0.0  
+        wy = travel_y * ease 
+        wz = 0.08 * math.sin(q * math.pi) # Nice little pop up during travel
         wrx = angle * math.sin(q * math.pi)
         wry = side * math.sin(q * math.pi)
-        wrz = spin_sign * 0.12 * q  # Max rotation is very subtle now
-        wsx, wsy, wsz = (1.0 - 0.05*math.sin(q*math.pi), 1.0 + 0.05*math.sin(q*math.pi), 1.0 - 0.02*math.sin(q*math.pi))
+        wrz = spin_sign * 0.15 * q
+        # Stretch during flight
+        wsx, wsy, wsz = (1.0 - 0.10*math.sin(q*math.pi), 1.0 + 0.15*math.sin(q*math.pi), 1.0 - 0.05*math.sin(q*math.pi)) 
 
     elif t <= 0.56: # Squash Impact
         q = (t - 0.38) / 0.18
         wy = travel_y * (1.0 + 0.08*math.sin(q*math.pi/2.0))
-        wz = 0.0
+        wz = 0.04 * math.sin(q * math.pi) # Small vertical pop you requested
         wrx = angle * (1.0-q)
         wry = side * (1.0-q)
-        wrz = spin_sign * (0.12 + 0.03*q)
-        wsx, wsy, wsz = (1.05 - 0.05*q, 0.95 + 0.05*q, 1.02 - 0.02*q)
+        wrz = spin_sign * (0.15 + 0.03*q)
+        # JUICY SQUASH! (15% deformation)
+        wsx, wsy, wsz = (1.15 - 0.10*q, 0.85 + 0.10*q, 1.10 - 0.05*q)
 
     elif t <= 0.78: # Rebound
         q = (t - 0.56) / 0.22
         bounce = math.sin(q * math.pi)
         wy = travel_y * (1.08 - 0.08*q)
-        wz = 0.0
+        wz = 0.02 * bounce # Tiny residual bounce
         wrx = angle * 0.3 * bounce
         wry = side * 0.3 * bounce
-        wrz = spin_sign * (0.15 - 0.08*q)
-        wsx, wsy, wsz = (1.0 + 0.02*bounce, 1.0 - 0.02*bounce, 1.0 + 0.01*bounce)
+        wrz = spin_sign * (0.18 - 0.08*q)
+        wsx, wsy, wsz = (1.0 + 0.05*bounce, 1.0 - 0.04*bounce, 1.0 + 0.03*bounce)
 
     else: # Settle back
         q = (t - 0.78) / 0.22
@@ -312,8 +381,8 @@ def _win_pose(style_index, t, travel_y, intensity=1.0):
         wz = 0.0
         wrx = angle * 0.1 * decay
         wry = side * 0.1 * decay
-        wrz = spin_sign * 0.07 * decay
-        wsx, wsy, wsz = (1.0 + 0.01*decay, 1.0 - 0.01*decay, 1.0 + 0.01*decay)
+        wrz = spin_sign * 0.10 * decay
+        wsx, wsy, wsz = (1.0 + 0.02*decay, 1.0 - 0.02*decay, 1.0 + 0.01*decay)
 
     return world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity)
 
@@ -365,7 +434,6 @@ def create_animations(rig, travel_y, idle_intensity=1.0, win_intensity=1.0):
             
             combined_samples = []
             combined_samples.extend(_idle_samples(style, style_index + 1, idle_intensity))
-            # travel_z తీసేసి కేవలం forward pop (travel_y) మాత్రమే పాస్ చేస్తున్నాను
             combined_samples.extend(_win_samples(style_index, travel_y, win_intensity))
             
             _bake_curves(rig, action, combined_samples)
@@ -456,29 +524,24 @@ class SLOTSYMBOL_PT_main(Panel):
         layout = self.layout
         settings = context.scene.slot_symbol_settings
 
-        # ---- HEADER ----
         box = layout.box()
         row = box.row()
         row.alignment = 'CENTER'
         row.label(text="SLOT SYMBOL GENERATOR", icon='ACTION') 
 
-        # ---- STEP 1: RIG ----
         col = layout.column(align=True)
         col.scale_y = 1.3
         col.operator("slotsymbol.create_symbol", text="1. Create Rig & Cube", icon='ARMATURE_DATA')
 
         layout.separator()
 
-        # ---- SETTINGS: MANUAL TRANSLATION ----
         box = layout.box()
         box.label(text="Win Animation (Manual Axis)", icon='OPTIONS')
         col = box.column(align=True)
         col.use_property_split = True
         col.use_property_decorate = False
-        # అనవసరమైన Jump Height తీసేసి కేవలం Forward ఆప్షన్ ఉంచాను
         col.prop(settings, "win_travel_y")
 
-        # ---- SETTINGS: INTENSITIES ----
         box = layout.box()
         box.label(text="Global Intensities", icon='MODIFIER')
         col = box.column(align=True)
@@ -487,7 +550,6 @@ class SLOTSYMBOL_PT_main(Panel):
         col.prop(settings, "idle_intensity")
         col.prop(settings, "win_intensity")
 
-        # ---- FRAME RANGES INFO ----
         box = layout.box()
         box.label(text="Action Frame Ranges", icon='TIME')
         col = box.column(align=True)
@@ -497,12 +559,10 @@ class SLOTSYMBOL_PT_main(Panel):
 
         layout.separator()
 
-        # ---- STEP 2: GENERATE ----
         col = layout.column(align=True)
         col.scale_y = 1.5
         col.operator("slotsymbol.create_animations", text="2. Generate Animations", icon='PLAY')
 
-        # ---- STATUS FEEDBACK ----
         if settings.status != "Ready":
             layout.separator()
             row = layout.row()
