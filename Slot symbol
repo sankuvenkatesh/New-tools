@@ -1,42 +1,41 @@
 """
-Slot Symbol Animation Generator — Blender Addon (v1.2.0)
+Slot Symbol Animation Generator — Blender Add-on (v1.3.0)
 =========================================================
-Compatible: Blender 4.2 LTS → 5.2 LTS
+Target: Blender 5.2 LTS (5.2.x)
 
-NEW in v1.2.0:
-  ✓ Squash & Stretch   — volume-preserving scale on win (cartoony pop)
-  ✓ Anticipation       — brief backward wind-up before forward rush
-  ✓ Overshoot + Bounce — impact squashes past target, then settles
-  ✓ "Juicy Mode" toggle in panel (default ON)
+NEW in v1.3.0 — Blender 5.2 LTS update:
+  ✓ Slotted / layered Action API, feature-detected (no version sniffing)
+  ✓ F-Curves read via layers → strips → channelbags
+    (Action.fcurves / .groups / .id_root were removed in 5.0)
+  ✓ No bpy.ops for mesh weights / camera / pose reset → no poll / context errors
+  ✓ "Create Symbol" and "Create Actions" are real operators (Undo + status-bar reports)
+  ✓ Frame settings validated: 1 < Idle End < Win Start < Win End (win segment >= 8 frames)
+  ✓ Idle keys follow "Idle End Frame" (default 30 → keys at 8 / 15 / 22, same as before)
+  ✓ Handles recalculated after the Cycles modifier is added
 
-Unchanged:
+Unchanged animation layout:
   • Idle segment f1–30 (loop, identity endpoints)
-  • Win segment f31–90
+  • Win segment  f31–90 (Juicy: squash & stretch, anticipation, overshoot + bounce)
   • Endpoints: f1 = f30 = f31 = f90 = IDENTITY
-  • Single Root bone, static camera (VR safe), FPS=30
+  • Single Root bone, static camera (VR safe), FPS = 30
 """
 
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "VR Slot Dev",
-    "version": (1, 2, 0),
-    "blender": (4, 2, 0),
+    "version": (1, 3, 0),
+    "blender": (5, 2, 0),
     "location": "View3D > N-Panel > Slot Symbol",
     "description": "Generate slot symbol rig + juicy idle/win actions",
     "category": "Animation",
 }
 
-import bpy
 import math
 import random
-from bpy.props import BoolProperty, IntProperty, FloatProperty, StringProperty
-from bpy.types import Panel, PropertyGroup
 
-try:
-    from bpy_extras import anim_utils
-    _HAS_ANIM_UTILS = True
-except ImportError:
-    _HAS_ANIM_UTILS = False
+import bpy
+from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
+from bpy.types import Operator, Panel, PropertyGroup
 
 
 # ==========================================================
@@ -44,18 +43,56 @@ except ImportError:
 # ==========================================================
 FPS         = 30
 RANDOM_SEED = 42
+RIG_NAME    = "SymbolRig"
+
+# Juicy win keys: (t, forward ratio, up, (sx, sy, sz), spin ratio)
+JUICY_KEYS = (
+    (0.00,  0.00,  0.00, (1.00, 1.00, 1.00),  0.00),   # identity
+    (0.10, -0.10,  0.00, (1.15, 1.00, 0.88), -0.15),   # anticipation (back + squash)
+    (0.30,  0.75,  0.10, (0.82, 1.00, 1.22),  0.70),   # rush (stretch tall)
+    (0.50,  1.08,  0.05, (1.25, 1.00, 0.80),  1.00),   # impact (squash + overshoot)
+    (0.62,  0.92,  0.00, (1.05, 1.00, 0.98),  1.15),   # bounce settle
+    (0.80,  0.35,  0.06, (0.88, 1.00, 1.14),  0.60),   # return stretch
+    (0.92, -0.03,  0.00, (1.06, 1.00, 0.94), -0.05),   # return overshoot
+    (1.00,  0.00,  0.00, (1.00, 1.00, 1.00),  0.00),   # identity
+)
+
+IDLE_KEY_POSITIONS = (0.25, 0.50, 0.75)     # fractions of the idle segment
+MIN_WIN_SPAN       = len(JUICY_KEYS) - 1    # 8 distinct keys -> at least 7 frames
 
 
 # ==========================================================
 # HELPERS
 # ==========================================================
-def _is_blender_5_plus():
-    return bpy.app.version >= (5, 0, 0)
-
-
 def _version_string():
     v = bpy.app.version
     return f"{v[0]}.{v[1]}.{v[2]}"
+
+
+def _has_rna_prop(rna_type, prop_name):
+    """True if a bpy.types class has the given RNA property in this build."""
+    try:
+        return prop_name in rna_type.bl_rna.properties.keys()
+    except Exception:
+        return False
+
+
+_icon_cache = None
+
+
+def _icon(name, fallback='NONE'):
+    """Return `name` if this Blender build knows the icon, else `fallback`
+    (an unknown icon name would otherwise break the whole panel)."""
+    global _icon_cache
+    if _icon_cache is None:
+        try:
+            _icon_cache = set(
+                bpy.types.UILayout.bl_rna.functions["prop"]
+                .parameters["icon"].enum_items.keys()
+            )
+        except Exception:
+            _icon_cache = set()
+    return name if (not _icon_cache or name in _icon_cache) else fallback
 
 
 def _ensure_object_mode():
@@ -68,37 +105,68 @@ def _ensure_object_mode():
 
 
 def _get_rig():
-    return bpy.data.objects.get("SymbolRig")
+    return bpy.data.objects.get(RIG_NAME)
 
 
 def _iter_fcurves(action):
-    if hasattr(action, "fcurves"):
-        try:
-            for fc in action.fcurves:
-                yield fc
-            return
-        except Exception:
-            pass
-    if _HAS_ANIM_UTILS:
-        try:
-            for slot in action.slots:
-                cb = anim_utils.action_ensure_channelbag_for_slot(action, slot)
-                if cb is not None:
-                    for fc in cb.fcurves:
+    """Yield every F-Curve of an action.
+    Blender 4.4+/5.x: layers -> strips -> channelbags -> fcurves.
+    Older builds:     the legacy Action.fcurves list."""
+    layers = getattr(action, "layers", None)
+    if layers is not None:
+        for layer in layers:
+            for strip in layer.strips:
+                for channelbag in getattr(strip, "channelbags", ()):
+                    for fc in channelbag.fcurves:
                         yield fc
-        except Exception:
-            pass
+        return
+    for fc in getattr(action, "fcurves", ()):
+        yield fc
 
 
-def _assign_action_with_slot(rig, act):
+def _assign_action(rig, act):
+    """Make `act` the rig's active action (plus its slot on slotted-action builds)."""
     ad = rig.animation_data
     ad.action = act
-    if _is_blender_5_plus() and hasattr(ad, "action_slot"):
-        if act.slots:
-            ad.action_slot = act.slots[0]
+    if hasattr(ad, "action_slot"):
+        if len(act.slots):
+            slot = act.slots[0]
         else:
             slot = act.slots.new(id_type='OBJECT', name=rig.name)
-            ad.action_slot = slot
+        ad.action_slot = slot
+
+
+def _assign_strip_slot(strip, act):
+    if hasattr(strip, "action_slot") and len(act.slots):
+        try:
+            strip.action_slot = act.slots[0]
+        except Exception:
+            pass
+
+
+def _validate_frames(idle_end, win_start, win_end):
+    """Return an error string, or None when the frame layout is usable."""
+    if not (1 < idle_end < win_start < win_end):
+        return "Frames must satisfy: 1 < Idle End < Win Start < Win End"
+    if win_end - win_start < MIN_WIN_SPAN:
+        return f"Win segment too short: need Win End - Win Start >= {MIN_WIN_SPAN}"
+    return None
+
+
+def _juicy_frames(win_start, win_end):
+    """Frame numbers for JUICY_KEYS: strictly increasing, first = win_start,
+    last = win_end (needs win_end - win_start >= MIN_WIN_SPAN)."""
+    span   = win_end - win_start
+    count  = len(JUICY_KEYS)
+    frames = []
+    prev   = win_start - 1
+    for i, key in enumerate(JUICY_KEYS):
+        f = win_start + int(round(span * key[0]))
+        f = min(f, win_end - (count - 1 - i))   # leave room for the remaining keys
+        f = max(f, prev + 1)                    # strictly increasing
+        frames.append(f)
+        prev = f
+    return frames
 
 
 # ==========================================================
@@ -111,45 +179,59 @@ def create_symbol():
     _ensure_object_mode()
     random.seed(RANDOM_SEED)
 
-    arm_data = bpy.data.armatures.new("SymbolArmature")
-    arm_obj  = bpy.data.objects.new("SymbolRig", arm_data)
-    bpy.context.collection.objects.link(arm_obj)
+    context    = bpy.context
+    scene      = context.scene
+    collection = context.collection
 
-    bpy.ops.object.select_all(action='DESELECT')
+    # ---- Armature with a single Root bone ----
+    arm_data = bpy.data.armatures.new("SymbolArmature")
+    arm_obj  = bpy.data.objects.new(RIG_NAME, arm_data)
+    collection.objects.link(arm_obj)
+
+    for obj in list(context.selected_objects):
+        obj.select_set(False)
     arm_obj.select_set(True)
-    bpy.context.view_layer.objects.active = arm_obj
+    context.view_layer.objects.active = arm_obj
 
     bpy.ops.object.mode_set(mode='EDIT')
-    eb   = arm_data.edit_bones
-    root = eb.new("Root")
+    root = arm_data.edit_bones.new("Root")
     root.head = (0, 0, 0)
     root.tail = (0, -0.5, 0)
     bpy.ops.object.mode_set(mode='OBJECT')
 
+    # ---- Symbol mesh ----
     bpy.ops.mesh.primitive_uv_sphere_add(radius=0.28, location=(0, 0, 0))
-    mesh = bpy.context.active_object
-    mesh.name = "SymbolMesh"
+    mesh_obj = context.active_object
+    mesh_obj.name = "SymbolMesh"
     bpy.ops.object.shade_smooth()
 
-    bpy.ops.object.select_all(action='DESELECT')
-    mesh.select_set(True)
-    arm_obj.select_set(True)
-    bpy.context.view_layer.objects.active = arm_obj
-    bpy.ops.object.parent_set(type='ARMATURE_AUTO')
+    # Parent + Armature modifier + every vertex fully weighted to Root.
+    # Pure data API: no ARMATURE_AUTO heat-weighting, so it cannot fail.
+    mesh_obj.parent = arm_obj
+    group = mesh_obj.vertex_groups.new(name="Root")
+    group.add(list(range(len(mesh_obj.data.vertices))), 1.0, 'REPLACE')
+    modifier = mesh_obj.modifiers.new(name="Armature", type='ARMATURE')
+    modifier.object = arm_obj
 
-    scene = bpy.context.scene
+    # ---- Static VR camera (only when the scene has none) ----
     if scene.camera is None:
-        bpy.ops.object.camera_add(location=(0, -2.5, 0.5))
-        cam = bpy.context.active_object
-        cam.name = "VR_StaticCamera"
+        cam_data = bpy.data.cameras.new("VR_StaticCamera")
+        cam_data.lens = 50
+        cam = bpy.data.objects.new("VR_StaticCamera", cam_data)
+        collection.objects.link(cam)
+        cam.location       = (0, -2.5, 0.5)
         cam.rotation_euler = (math.radians(85), 0.0, 0.0)
-        cam.data.lens = 50
         scene.camera = cam
 
     scene.render.fps      = FPS
     scene.render.fps_base = 1.0
     scene.frame_start     = 1
     scene.frame_end       = 90
+
+    # Leave the rig selected + active, ready for "Create Actions"
+    mesh_obj.select_set(False)
+    arm_obj.select_set(True)
+    context.view_layer.objects.active = arm_obj
 
     return f"Symbol created  [{_version_string()}]"
 
@@ -159,7 +241,11 @@ def create_symbol():
 # ==========================================================
 def create_actions(rig, num_actions, idle_end, win_start, win_end,
                    win_forward, juicy_mode=True):
-    rig.animation_data_create()
+    problem = _validate_frames(idle_end, win_start, win_end)
+    if problem:
+        raise ValueError(problem)
+
+    ad = rig.animation_data_create()
     random.seed(RANDOM_SEED)
 
     def reset_pose():
@@ -188,12 +274,20 @@ def create_actions(rig, num_actions, idle_end, win_start, win_end,
             mod = fc.modifiers.new('CYCLES')
             mod.mode_before = 'REPEAT'
             mod.mode_after  = 'REPEAT'
+            fc.update()
 
-    rig.animation_data.action = None
-    for tr in list(rig.animation_data.nla_tracks):
-        rig.animation_data.nla_tracks.remove(tr)
+    # Start clean: no active action, no NLA tracks
+    ad.action = None
+    for track in list(ad.nla_tracks):
+        ad.nla_tracks.remove(track)
 
-    created = 0
+    idle_frames = sorted(
+        {int(1 + (idle_end - 1) * k) for k in IDLE_KEY_POSITIONS} - {1, idle_end}
+    )
+    win_frames = _juicy_frames(win_start, win_end)
+    span       = win_end - win_start
+
+    new_actions = []
     for idx in range(1, num_actions + 1):
         name = f"Symbol_{idx:02d}"
 
@@ -206,10 +300,10 @@ def create_actions(rig, num_actions, idle_end, win_start, win_end,
 
         act = bpy.data.actions.new(name)
         act.use_fake_user = True
-        _assign_action_with_slot(rig, act)
+        _assign_action(rig, act)
         reset_pose()
 
-        # ---- Randomised parameters ----
+        # ---- Randomised parameters (same order as v1.2.0 → same results) ----
         phase_i    = idx * (2 * math.pi / num_actions)
         phase_w    = idx * (2 * math.pi / num_actions) + math.pi * 0.37
         idle_inten = 0.75 + 0.50 * random.random()
@@ -220,65 +314,35 @@ def create_actions(rig, num_actions, idle_end, win_start, win_end,
         spin_dir   = 1.0 if (idx % 2 == 0) else -1.0
 
         # ==================================================
-        # IDLE SEGMENT  (unchanged)
+        # IDLE SEGMENT
         # ==================================================
-        key_full(1, (0, 0, 0), (0, 0, 0), (1, 1, 1))
-        for f in (8, 15, 22):
-            if f >= idle_end:
-                continue
-            t    = (f - 1) / max(idle_end - 1, 1)
+        key_full(1)
+        for f in idle_frames:
+            t    = (f - 1) / (idle_end - 1)
             bob  = math.sin(t * 2*math.pi * idle_speed + phase_i)       * 0.03 * idle_inten
             sway = math.sin(t * 2*math.pi * idle_speed + phase_i + 1.0) * 0.02 * idle_inten
             spin = math.sin(t * 2*math.pi * idle_speed + phase_i)       * 0.08 * idle_inten
-            key_full(f, (0, 0, bob), (sway, 0, spin), (1, 1, 1))
-        key_full(idle_end, (0, 0, 0), (0, 0, 0), (1, 1, 1))
+            key_full(f, (0, 0, bob), (sway, 0, spin))
+        key_full(idle_end)
 
         # ==================================================
         # WIN SEGMENT
         # ==================================================
-        span = max(win_end - win_start, 1)
-
         if juicy_mode:
-            # ----------------------------------------------
             # JUICY: squash-stretch + anticipation + overshoot
-            # ----------------------------------------------
             base_spin = spin_dir * math.pi * math.sin(phase_w)
-
-            # (t,  fwd_ratio, up,  (sx,   sy,   sz ),  spin_ratio)
-            win_keys = [
-                (0.00,  0.00,  0.00, (1.00, 1.00, 1.00),  0.00),  # identity
-                (0.10, -0.10,  0.00, (1.15, 1.00, 0.88), -0.15),  # anticipation (back+squash)
-                (0.30,  0.75,  0.10, (0.82, 1.00, 1.22),  0.70),  # rush (stretch tall)
-                (0.50,  1.08,  0.05, (1.25, 1.00, 0.80),  1.00),  # impact (squash+overshoot)
-                (0.62,  0.92,  0.00, (1.05, 1.00, 0.98),  1.15),  # bounce settle
-                (0.80,  0.35,  0.06, (0.88, 1.00, 1.14),  0.60),  # return stretch
-                (0.92, -0.03,  0.00, (1.06, 1.00, 0.94), -0.05),  # return overshoot
-                (1.00,  0.00,  0.00, (1.00, 1.00, 1.00),  0.00),  # identity
-            ]
-
-            prev_frame = win_start - 1
-            for t, fwd_r, up, scl, spin_r in win_keys:
-                frame = win_start + int(round(span * t))
-                if frame > win_end:
-                    frame = win_end
-                if frame <= prev_frame:
-                    frame = prev_frame + 1
-                    if frame > win_end:
-                        break
-                prev_frame = frame
-
-                loc = (0.0, win_fwd * fwd_r, up * win_inten)
-                rot = (0.0, 0.0, base_spin * spin_r)
-                key_full(frame, loc, rot, scl)
+            for frame, (_t, fwd_r, up, scl, spin_r) in zip(win_frames, JUICY_KEYS):
+                key_full(frame,
+                         (0.0, win_fwd * fwd_r, up * win_inten),
+                         (0.0, 0.0, base_spin * spin_r),
+                         scl)
         else:
-            # ----------------------------------------------
             # CLASSIC: uniform scale, straight forward move
-            # ----------------------------------------------
             p1 = win_start + int(span * 0.23)
             p2 = win_start + int(span * 0.50)
             p3 = win_start + int(span * 0.77)
 
-            key_full(win_start, (0, 0, 0), (0, 0, 0), (1, 1, 1))
+            key_full(win_start)
             key_full(p1,
                      (0, win_fwd * 0.35, 0.12 * win_inten),
                      (0, 0, spin_dir * math.pi * 0.5 * math.sin(phase_w)),
@@ -291,94 +355,31 @@ def create_actions(rig, num_actions, idle_end, win_start, win_end,
                      (0, win_fwd * 0.30, 0.08 * win_inten),
                      (0, 0, spin_dir * math.pi * 1.5 * math.sin(phase_w)),
                      (1.05, 1.05, 1.05))
-            key_full(win_end, (0, 0, 0), (0, 0, 0), (1, 1, 1))
+            key_full(win_end)
 
         make_cyclic(act)
-        created += 1
+        new_actions.append(act)
 
-    # ---- NLA pushdown ----
-    rig.animation_data.action = None
-    for idx in range(1, num_actions + 1):
-        name = f"Symbol_{idx:02d}"
-        act  = bpy.data.actions.get(name)
-        if not act:
-            continue
-        track = rig.animation_data.nla_tracks.new()
-        track.name = name
-        strip = track.strips.new(name, 1, act)
-        strip.name = name
-        try:
-            if _is_blender_5_plus() and hasattr(strip, "action_slot") and act.slots:
-                strip.action_slot = act.slots[0]
-        except Exception:
-            pass
+    # ---- NLA pushdown: one track + strip per action ----
+    ad.action = None
+    for act in new_actions:
+        track = ad.nla_tracks.new()
+        track.name = act.name
+        strip = track.strips.new(act.name, 1, act)
+        strip.name = act.name
+        _assign_strip_slot(strip, act)
 
-    # ---- Reset pose ----
-    bpy.context.view_layer.objects.active = rig
-    bpy.ops.object.mode_set(mode='POSE')
-    bpy.ops.pose.select_all(action='SELECT')
-    bpy.ops.pose.transforms_clear()
-    bpy.ops.object.mode_set(mode='OBJECT')
+    # ---- Reset pose (data API, no mode switching) ----
+    reset_pose()
 
     mode = "Juicy" if juicy_mode else "Classic"
-    return f"Created {created} actions [{mode}]  [{_version_string()}]"
-
-
-# ==========================================================
-# UPDATE CALLBACKS
-# ==========================================================
-def _update_create_symbol(self, context):
-    if not self.create_symbol:
-        return
-    self.create_symbol = False
-    try:
-        _ensure_object_mode()
-        self.status = create_symbol()
-    except Exception as e:
-        self.status = f"ERROR: {e}"
-
-
-def _update_create_actions(self, context):
-    if not self.create_actions:
-        return
-    self.create_actions = False
-    try:
-        rig = _get_rig()
-        if rig is None:
-            self.status = "ERROR: Create Symbol first!"
-            return
-        _ensure_object_mode()
-        self.status = create_actions(
-            rig,
-            self.num_actions,
-            self.idle_end,
-            self.win_start,
-            self.win_end,
-            self.win_forward,
-            self.juicy_mode,
-        )
-    except Exception as e:
-        self.status = f"ERROR: {e}"
+    return f"Created {len(new_actions)} actions [{mode}]  [{_version_string()}]"
 
 
 # ==========================================================
 # PROPERTY GROUP
 # ==========================================================
 class SlotSymbolSettings(PropertyGroup):
-
-    create_symbol: BoolProperty(
-        name="Create Symbol",
-        description="Generate 3D symbol with single-bone rig",
-        default=False,
-        update=_update_create_symbol,
-    )
-
-    create_actions: BoolProperty(
-        name="Create Actions",
-        description="Generate all idle+win animation actions",
-        default=False,
-        update=_update_create_actions,
-    )
 
     juicy_mode: BoolProperty(
         name="Juicy Mode",
@@ -419,6 +420,63 @@ class SlotSymbolSettings(PropertyGroup):
 
 
 # ==========================================================
+# OPERATORS
+# ==========================================================
+class SLOTSYMBOL_OT_create_symbol(Operator):
+    bl_idname      = "slotsymbol.create_symbol"
+    bl_label       = "Create Symbol"
+    bl_description = "Generate 3D symbol with single-bone rig"
+    bl_options     = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.slot_symbol_settings
+        if _get_rig() is not None:
+            s.status = "SymbolRig already exists"
+            self.report({'WARNING'}, s.status)
+            return {'CANCELLED'}
+        try:
+            s.status = create_symbol()
+        except Exception as e:
+            s.status = f"ERROR: {e}"
+            self.report({'ERROR'}, s.status)
+            return {'CANCELLED'}
+        self.report({'INFO'}, s.status)
+        return {'FINISHED'}
+
+
+class SLOTSYMBOL_OT_create_actions(Operator):
+    bl_idname      = "slotsymbol.create_actions"
+    bl_label       = "Create Actions"
+    bl_description = "Generate all idle + win animation actions (one NLA track each)"
+    bl_options     = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s   = context.scene.slot_symbol_settings
+        rig = _get_rig()
+        if rig is None:
+            s.status = "ERROR: Create Symbol first!"
+            self.report({'ERROR'}, s.status)
+            return {'CANCELLED'}
+        try:
+            _ensure_object_mode()
+            s.status = create_actions(
+                rig,
+                s.num_actions,
+                s.idle_end,
+                s.win_start,
+                s.win_end,
+                s.win_forward,
+                s.juicy_mode,
+            )
+        except Exception as e:
+            s.status = f"ERROR: {e}"
+            self.report({'ERROR'}, s.status)
+            return {'CANCELLED'}
+        self.report({'INFO'}, s.status)
+        return {'FINISHED'}
+
+
+# ==========================================================
 # UI PANEL
 # ==========================================================
 class SLOTSYMBOL_PT_main(Panel):
@@ -434,26 +492,28 @@ class SLOTSYMBOL_PT_main(Panel):
 
         header = layout.box()
         hrow   = header.row()
-        hrow.label(text="3D Slot Symbol Tools", icon='ARMATURE_DATA')
+        hrow.label(text="3D Slot Symbol Tools", icon=_icon('ARMATURE_DATA'))
 
         act_box = layout.box()
         acol = act_box.column(align=True)
         acol.scale_y = 1.35
-        acol.prop(s, "create_symbol",  text="Create Symbol",  icon='MESH_UVSPHERE')
-        acol.prop(s, "create_actions", text="Create Actions", icon='ACTION')
+        acol.operator("slotsymbol.create_symbol",  text="Create Symbol",
+                      icon=_icon('MESH_UVSPHERE'))
+        acol.operator("slotsymbol.create_actions", text="Create Actions",
+                      icon=_icon('ACTION'))
 
         # ---- Style toggle ----
         layout.separator(factor=0.5)
         style = layout.box()
         sc = style.column(align=True)
-        sc.label(text="Animation Style", icon='SHADERFX')
+        sc.label(text="Animation Style", icon=_icon('SHADERFX'))
         sc.separator(factor=0.3)
         sc.prop(s, "juicy_mode", text="Juicy (Squash + Overshoot)")
 
         layout.separator(factor=0.6)
         sett = layout.box()
         scol = sett.column(align=True)
-        scol.label(text="Settings", icon='PREFERENCES')
+        scol.label(text="Settings", icon=_icon('PREFERENCES'))
         scol.separator(factor=0.4)
         scol.prop(s, "num_actions")
         scol.prop(s, "idle_end",    text="Idle End Frame")
@@ -464,7 +524,7 @@ class SLOTSYMBOL_PT_main(Panel):
         layout.separator(factor=0.6)
         info = layout.box()
         icol = info.column(align=True)
-        icol.label(text="Timeline Layout", icon='INFO')
+        icol.label(text="Timeline Layout", icon=_icon('INFO'))
         icol.separator(factor=0.3)
         icol.scale_y = 0.85
         icol.label(text=f"Idle : f1 → f{s.idle_end}   (loop)")
@@ -477,24 +537,29 @@ class SLOTSYMBOL_PT_main(Panel):
         layout.separator(factor=0.6)
         compat = layout.box()
         ccol = compat.column(align=True)
-        ccol.label(text="Compatibility", icon='BLENDER')
+        ccol.label(text="Compatibility", icon=_icon('BLENDER'))
         ccol.scale_y = 0.85
         ccol.label(text=f"Blender: {_version_string()}")
-        if _is_blender_5_plus():
-            ccol.label(text="API: Slotted Actions (5.x)  ✓")
+        if _has_rna_prop(bpy.types.Action, "layers"):
+            ccol.label(text="API: Slotted / Layered Actions  ✓")
         else:
-            ccol.label(text="API: Legacy fcurves (4.x)  ✓")
+            ccol.label(text="API: Legacy fcurves  ✓")
 
         layout.separator(factor=0.6)
         stat = layout.box()
         icon = 'ERROR' if s.status.startswith("ERROR") else 'CHECKMARK'
-        stat.label(text=f"Status: {s.status}", icon=icon)
+        stat.label(text=f"Status: {s.status}", icon=_icon(icon))
 
 
 # ==========================================================
 # REGISTER
 # ==========================================================
-_classes = (SlotSymbolSettings, SLOTSYMBOL_PT_main)
+_classes = (
+    SlotSymbolSettings,
+    SLOTSYMBOL_OT_create_symbol,
+    SLOTSYMBOL_OT_create_actions,
+    SLOTSYMBOL_PT_main,
+)
 
 
 def register():
