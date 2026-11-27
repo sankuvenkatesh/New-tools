@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (2, 1, 0),
+    "version": (2, 2, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Slot Symbol",
     "description": "Generate a horizontal single-bone cube rig with 16 looping idle and 16 win animations",
@@ -83,17 +83,18 @@ def _key_root(pb, frame, loc=(0.0, 0.0, 0.0),
 def _assign_action(rig, action):
     ad = rig.animation_data_create()
     ad.action = action
-    # Blender 4.4+ / 5.x slotted actions.
+    # Blender 4.4+ / 5.x slotted actions safe assignment
     if hasattr(ad, "action_slot") and hasattr(action, "slots"):
-        if len(action.slots):
+        if len(action.slots) > 0:
             slot = action.slots[0]
         else:
             slot = action.slots.new(id_type='OBJECT', name=rig.name)
-        ad.action_slot = slot
+        # Assign slot ONLY if action is currently active to prevent errors
+        if ad.action is not None:
+            ad.action_slot = slot
 
 
 def _iter_action_fcurves(action):
-    """Feature-detect layered/slotted Actions and retain legacy compatibility."""
     layers = getattr(action, "layers", None)
     if layers is not None:
         for layer in layers:
@@ -113,7 +114,6 @@ def _polish_action(action, cyclic=False):
             key.handle_left_type = 'AUTO_CLAMPED'
             key.handle_right_type = 'AUTO_CLAMPED'
         if cyclic:
-            # Check if CYCLES modifier already exists to prevent duplication
             if not any(mod.type == 'CYCLES' for mod in fc.modifiers):
                 mod = fc.modifiers.new(type='CYCLES')
                 mod.mode_before = 'REPEAT'
@@ -152,10 +152,13 @@ def create_symbol():
     collection = context.collection
 
     arm_data = bpy.data.armatures.new("SymbolArmature")
+    arm_data.display_type = 'B_BONE' # Makes the horizontal bone display nicely
+    arm_data.show_axes = True        # Shows orientation axes
+    
     rig = bpy.data.objects.new(RIG_NAME, arm_data)
     collection.objects.link(rig)
 
-    # Build a horizontal bone along world/local X.
+    # Build a strictly horizontal bone along world/local X.
     bpy.ops.object.select_all(action='DESELECT')
     rig.select_set(True)
     context.view_layer.objects.active = rig
@@ -163,6 +166,7 @@ def create_symbol():
     bone = arm_data.edit_bones.new(ROOT_BONE)
     bone.head = (-0.45, 0.0, 0.0)
     bone.tail = (0.45, 0.0, 0.0)
+    bone.roll = 0.0 # Prevents twisting
     bone.use_deform = True
     bpy.ops.object.mode_set(mode='OBJECT')
 
@@ -309,7 +313,6 @@ def _idle_pose(style, t, variant, intensity=1.0):
         sx = 1.0 + 0.025 * math.sin(2.0 * p)
         sy = 1.0 - 0.025 * math.sin(2.0 * p)
 
-    # Apply Intensity Scaling
     return (x * intensity, y * intensity, z * intensity), \
            (rx * intensity, ry * intensity, rz * intensity), \
            (1.0 + (sx - 1.0) * intensity, 1.0 + (sy - 1.0) * intensity, 1.0 + (sz - 1.0) * intensity)
@@ -358,7 +361,6 @@ def _win_pose(style_index, t, distance, intensity=1.0):
         r = (angle * 0.22 * decay, side * 0.06 * decay, spin_sign * 1.60 * decay)
         s = (1.0 + 0.035*decay, 1.0 + 0.02*decay, 1.0 - 0.035*decay)
 
-    # Apply Intensity (Forward Y distance is kept independent of intensity)
     return (l[0] * intensity, l[1], l[2] * intensity), \
            (r[0] * intensity, r[1] * intensity, r[2] * intensity), \
            (1.0 + (s[0] - 1.0) * intensity, 1.0 + (s[1] - 1.0) * intensity, 1.0 + (s[2] - 1.0) * intensity)
@@ -370,15 +372,15 @@ def create_animations(rig, forward_distance, idle_intensity=1.0, win_intensity=1
         raise ValueError("Forward distance must be greater than zero.")
 
     ad = rig.animation_data_create()
+    
+    # Safely clear the active action without touching the slot
+    # Blender 5.2 automatically unlinks the slot when action becomes None.
     ad.action = None
-    if hasattr(ad, "action_slot"):
-        ad.action_slot = None
 
     pb = rig.pose.bones[ROOT_BONE]
     created = []
 
     for style_index, style in enumerate(IDLE_STYLES):
-        # ---------------------------- IDLE ----------------------------
         idle = _new_action(rig, f"Idle_{style}")
         _reset_root(pb)
         sample_frames = (1, 12, 23, 34, 45)
@@ -391,7 +393,6 @@ def create_animations(rig, forward_distance, idle_intensity=1.0, win_intensity=1
         _polish_action(idle, cyclic=True)
         created.append(idle)
 
-        # ----------------------------- WIN ---------------------------
         win = _new_action(rig, f"Win_{style}")
         _reset_root(pb)
         win_samples = (1, 4, 7, 13, 23, 34, 40, 47, 54, 60)
@@ -405,9 +406,9 @@ def create_animations(rig, forward_distance, idle_intensity=1.0, win_intensity=1
         created.append(win)
 
     _reset_root(pb)
+    
+    # Safely clean up at the end (just setting action to None is enough)
     ad.action = None
-    if hasattr(ad, "action_slot"):
-        ad.action_slot = None
 
     return f"Created {len(IDLE_STYLES)} idle loops + {len(IDLE_STYLES)} win actions ({len(created)} total)."
 
@@ -424,12 +425,12 @@ class SlotSymbolSettings(PropertyGroup):
     )
     idle_intensity: FloatProperty(
         name="Idle Intensity",
-        description="Multiplier for idle animation movements (bounce, wobble, etc.)",
+        description="Multiplier for idle animation movements",
         default=1.0, min=0.1, max=5.0,
     )
     win_intensity: FloatProperty(
         name="Win Intensity",
-        description="Multiplier for win animation exaggerations (spin, lift, squash)",
+        description="Multiplier for win animation exaggerations",
         default=1.0, min=0.1, max=5.0,
     )
     status: StringProperty(name="Status", default="Ready")
@@ -501,7 +502,6 @@ class SLOTSYMBOL_PT_main(Panel):
         box.label(text=f"Idle: 1–{IDLE_FRAMES} frames • seamless loop")
         box.label(text=f"Win: 1–{WIN_FRAMES} frames • one-shot")
         
-        # New Settings Columns
         col = box.column(align=True)
         col.prop(settings, "forward_distance")
         col.prop(settings, "idle_intensity")
