@@ -3301,6 +3301,15 @@ class OVERLAPPER_PT_panel(
     bl_region_type = 'UI'
     bl_category = "Overlapper"
 
+    def draw_header(
+            self,
+            context
+    ):
+        self.layout.label(
+            text="",
+            icon='ONIONSKIN_ON'
+        )
+
     def draw(
             self,
             context
@@ -3328,42 +3337,66 @@ class OVERLAPPER_PT_panel(
             align=True
         )
 
-        col.prop(
-            props,
-            "softness"
-        )
-
-        col.prop(
-            props,
-            "scale"
-        )
+        for prop_name, icon_name in (
+            ("softness", 'MOD_SOFT'),
+            ("scale", 'FULLSCREEN_ENTER'),
+        ):
+            row = col.row(
+                align=True
+            )
+            icon_col = row.row(
+                align=True
+            )
+            icon_col.ui_units_x = 1.1
+            icon_col.label(
+                text="",
+                icon=icon_name
+            )
+            row.prop(
+                props,
+                prop_name
+            )
 
         box = layout.box()
 
         box.prop(
             props,
-            "use_wind"
+            "use_wind",
+            icon='FORCE_WIND',
+            toggle=True
         )
 
         if props.use_wind:
 
-            row = box.row(
+            wind_col = box.column(
                 align=True
             )
 
-            row.prop(
-                props,
-                "wind_scale"
-            )
-
-            row.prop(
-                props,
-                "wind_speed"
-            )
+            for prop_name, icon_name in (
+                ("wind_scale", 'FORCE_TURBULENCE'),
+                ("wind_speed", 'TIME'),
+            ):
+                row = wind_col.row(
+                    align=True
+                )
+                icon_col = row.row(
+                    align=True
+                )
+                icon_col.ui_units_x = 1.1
+                icon_col.label(
+                    text="",
+                    icon=icon_name
+                )
+                row.prop(
+                    props,
+                    prop_name
+                )
 
         box = layout.box()
 
-        row = box.row()
+        row = box.row(
+            align=True
+        )
 
         row.prop(
             props,
@@ -3376,44 +3409,61 @@ class OVERLAPPER_PT_panel(
             emboss=False
         )
 
+        icon_col = row.row(
+            align=True
+        )
+        icon_col.ui_units_x = 1.1
+        icon_col.label(
+            text="",
+            icon='PREFERENCES'
+        )
+
         if props.show_options:
 
-            box.prop(
-                props,
-                "dont_use_first"
-            )
-
-            box.prop(
-                props,
-                "add_translate"
-            )
-
-            box.prop(
-                props,
-                "hierarchy_mode"
-            )
-
-            box.prop(
-                props,
-                "cycle_mode"
-            )
+            for prop_name, icon_name in (
+                ("dont_use_first", 'PINNED'),
+                ("add_translate", 'EMPTY_ARROWS'),
+                ("hierarchy_mode", 'OUTLINER'),
+                ("cycle_mode", 'LOOP_FORWARDS'),
+            ):
+                row = box.row(
+                    align=True
+                )
+                icon_col = row.row(
+                    align=True
+                )
+                icon_col.ui_units_x = 1.1
+                icon_col.label(
+                    text="",
+                    icon=icon_name
+                )
+                row.prop(
+                    props,
+                    prop_name
+                )
 
             box.separator()
 
-            box.prop(
-                props,
-                "bake_new_layer"
-            )
-
-            box.prop(
-                props,
-                "adaptive_scale"
-            )
-
-            box.prop(
-                props,
-                "delete_redundant"
-            )
+            for prop_name, icon_name in (
+                ("bake_new_layer", 'NLA'),
+                ("adaptive_scale", 'DRIVER_DISTANCE'),
+                ("delete_redundant", 'MOD_DECIM'),
+            ):
+                row = box.row(
+                    align=True
+                )
+                icon_col = row.row(
+                    align=True
+                )
+                icon_col.ui_units_x = 1.1
+                icon_col.label(
+                    text="",
+                    icon=icon_name
+                )
+                row.prop(
+                    props,
+                    prop_name
+                )
 
         layout.separator()
 
@@ -3425,7 +3475,7 @@ class OVERLAPPER_PT_panel(
 
         row.operator(
             "overlapper.run",
-            icon='MOD_DYNAMICPAINT'
+            icon='MOD_WAVE'
         )
 
         row = layout.row(
