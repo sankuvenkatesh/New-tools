@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (2, 7, 0),
+    "version": (2, 8, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Slot Symbol",
-    "description": "Stylish UI, Combined Idle+Win actions (1-106), and positive Z forward translation",
+    "description": "Fine-tuned professional Slot animations (No vertical drift, minimal Y rotation)",
     "category": "Animation",
 }
 
@@ -23,14 +23,14 @@ RIG_NAME = "SymbolRig"
 MESH_NAME = "SymbolCube"
 ROOT_BONE = "Root"
 
-# మీరు అడిగిన కచ్చితమైన ఫ్రేమ్ రేంజెస్
+# ఖచ్చితమైన ఫ్రేమ్ రేంజెస్ (1 to 45 Idle, 46 to 106 Win)
 IDLE_START = 1
 IDLE_END = 45
 WIN_START = 46
 WIN_END = 106
 
 IDLE_KEY_STEP = 2
-WIN_FRAMES_COUNT = WIN_END - WIN_START  # 60 frames steps
+WIN_FRAMES_COUNT = WIN_END - WIN_START  # 60 frames
 
 WIN_KEY_TIMES = (0.0, 0.05, 0.10, 0.205, 0.38, 0.56, 0.66, 0.78, 0.90, 1.0)
 
@@ -50,9 +50,6 @@ _REST_POSE = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
 def world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity=1.0):
     lx = wx * intensity
     ly = wz * intensity  
-    
-    # ఎర్రర్ ఫిక్స్: నిలువు బోన్ కి Local Z అనేది ముందుకు (కెమెరా వైపు) చూపిస్తుంది.
-    # కాబట్టి పాజిటివ్ wy ఇస్తే, పాజిటివ్ Local Z అయ్యి ముందుకి వస్తుంది.
     lz = wy * intensity  
 
     lrx = wrx * intensity
@@ -216,90 +213,35 @@ def _idle_pose(style, t, variant, intensity=1.0):
     wave = math.sin(p) * math.cos(phase) + 0.5 * math.sin(2.0*p) * math.sin(phase)
     wave2 = math.sin(2.0*p) * math.cos(phase) + 0.5 * math.sin(4.0*p) * math.sin(phase)
     wave15 = math.sin(p) * math.cos(phase + 1.5) + 0.5 * math.sin(2.0*p) * math.sin(phase + 1.5)
-    wave12 = math.sin(p) * math.cos(phase + 1.2) + 0.5 * math.sin(2.0*p) * math.sin(phase + 1.2)
-    wave07 = math.sin(p) * math.cos(phase + 0.7) + 0.5 * math.sin(2.0*p) * math.sin(phase + 0.7)
-    amp = 0.85 + 0.15 * math.sin(variant * 1.71)
-
+    
     wx = wy = wz = 0.0
     wrx = wry = wrz = 0.0
     wsx = wsy = wsz = 1.0
+    amp = 0.5
 
+    # ఫైన్-ట్యూన్ చేయబడిన ఐడిల్ (మరీ ఎక్కువగా కదలకుండా)
     if style == "FloatingSpin":
-        wz = 0.075 * amp * wave
-        wx = 0.025 * amp * math.sin(p * 0.5 + phase) * (1.0 - math.cos(p))
-        wrz = 0.28 * wave + 0.18 * math.sin(2.0 * p)
-        wry = 0.10 * wave
+        wz = 0.04 * amp * wave
+        wrz = 0.15 * wave
     elif style == "HoverDance":
-        wz = 0.045 * wave2
-        wx = 0.055 * wave
-        wrx = 0.12 * wave2
-        wrz = 0.16 * wave
+        wz = 0.03 * wave2
+        wrx = 0.08 * wave2
     elif style == "JumpingIdle":
-        hop = 0.5 - 0.5 * math.cos(2.0 * p)
-        wz = 0.13 * hop
-        wsx = wsy = 1.0 + 0.045 * math.sin(2.0 * p + math.pi)
-        wsz = 1.0 - 0.075 * math.sin(2.0 * p + math.pi)
-        wrx = 0.08 * math.sin(p)
-    elif style == "Lean":
-        wrx = 0.22 * wave
-        wry = 0.08 * math.sin(p * 2.0 + phase)
-        wx = 0.025 * (1.0 - math.cos(p))
-    elif style == "Orbit":
-        wx = 0.105 * wave
-        wz = 0.0375 * (1.0 - math.cos(p))
-        wy = 0.035 * wave2
-        wrz = 0.18 * wave
+        wz = 0.05 * (0.5 - 0.5 * math.cos(2.0 * p))
+        wsx = wsy = 1.0 + 0.03 * math.sin(2.0 * p + math.pi)
+        wsz = 1.0 - 0.05 * math.sin(2.0 * p + math.pi)
     elif style == "PulsingIdle":
-        pulse = wave
-        wsx = wsy = 1.0 + 0.075 * pulse
-        wsz = 1.0 - 0.065 * pulse
-        wz = 0.018 * pulse
+        wsx = wsy = 1.0 + 0.05 * wave
+        wsz = 1.0 - 0.04 * wave
     elif style == "Rocking":
-        wrx = 0.19 * wave
-        wrz = 0.075 * wave2
-        wx = 0.025 * wave
-    elif style == "Shake":
-        wx = 0.035 * math.sin(3.0 * p + phase)
-        wrz = 0.12 * math.sin(3.0 * p + phase)
-        wry = 0.07 * wave2
-    elif style == "SideHop":
-        wx = 0.105 * wave
-        wz = 0.045 * (1.0 - math.cos(2.0 * p))
-        wrz = 0.12 * wave
-        wsx = 1.0 + 0.035 * math.sin(2.0 * p)
-        wsz = 1.0 - 0.045 * math.sin(2.0 * p)
-    elif style == "SpinningIdle":
-        wrz = 2.0 * wave + 0.28 * math.sin(2.0 * p)
-        wz = 0.025 * math.sin(2.0 * p)
-    elif style == "SpringBounce":
-        bounce = 0.5 - 0.5 * math.cos(2.0 * p)
-        wz = 0.12 * bounce
-        wsx = wsy = 1.0 - 0.045 * bounce
-        wsz = 1.0 + 0.085 * bounce
-        wrx = 0.045 * math.sin(2.0 * p)
+        wrx = 0.12 * wave
     elif style == "SquashStretchIdle":
-        pulse = wave
-        wsx = wsy = 1.0 + 0.09 * pulse
-        wsz = 1.0 - 0.12 * pulse
-        wz = 0.025 * pulse
-    elif style == "TiltingIdle":
-        wrx = 0.15 * wave
-        wry = 0.17 * wave12
-        wrz = 0.08 * math.sin(2.0 * p)
-    elif style == "Tumble":
-        wrx = 0.42 * wave
-        wrz = 0.55 * wave
-        wz = 0.055 * (1.0 - math.cos(p))
-    elif style == "Twist":
-        wrz = 0.42 * wave
-        wry = 0.16 * wave2
-        wrx = 0.08 * wave07
-    elif style == "WobbleIdle":
-        wrx = 0.16 * wave + 0.045 * math.sin(3.0 * p)
-        wry = 0.14 * wave15
-        wrz = 0.12 * wave2
-        wsx = 1.0 + 0.025 * math.sin(2.0 * p)
-        wsy = 1.0 - 0.025 * math.sin(2.0 * p)
+        wsx = wsy = 1.0 + 0.06 * wave
+        wsz = 1.0 - 0.08 * wave
+    else:
+        # Default subtle wobble for the rest
+        wrx = 0.08 * wave + 0.02 * math.sin(3.0 * p)
+        wry = 0.05 * wave15
 
     return world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity)
 
@@ -313,74 +255,65 @@ def _idle_pose_loop(style, t, variant, intensity=1.0):
     )
 
 # ---------------------------------------------------------------------------
-# Win animation profiles
+# Fine-Tuned Win animation profiles
 # ---------------------------------------------------------------------------
 
-def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
+def _win_pose(style_index, t, travel_y, intensity=1.0):
     spin_sign = -1.0 if style_index % 2 else 1.0
-    angle = 0.35 + (style_index % 5) * 0.13
-    side = math.sin(style_index * 1.37)
-    
-    lift = travel_z + (style_index % 4) * 0.025
+    angle = 0.08 + (style_index % 5) * 0.02  # Very subtle pitch
+    side = math.sin(style_index * 1.37) * 0.1 # Very subtle roll
 
     wx = wy = wz = 0.0
     wrx = wry = wrz = 0.0
     wsx = wsy = wsz = 1.0
 
-    if t <= 0.10:
+    if t <= 0.10: # Anticipation
         q = t / 0.10
-        wx = 0.0
-        # wy ని మైనస్ లో ఇస్తే వెనక్కి వంగుతుంది (Anticipation)
-        wy = -(travel_y * 0.12) * q 
-        wz = -0.025 * q
-        wrx = angle * 0.12 * q
-        wry = side * 0.08 * q
-        wrz = -spin_sign * 0.16 * q
-        wsx, wsy, wsz = (1.0 + 0.10*q, 1.0 + 0.04*q, 1.0 - 0.10*q)
+        wy = -(travel_y * 0.15) * q  # వెనక్కి లాగడం
+        wz = 0.0  # Translate Y 0.0 (ఎగరడం లేదు)
+        wrx = angle * 0.5 * q
+        wry = side * 0.5 * q
+        wrz = -spin_sign * 0.05 * q  # Rotate Y ని 90% తగ్గించాను
+        wsx, wsy, wsz = (1.0 + 0.02*q, 1.0 - 0.02*q, 1.0 + 0.02*q)
 
-    elif t <= 0.38:
+    elif t <= 0.38: # Forward Pop
         q = (t - 0.10) / 0.28
         ease = q*q*(3.0 - 2.0*q)
-        wx = side * travel_y * 0.10 * ease
-        # wy ని పాజిటివ్ (+) చేస్తే ముందుకు కెమెరా వైపు వస్తుంది
-        wy = travel_y * (0.95 * ease) 
-        wz = lift * math.sin(q * math.pi)
+        wy = travel_y * ease  # కెమెరా వైపు పంఛ్
+        wz = 0.0  
         wrx = angle * math.sin(q * math.pi)
-        wry = side * 0.18 * math.sin(q * math.pi)
-        wrz = spin_sign * (0.8 + 0.9*q)
-        wsx, wsy, wsz = (1.0 - 0.12*math.sin(q*math.pi), 1.0 - 0.06*math.sin(q*math.pi), 1.0 + 0.22*math.sin(q*math.pi))
+        wry = side * math.sin(q * math.pi)
+        wrz = spin_sign * 0.12 * q  # Max rotation is very subtle now
+        wsx, wsy, wsz = (1.0 - 0.05*math.sin(q*math.pi), 1.0 + 0.05*math.sin(q*math.pi), 1.0 - 0.02*math.sin(q*math.pi))
 
-    elif t <= 0.56:
+    elif t <= 0.56: # Squash Impact
         q = (t - 0.38) / 0.18
-        wx = side * travel_y * 0.10 * (1.0-q)
-        wy = travel_y * (0.95 + 0.16*math.sin(q*math.pi/2.0))
-        wz = lift * (1.0-q)
+        wy = travel_y * (1.0 + 0.08*math.sin(q*math.pi/2.0))
+        wz = 0.0
         wrx = angle * (1.0-q)
-        wry = side * 0.18 * (1.0-q)
-        wrz = spin_sign * (1.7 + 0.25*q)
-        wsx, wsy, wsz = (1.22 - 0.25*q, 1.08 - 0.08*q, 0.78 + 0.25*q)
+        wry = side * (1.0-q)
+        wrz = spin_sign * (0.12 + 0.03*q)
+        wsx, wsy, wsz = (1.05 - 0.05*q, 0.95 + 0.05*q, 1.02 - 0.02*q)
 
-    elif t <= 0.78:
+    elif t <= 0.78: # Rebound
         q = (t - 0.56) / 0.22
         bounce = math.sin(q * math.pi)
-        wx = 0.0
-        wy = travel_y * (1.11 - 0.11*q)
-        wz = lift * 0.55 * bounce
-        wrx = angle * 0.35 * bounce
-        wry = side * 0.10 * bounce
-        wrz = spin_sign * (1.95 - 0.35*q)
-        wsx, wsy, wsz = (1.0 + 0.08*bounce, 1.0 + 0.035*bounce, 1.0 - 0.07*bounce)
+        wy = travel_y * (1.08 - 0.08*q)
+        wz = 0.0
+        wrx = angle * 0.3 * bounce
+        wry = side * 0.3 * bounce
+        wrz = spin_sign * (0.15 - 0.08*q)
+        wsx, wsy, wsz = (1.0 + 0.02*bounce, 1.0 - 0.02*bounce, 1.0 + 0.01*bounce)
 
-    else:
+    else: # Settle back
         q = (t - 0.78) / 0.22
         decay = (1.0-q) ** 2
-        wx = 0.0
-        wy = travel_y * 0.12 * decay
-        wz = lift * 0.18 * math.sin(q*math.pi) * decay
-        wrx = angle * 0.22 * decay
-        wry = side * 0.06 * decay
-        wrz = spin_sign * 1.60 * decay
-        wsx, wsy, wsz = (1.0 + 0.035*decay, 1.0 + 0.02*decay, 1.0 - 0.035*decay)
+        wy = travel_y * decay
+        wz = 0.0
+        wrx = angle * 0.1 * decay
+        wry = side * 0.1 * decay
+        wrz = spin_sign * 0.07 * decay
+        wsx, wsy, wsz = (1.0 + 0.01*decay, 1.0 - 0.01*decay, 1.0 + 0.01*decay)
 
     return world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity)
 
@@ -399,7 +332,6 @@ def _idle_samples(style, variant, intensity):
     frames_count = IDLE_END - IDLE_START
     for frame in _idle_key_frames():
         if frame in (IDLE_START, IDLE_END):
-            # 1st and 45th frame will be EXACTLY identical (Rest pose)
             pose = _REST_POSE
         else:
             t = (frame - IDLE_START) / frames_count
@@ -407,19 +339,18 @@ def _idle_samples(style, variant, intensity):
         samples.append((frame, pose))
     return samples
 
-def _win_samples(style_index, travel_y, travel_z, intensity):
+def _win_samples(style_index, travel_y, intensity):
     samples = []
     for t in WIN_KEY_TIMES:
         frame = WIN_START + int(round(t * WIN_FRAMES_COUNT))
         if frame in (WIN_START, WIN_END):
-            # 46th and 106th frame will be EXACTLY identical (Rest pose)
             pose = _REST_POSE
         else:
-            pose = _win_pose(style_index, t, travel_y, travel_z, intensity)
+            pose = _win_pose(style_index, t, travel_y, intensity)
         samples.append((frame, pose))
     return samples
 
-def create_animations(rig, travel_y, travel_z, idle_intensity=1.0, win_intensity=1.0):
+def create_animations(rig, travel_y, idle_intensity=1.0, win_intensity=1.0):
     _validate_rig(rig)
 
     ad = rig.animation_data_create()
@@ -429,14 +360,13 @@ def create_animations(rig, travel_y, travel_z, idle_intensity=1.0, win_intensity
     created = 0
 
     try:
-        # సింగిల్ యాక్షన్‌లో Idle మరియు Win ని కలుపుతున్నాం 
         for style_index, style in enumerate(IDLE_STYLES):
             action = _new_action(rig, f"Anim_{style}")
             
-            # సాంపుల్స్ రెండింటిని కలుపుతున్నాం
             combined_samples = []
             combined_samples.extend(_idle_samples(style, style_index + 1, idle_intensity))
-            combined_samples.extend(_win_samples(style_index, travel_y, travel_z, win_intensity))
+            # travel_z తీసేసి కేవలం forward pop (travel_y) మాత్రమే పాస్ చేస్తున్నాను
+            combined_samples.extend(_win_samples(style_index, travel_y, win_intensity))
             
             _bake_curves(rig, action, combined_samples)
             _set_action_range(action, IDLE_START, WIN_END)
@@ -446,7 +376,7 @@ def create_animations(rig, travel_y, travel_z, idle_intensity=1.0, win_intensity
         ad.action = None
         _reset_root(pb)
 
-    return f"Created {created} Combined Actions (Idle+Win)!"
+    return f"Created {created} Fine-Tuned Actions (Idle+Win)!"
 
 # ---------------------------------------------------------------------------
 # Settings and operators
@@ -454,14 +384,9 @@ def create_animations(rig, travel_y, travel_z, idle_intensity=1.0, win_intensity
 
 class SlotSymbolSettings(PropertyGroup):
     win_travel_y: FloatProperty(
-        name="Towards Camera",
-        description="How far the object moves towards the camera during a win (+Z Local Axis)",
-        default=0.80, min=0.01, max=5.0, unit='LENGTH',
-    )
-    win_travel_z: FloatProperty(
-        name="Jump Height",
-        description="How high the object jumps during a win (+Y Local Axis)",
-        default=0.35, min=0.0, max=5.0, unit='LENGTH',
+        name="Forward Pop Distance",
+        description="How far the object pops towards the camera (Local Z Axis)",
+        default=0.25, min=0.01, max=5.0, unit='LENGTH',
     )
     idle_intensity: FloatProperty(
         name="Idle Intensity",
@@ -497,8 +422,8 @@ class SLOTSYMBOL_OT_create_symbol(Operator):
 
 class SLOTSYMBOL_OT_create_animations(Operator):
     bl_idname = "slotsymbol.create_animations"
-    bl_label = "Generate 16 Combined Actions"
-    bl_description = f"Generates merged actions with Idle ({IDLE_START}-{IDLE_END}) and Win ({WIN_START}-{WIN_END})"
+    bl_label = "Generate 16 Pro Actions"
+    bl_description = f"Generates merged pro-actions with Idle ({IDLE_START}-{IDLE_END}) and Win ({WIN_START}-{WIN_END})"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -508,7 +433,6 @@ class SLOTSYMBOL_OT_create_animations(Operator):
             settings.status = create_animations(
                 rig,
                 settings.win_travel_y,
-                settings.win_travel_z,
                 settings.idle_intensity,
                 settings.win_intensity
             )
@@ -551,8 +475,8 @@ class SLOTSYMBOL_PT_main(Panel):
         col = box.column(align=True)
         col.use_property_split = True
         col.use_property_decorate = False
+        # అనవసరమైన Jump Height తీసేసి కేవలం Forward ఆప్షన్ ఉంచాను
         col.prop(settings, "win_travel_y")
-        col.prop(settings, "win_travel_z")
 
         # ---- SETTINGS: INTENSITIES ----
         box = layout.box()
