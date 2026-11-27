@@ -1,7 +1,8 @@
+
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (2, 6, 0),
+    "version": (2, 6, 1),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Slot Symbol",
     "description": "Stylish UI with perfectly mapped forward translations and specific frame ranges",
@@ -23,16 +24,15 @@ RIG_NAME = "SymbolRig"
 MESH_NAME = "SymbolCube"
 ROOT_BONE = "Root"
 
-# Frame Ranges as requested
+# మీరు అడిగిన ఖచ్చితమైన ఫ్రేమ్ రేంజెస్
 IDLE_START = 1
 IDLE_END = 45
 WIN_START = 46
 WIN_END = 106
 
 IDLE_KEY_STEP = 2
-WIN_FRAMES_COUNT = WIN_END - WIN_START  # 60 frames
+WIN_FRAMES_COUNT = WIN_END - WIN_START  # 60 frames steps (46 to 106)
 
-# Normalized time landmarks for win poses
 WIN_KEY_TIMES = (0.0, 0.05, 0.10, 0.205, 0.38, 0.56, 0.66, 0.78, 0.90, 1.0)
 
 IDLE_STYLES = (
@@ -49,24 +49,15 @@ _REST_POSE = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
 # Axis Mapping (World to Vertical Bone Space)
 # ---------------------------------------------------------------------------
 def world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity=1.0):
-    """
-    Standard Vertical Bone (Head 0,0,0 to Tail 0,0,1):
-    - World X -> Local X
-    - World Y -> Local Z
-    - World Z -> Local Y
-    This strictly fixes the "moving sideways instead of forward" issue.
-    """
-    # Translation
+    # నిలువుగా ఉండే బోన్‌కు తగ్గట్టు పర్ఫెక్ట్ మ్యాపింగ్ (ముందుకు కెమెరా వైపు రావడానికి)
     lx = wx * intensity
-    ly = wz * intensity  # Up goes to Bone Y
-    lz = wy * intensity  # Forward goes to Bone Z
+    ly = wz * intensity  
+    lz = wy * intensity  
 
-    # Rotation
     lrx = wrx * intensity
     lry = wrz * intensity
     lrz = wry * intensity
 
-    # Scale
     lsx = 1.0 + (wsx - 1.0) * intensity
     lsy = 1.0 + (wsz - 1.0) * intensity
     lsz = 1.0 + (wsy - 1.0) * intensity
@@ -168,7 +159,7 @@ def create_symbol():
     try:
         bone = arm_data.edit_bones.new(ROOT_BONE)
         bone.head = (0.0, 0.0, 0.0)
-        bone.tail = (0.0, 0.0, 1.0) # Vertical standard bone
+        bone.tail = (0.0, 0.0, 1.0)
         bone.roll = 0.0
         bone.use_deform = True
     finally:
@@ -203,7 +194,7 @@ def create_symbol():
         camera_data.lens = 50
         camera = bpy.data.objects.new("VR_StaticCamera", camera_data)
         collection.objects.link(camera)
-        # Camera is placed at Y = -2.5 (Looking +Y direction)
+        # కెమెరా -Y యాక్సిస్ నుండి చూసేలా సెట్టింగ్
         camera.location = (0.0, -2.5, 0.45)
         camera.rotation_euler = (math.radians(82.0), 0.0, 0.0)
         scene.camera = camera
@@ -219,7 +210,7 @@ def create_symbol():
     return f"Created Rig & Cube successfully! [{_version_string()}]"
 
 # ---------------------------------------------------------------------------
-# Idle motion profiles (Pure World Space calculations)
+# Idle motion profiles 
 # ---------------------------------------------------------------------------
 
 def _idle_pose(style, t, variant, intensity=1.0):
@@ -326,7 +317,7 @@ def _idle_pose_loop(style, t, variant, intensity=1.0):
     )
 
 # ---------------------------------------------------------------------------
-# Win animation profiles (Pure World Space calculations)
+# Win animation profiles
 # ---------------------------------------------------------------------------
 
 def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
@@ -334,7 +325,6 @@ def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
     angle = 0.35 + (style_index % 5) * 0.13
     side = math.sin(style_index * 1.37)
     
-    # Base variations based on the style
     lift = travel_z + (style_index % 4) * 0.025
 
     wx = wy = wz = 0.0
@@ -344,7 +334,7 @@ def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
     if t <= 0.10:
         q = t / 0.10
         wx = 0.0
-        wy = (travel_y * 0.12) * q # Anticipation moves slightly away from camera (+Y)
+        wy = (travel_y * 0.12) * q 
         wz = -0.025 * q
         wrx = angle * 0.12 * q
         wry = side * 0.08 * q
@@ -355,7 +345,7 @@ def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
         q = (t - 0.10) / 0.28
         ease = q*q*(3.0 - 2.0*q)
         wx = side * travel_y * 0.10 * ease
-        wy = -travel_y * (0.95 * ease) # Moves towards Camera (-Y)
+        wy = -travel_y * (0.95 * ease) 
         wz = lift * math.sin(q * math.pi)
         wrx = angle * math.sin(q * math.pi)
         wry = side * 0.18 * math.sin(q * math.pi)
@@ -401,7 +391,6 @@ def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
 # ---------------------------------------------------------------------------
 
 def _idle_key_frames():
-    # 1 to 45
     frames = list(range(IDLE_START, IDLE_END + 1, max(1, IDLE_KEY_STEP)))
     if frames[-1] != IDLE_END:
         frames.append(IDLE_END)
@@ -412,6 +401,7 @@ def _idle_samples(style, variant, intensity):
     frames_count = IDLE_END - IDLE_START
     for frame in _idle_key_frames():
         if frame in (IDLE_START, IDLE_END):
+            # 1st and 45th frame will be EXACTLY identical (Rest pose)
             pose = _REST_POSE
         else:
             t = (frame - IDLE_START) / frames_count
@@ -424,6 +414,7 @@ def _win_samples(style_index, travel_y, travel_z, intensity):
     for t in WIN_KEY_TIMES:
         frame = WIN_START + int(round(t * WIN_FRAMES_COUNT))
         if frame in (WIN_START, WIN_END):
+            # 46th and 106th frame will be EXACTLY identical (Rest pose)
             pose = _REST_POSE
         else:
             pose = _win_pose(style_index, t, travel_y, travel_z, intensity)
@@ -544,7 +535,8 @@ class SLOTSYMBOL_PT_main(Panel):
         box = layout.box()
         row = box.row()
         row.alignment = 'CENTER'
-        row.label(text="SLOT SYMBOL GENERATOR", icon='DIAMOND_WIDGET')
+        # SAFE ICON 'ACTION' వాడాను
+        row.label(text="SLOT SYMBOL GENERATOR", icon='ACTION') 
 
         # ---- STEP 1: RIG ----
         col = layout.column(align=True)
@@ -555,7 +547,7 @@ class SLOTSYMBOL_PT_main(Panel):
 
         # ---- SETTINGS: MANUAL TRANSLATION ----
         box = layout.box()
-        box.label(text="Win Animation (Manual Axis)", icon='VIEW_PAN')
+        box.label(text="Win Animation (Manual Axis)", icon='OPTIONS')
         col = box.column(align=True)
         col.use_property_split = True
         col.use_property_decorate = False
@@ -564,7 +556,7 @@ class SLOTSYMBOL_PT_main(Panel):
 
         # ---- SETTINGS: INTENSITIES ----
         box = layout.box()
-        box.label(text="Global Intensities", icon='MOD_HUE_SATURATION')
+        box.label(text="Global Intensities", icon='MODIFIER')
         col = box.column(align=True)
         col.use_property_split = True
         col.use_property_decorate = False
@@ -618,3 +610,4 @@ if __name__ == "__main__":
     except Exception:
         pass
     register()
+
