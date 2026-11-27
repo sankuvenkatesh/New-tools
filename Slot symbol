@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (2, 2, 0),
+    "version": (2, 4, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Slot Symbol",
     "description": "Generate a horizontal single-bone cube rig with 16 looping idle and 16 win animations",
@@ -10,6 +10,7 @@ bl_info = {
 
 import bpy
 import math
+import traceback
 from bpy.props import FloatProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
@@ -23,6 +24,19 @@ MESH_NAME = "SymbolCube"
 ROOT_BONE = "Root"
 IDLE_FRAMES = 45
 WIN_FRAMES = 60
+
+# Idle loops get a key every IDLE_KEY_STEP frames (1, 3, 5 ... 45).
+# The idle waves contain 2nd/3rd/4th harmonics. Keying only frames 1/12/23/34/45
+# sampled them exactly at their zero crossings, so those channels came out flat.
+IDLE_KEY_STEP = 2
+
+# Win actions are keyed at the design moments of the motion (normalized time).
+# Poses are evaluated at these exact times, so a key that sits on a phase
+# boundary always receives the END pose of that phase instead of being pushed
+# into the next phase by frame rounding (this used to snap the spin at frame 7).
+# Resulting frames: 1, 4, 7, 13, 23, 34, 40, 47, 54, 60.
+WIN_KEY_TIMES = (0.0, 0.05, 0.10, 0.205, 0.38, 0.56, 0.66, 0.78, 0.90, 1.0)
+
 IDLE_STYLES = (
     "FloatingSpin",
     "HoverDance",
@@ -42,6 +56,9 @@ IDLE_STYLES = (
     "WobbleIdle",
 )
 
+_ROOT_PROPS = ("location", "rotation_euler", "scale")
+_REST_POSE = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+
 
 # ---------------------------------------------------------------------------
 # General helpers
@@ -58,7 +75,7 @@ def _get_rig():
 
 def _set_object_mode():
     obj = bpy.context.object
-    if obj and obj.mode != 'OBJECT':
+    if obj is not None and obj.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
 
 
@@ -69,66 +86,53 @@ def _reset_root(pb):
     pb.scale = (1.0, 1.0, 1.0)
 
 
-def _key_root(pb, frame, loc=(0.0, 0.0, 0.0),
-              rot=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.0)):
-    pb.rotation_mode = 'XYZ'
-    pb.location = loc
-    pb.rotation_euler = rot
-    pb.scale = scale
-    pb.keyframe_insert(data_path="location", frame=frame, group=ROOT_BONE)
-    pb.keyframe_insert(data_path="rotation_euler", frame=frame, group=ROOT_BONE)
-    pb.keyframe_insert(data_path="scale", frame=frame, group=ROOT_BONE)
-
-
-def _assign_action(rig, action):
-    ad = rig.animation_data_create()
-    ad.action = action
-    # Blender 4.4+ / 5.x slotted actions safe assignment
-    if hasattr(ad, "action_slot") and hasattr(action, "slots"):
-        if len(action.slots) > 0:
-            slot = action.slots[0]
-        else:
-            slot = action.slots.new(id_type='OBJECT', name=rig.name)
-        # Assign slot ONLY if action is currently active to prevent errors
-        if ad.action is not None:
-            ad.action_slot = slot
-
-
-def _iter_action_fcurves(action):
-    layers = getattr(action, "layers", None)
-    if layers is not None:
-        for layer in layers:
-            for strip in layer.strips:
-                for bag in getattr(strip, "channelbags", ()):
-                    for fc in bag.fcurves:
-                        yield fc
-        return
-    for fc in getattr(action, "fcurves", ()):
-        yield fc
-
-
-def _polish_action(action, cyclic=False):
-    for fc in _iter_action_fcurves(action):
-        for key in fc.keyframe_points:
-            key.interpolation = 'BEZIER'
-            key.handle_left_type = 'AUTO_CLAMPED'
-            key.handle_right_type = 'AUTO_CLAMPED'
-        if cyclic:
-            if not any(mod.type == 'CYCLES' for mod in fc.modifiers):
-                mod = fc.modifiers.new(type='CYCLES')
-                mod.mode_before = 'REPEAT'
-                mod.mode_after = 'REPEAT'
-        fc.update()
-
-
 def _new_action(rig, name):
+    """Create an empty action with a fake user and assign it to the rig.
+
+    Blender 5.x: every action is slotted/layered. The action must be assigned
+    BEFORE keying, because Action.fcurve_ensure_for_datablock() creates the
+    layer, keyframe strip and slot itself and hooks the slot up to the rig.
+    """
     old = bpy.data.actions.get(name)
     if old is not None:
         bpy.data.actions.remove(old, do_unlink=True)
     action = bpy.data.actions.new(name)
     action.use_fake_user = True
-    _assign_action(rig, action)
+    rig.animation_data_create().action = action
     return action
+
+
+def _set_action_range(action, last_frame, cyclic):
+    action.use_frame_range = True
+    action.frame_start = 1
+    action.frame_end = last_frame
+    action.use_cyclic = cyclic
+
+
+def _bake_curves(rig, action, samples, cyclic=False):
+    """Write F-Curves for the Root bone (loc/rot/scale) from (frame, pose) samples.
+
+    pose = (location, rotation_euler, scale), each a 3-tuple.
+    Uses the F-Curve API directly, so the result does not depend on the user's
+    keying preferences ("Only Insert Needed", visual keying, ...).
+    """
+    for prop_index, prop in enumerate(_ROOT_PROPS):
+        data_path = f'pose.bones["{ROOT_BONE}"].{prop}'
+        for axis in range(3):
+            fc = action.fcurve_ensure_for_datablock(
+                rig, data_path, index=axis, group_name=ROOT_BONE)
+            for frame, pose in samples:
+                fc.keyframe_points.insert(
+                    frame, pose[prop_index][axis], options={'FAST'})
+            for key in fc.keyframe_points:
+                key.interpolation = 'BEZIER'
+                key.handle_left_type = 'AUTO_CLAMPED'
+                key.handle_right_type = 'AUTO_CLAMPED'
+            if cyclic and not any(mod.type == 'CYCLES' for mod in fc.modifiers):
+                mod = fc.modifiers.new(type='CYCLES')
+                mod.mode_before = 'REPEAT'
+                mod.mode_after = 'REPEAT'
+            fc.update()
 
 
 def _validate_rig(rig):
@@ -152,31 +156,45 @@ def create_symbol():
     collection = context.collection
 
     arm_data = bpy.data.armatures.new("SymbolArmature")
-    arm_data.display_type = 'B_BONE' # Makes the horizontal bone display nicely
-    arm_data.show_axes = True        # Shows orientation axes
-    
+    arm_data.display_type = 'B_BONE'
+    arm_data.show_axes = True
+
     rig = bpy.data.objects.new(RIG_NAME, arm_data)
     collection.objects.link(rig)
 
-    # Build a strictly horizontal bone along world/local X.
     bpy.ops.object.select_all(action='DESELECT')
     rig.select_set(True)
     context.view_layer.objects.active = rig
     bpy.ops.object.mode_set(mode='EDIT')
-    bone = arm_data.edit_bones.new(ROOT_BONE)
-    bone.head = (-0.45, 0.0, 0.0)
-    bone.tail = (0.45, 0.0, 0.0)
-    bone.roll = 0.0 # Prevents twisting
-    bone.use_deform = True
-    bpy.ops.object.mode_set(mode='OBJECT')
+    try:
+        bone = arm_data.edit_bones.new(ROOT_BONE)
+        bone.head = (-0.45, 0.0, 0.0)
+        bone.tail = (0.45, 0.0, 0.0)
+        bone.roll = 0.0
+        bone.use_deform = True
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
 
-    # Beveled cube, centered on the Root bone.
     bpy.ops.mesh.primitive_cube_add(size=0.58, location=(0.0, 0.0, 0.0))
     mesh = context.object
     mesh.name = MESH_NAME
     mesh.data.name = "SymbolCubeMesh"
-    for polygon in mesh.data.polygons:
-        polygon.use_smooth = True
+    try:
+        for polygon in mesh.data.polygons:
+            polygon.use_smooth = True
+    except AttributeError:
+        bpy.ops.object.shade_smooth()
+
+    mesh.parent = rig
+    group = mesh.vertex_groups.new(name=ROOT_BONE)
+    if mesh.data.vertices:
+        group.add([v.index for v in mesh.data.vertices], 1.0, 'REPLACE')
+
+    # Deform first, shading modifiers after: the weighted normals are then
+    # computed on the posed/squashed cube instead of the rest-pose cube.
+    arm_mod = mesh.modifiers.new("Armature", 'ARMATURE')
+    arm_mod.object = rig
+    arm_mod.use_vertex_groups = True
 
     bevel = mesh.modifiers.new("Soft Rounded Edges", 'BEVEL')
     bevel.width = 0.055
@@ -186,16 +204,6 @@ def create_symbol():
     weighted = mesh.modifiers.new("Weighted Corner Normals", 'WEIGHTED_NORMAL')
     weighted.keep_sharp = True
 
-    # Parent and weight all vertices to the single Root bone.
-    mesh.parent = rig
-    group = mesh.vertex_groups.new(name=ROOT_BONE)
-    if mesh.data.vertices:
-        group.add([v.index for v in mesh.data.vertices], 1.0, 'REPLACE')
-    arm_mod = mesh.modifiers.new("Armature", 'ARMATURE')
-    arm_mod.object = rig
-    arm_mod.use_vertex_groups = True
-
-    # Keep an existing scene camera; create a static camera only if absent.
     if scene.camera is None:
         camera_data = bpy.data.cameras.new("VR_StaticCamera")
         camera_data.lens = 50
@@ -318,6 +326,22 @@ def _idle_pose(style, t, variant, intensity=1.0):
            (1.0 + (sx - 1.0) * intensity, 1.0 + (sy - 1.0) * intensity, 1.0 + (sz - 1.0) * intensity)
 
 
+def _idle_pose_loop(style, t, variant, intensity=1.0):
+    """Idle pose with the t=0 offset removed.
+
+    A few styles (Lean, Shake) are not exactly at rest at t=0. Subtracting that
+    offset makes frame 1 and the last frame sit exactly on the rest pose while
+    the curve stays continuous, so the loop has no pop at the seam.
+    """
+    loc, rot, sca = _idle_pose(style, t, variant, intensity)
+    loc0, rot0, sca0 = _idle_pose(style, 0.0, variant, intensity)
+    return (
+        tuple(a - b for a, b in zip(loc, loc0)),
+        tuple(a - b for a, b in zip(rot, rot0)),
+        tuple(a / b for a, b in zip(sca, sca0)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Win animation profiles
 # ---------------------------------------------------------------------------
@@ -366,51 +390,70 @@ def _win_pose(style_index, t, distance, intensity=1.0):
            (1.0 + (s[0] - 1.0) * intensity, 1.0 + (s[1] - 1.0) * intensity, 1.0 + (s[2] - 1.0) * intensity)
 
 
+# ---------------------------------------------------------------------------
+# Animation generation
+# ---------------------------------------------------------------------------
+
+def _idle_key_frames():
+    frames = list(range(1, IDLE_FRAMES + 1, max(1, IDLE_KEY_STEP)))
+    if frames[-1] != IDLE_FRAMES:
+        frames.append(IDLE_FRAMES)
+    return frames
+
+
+def _idle_samples(style, variant, intensity):
+    samples = []
+    for frame in _idle_key_frames():
+        if frame in (1, IDLE_FRAMES):
+            pose = _REST_POSE
+        else:
+            t = (frame - 1) / (IDLE_FRAMES - 1)
+            pose = _idle_pose_loop(style, t, variant, intensity)
+        samples.append((frame, pose))
+    return samples
+
+
+def _win_samples(style_index, distance, intensity):
+    samples = []
+    for t in WIN_KEY_TIMES:
+        frame = 1 + int(round(t * (WIN_FRAMES - 1)))
+        if frame in (1, WIN_FRAMES):
+            pose = _REST_POSE
+        else:
+            pose = _win_pose(style_index, t, distance, intensity)
+        samples.append((frame, pose))
+    return samples
+
+
 def create_animations(rig, forward_distance, idle_intensity=1.0, win_intensity=1.0):
     _validate_rig(rig)
     if forward_distance <= 0.0:
         raise ValueError("Forward distance must be greater than zero.")
 
     ad = rig.animation_data_create()
-    
-    # Safely clear the active action without touching the slot
-    # Blender 5.2 automatically unlinks the slot when action becomes None.
     ad.action = None
 
     pb = rig.pose.bones[ROOT_BONE]
-    created = []
-
-    for style_index, style in enumerate(IDLE_STYLES):
-        idle = _new_action(rig, f"Idle_{style}")
-        _reset_root(pb)
-        sample_frames = (1, 12, 23, 34, 45)
-        for frame in sample_frames:
-            t = (frame - 1) / (IDLE_FRAMES - 1)
-            loc, rot, scale = _idle_pose(style, t, style_index + 1, intensity=idle_intensity)
-            if frame in (1, IDLE_FRAMES):
-                loc, rot, scale = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
-            _key_root(pb, frame, loc, rot, scale)
-        _polish_action(idle, cyclic=True)
-        created.append(idle)
-
-        win = _new_action(rig, f"Win_{style}")
-        _reset_root(pb)
-        win_samples = (1, 4, 7, 13, 23, 34, 40, 47, 54, 60)
-        for frame in win_samples:
-            t = (frame - 1) / (WIN_FRAMES - 1)
-            loc, rot, scale = _win_pose(style_index, t, forward_distance, intensity=win_intensity)
-            if frame in (1, WIN_FRAMES):
-                loc, rot, scale = (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
-            _key_root(pb, frame, loc, rot, scale)
-        _polish_action(win, cyclic=False)
-        created.append(win)
-
     _reset_root(pb)
-    
-    # Safely clean up at the end (just setting action to None is enough)
-    ad.action = None
+    created = 0
 
-    return f"Created {len(IDLE_STYLES)} idle loops + {len(IDLE_STYLES)} win actions ({len(created)} total)."
+    try:
+        for style_index, style in enumerate(IDLE_STYLES):
+            idle = _new_action(rig, f"Idle_{style}")
+            _bake_curves(rig, idle, _idle_samples(style, style_index + 1, idle_intensity), cyclic=True)
+            _set_action_range(idle, IDLE_FRAMES, cyclic=True)
+            created += 1
+
+            win = _new_action(rig, f"Win_{style}")
+            _bake_curves(rig, win, _win_samples(style_index, forward_distance, win_intensity), cyclic=False)
+            _set_action_range(win, WIN_FRAMES, cyclic=False)
+            created += 1
+    finally:
+        # Leave the rig clean: no action assigned, Root back at rest.
+        ad.action = None
+        _reset_root(pb)
+
+    return f"Created {len(IDLE_STYLES)} idle loops + {len(IDLE_STYLES)} win actions ({created} total)."
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +489,8 @@ class SLOTSYMBOL_OT_create_symbol(Operator):
         settings = context.scene.slot_symbol_settings
         try:
             settings.status = create_symbol()
-        except (RuntimeError, ValueError, AttributeError, TypeError) as exc:
+        except Exception as exc:
+            traceback.print_exc()
             settings.status = f"ERROR: {exc}"
             self.report({'ERROR'}, settings.status)
             return {'CANCELLED'}
@@ -465,12 +509,13 @@ class SLOTSYMBOL_OT_create_animations(Operator):
         rig = _get_rig()
         try:
             settings.status = create_animations(
-                rig, 
+                rig,
                 settings.forward_distance,
                 settings.idle_intensity,
                 settings.win_intensity
             )
-        except (RuntimeError, ValueError, AttributeError, TypeError, KeyError) as exc:
+        except Exception as exc:
+            traceback.print_exc()
             settings.status = f"ERROR: {exc}"
             self.report({'ERROR'}, settings.status)
             return {'CANCELLED'}
@@ -501,7 +546,7 @@ class SLOTSYMBOL_PT_main(Panel):
         box.label(text="Animation Setup", icon='ANIM')
         box.label(text=f"Idle: 1–{IDLE_FRAMES} frames • seamless loop")
         box.label(text=f"Win: 1–{WIN_FRAMES} frames • one-shot")
-        
+
         col = box.column(align=True)
         col.prop(settings, "forward_distance")
         col.prop(settings, "idle_intensity")
@@ -547,4 +592,10 @@ def unregister():
 
 
 if __name__ == "__main__":
+    # Allows re-running the script from the Text Editor without a
+    # "class already registered" error.
+    try:
+        unregister()
+    except Exception:
+        pass
     register()
