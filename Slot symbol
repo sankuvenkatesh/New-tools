@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (2, 5, 0),
+    "version": (2, 6, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Slot Symbol",
-    "description": "Generate a standard vertical single-bone cube rig with 16 looping idle and 16 win animations",
+    "description": "Stylish UI with perfectly mapped forward translations and specific frame ranges",
     "category": "Animation",
 }
 
@@ -15,41 +15,63 @@ from bpy.props import FloatProperty, StringProperty
 from bpy.types import Operator, Panel, PropertyGroup
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration & Frame Ranges
 # ---------------------------------------------------------------------------
 
 FPS = 30
 RIG_NAME = "SymbolRig"
 MESH_NAME = "SymbolCube"
 ROOT_BONE = "Root"
-IDLE_FRAMES = 45
-WIN_FRAMES = 60
-IDLE_KEY_STEP = 2
 
+# Frame Ranges as requested
+IDLE_START = 1
+IDLE_END = 45
+WIN_START = 46
+WIN_END = 106
+
+IDLE_KEY_STEP = 2
+WIN_FRAMES_COUNT = WIN_END - WIN_START  # 60 frames
+
+# Normalized time landmarks for win poses
 WIN_KEY_TIMES = (0.0, 0.05, 0.10, 0.205, 0.38, 0.56, 0.66, 0.78, 0.90, 1.0)
 
 IDLE_STYLES = (
-    "FloatingSpin",
-    "HoverDance",
-    "JumpingIdle",
-    "Lean",
-    "Orbit",
-    "PulsingIdle",
-    "Rocking",
-    "Shake",
-    "SideHop",
-    "SpinningIdle",
-    "SpringBounce",
-    "SquashStretchIdle",
-    "TiltingIdle",
-    "Tumble",
-    "Twist",
-    "WobbleIdle",
+    "FloatingSpin", "HoverDance", "JumpingIdle", "Lean",
+    "Orbit", "PulsingIdle", "Rocking", "Shake",
+    "SideHop", "SpinningIdle", "SpringBounce", "SquashStretchIdle",
+    "TiltingIdle", "Tumble", "Twist", "WobbleIdle"
 )
 
 _ROOT_PROPS = ("location", "rotation_euler", "scale")
 _REST_POSE = ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
 
+# ---------------------------------------------------------------------------
+# Axis Mapping (World to Vertical Bone Space)
+# ---------------------------------------------------------------------------
+def world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity=1.0):
+    """
+    Standard Vertical Bone (Head 0,0,0 to Tail 0,0,1):
+    - World X -> Local X
+    - World Y -> Local Z
+    - World Z -> Local Y
+    This strictly fixes the "moving sideways instead of forward" issue.
+    """
+    # Translation
+    lx = wx * intensity
+    ly = wz * intensity  # Up goes to Bone Y
+    lz = wy * intensity  # Forward goes to Bone Z
+
+    # Rotation
+    lrx = wrx * intensity
+    lry = wrz * intensity
+    lrz = wry * intensity
+
+    # Scale
+    lsx = 1.0 + (wsx - 1.0) * intensity
+    lsy = 1.0 + (wsz - 1.0) * intensity
+    lsz = 1.0 + (wsy - 1.0) * intensity
+
+    return (lx, ly, lz), (lrx, lry, lrz), (lsx, lsy, lsz)
 
 # ---------------------------------------------------------------------------
 # General helpers
@@ -59,23 +81,19 @@ def _version_string():
     v = bpy.app.version
     return f"{v[0]}.{v[1]}.{v[2]}"
 
-
 def _get_rig():
     return bpy.data.objects.get(RIG_NAME)
-
 
 def _set_object_mode():
     obj = bpy.context.object
     if obj is not None and obj.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
 
-
 def _reset_root(pb):
     pb.rotation_mode = 'XYZ'
     pb.location = (0.0, 0.0, 0.0)
     pb.rotation_euler = (0.0, 0.0, 0.0)
     pb.scale = (1.0, 1.0, 1.0)
-
 
 def _new_action(rig, name):
     old = bpy.data.actions.get(name)
@@ -86,13 +104,11 @@ def _new_action(rig, name):
     rig.animation_data_create().action = action
     return action
 
-
-def _set_action_range(action, last_frame):
+def _set_action_range(action, start_frame, end_frame):
     if hasattr(action, "use_frame_range"):
         action.use_frame_range = True
-        action.frame_start = 1
-        action.frame_end = last_frame
-
+        action.frame_start = start_frame
+        action.frame_end = end_frame
 
 def _bake_curves(rig, action, samples, cyclic=False):
     for prop_index, prop in enumerate(_ROOT_PROPS):
@@ -119,13 +135,11 @@ def _bake_curves(rig, action, samples, cyclic=False):
                 mod.mode_after = 'REPEAT'
             fc.update()
 
-
 def _validate_rig(rig):
     if rig is None or rig.type != 'ARMATURE':
         raise RuntimeError("Create the Symbol Cube rig first.")
     if ROOT_BONE not in rig.pose.bones:
         raise RuntimeError("The rig does not contain the required Root bone.")
-
 
 # ---------------------------------------------------------------------------
 # Create Vertical Root rig + beveled cube
@@ -141,7 +155,7 @@ def create_symbol():
     collection = context.collection
 
     arm_data = bpy.data.armatures.new("SymbolArmature")
-    arm_data.display_type = 'OCTAHEDRAL' # Standard Blender bone display
+    arm_data.display_type = 'OCTAHEDRAL'
     arm_data.show_axes = True
 
     rig = bpy.data.objects.new(RIG_NAME, arm_data)
@@ -153,9 +167,8 @@ def create_symbol():
     bpy.ops.object.mode_set(mode='EDIT')
     try:
         bone = arm_data.edit_bones.new(ROOT_BONE)
-        # Standard Single Bone configuration (vertical Z-up)
         bone.head = (0.0, 0.0, 0.0)
-        bone.tail = (0.0, 0.0, 1.0)
+        bone.tail = (0.0, 0.0, 1.0) # Vertical standard bone
         bone.roll = 0.0
         bone.use_deform = True
     finally:
@@ -190,24 +203,23 @@ def create_symbol():
         camera_data.lens = 50
         camera = bpy.data.objects.new("VR_StaticCamera", camera_data)
         collection.objects.link(camera)
+        # Camera is placed at Y = -2.5 (Looking +Y direction)
         camera.location = (0.0, -2.5, 0.45)
         camera.rotation_euler = (math.radians(82.0), 0.0, 0.0)
         scene.camera = camera
 
     scene.render.fps = FPS
-    scene.render.fps_base = 1.0
-    scene.frame_start = 1
-    scene.frame_end = WIN_FRAMES
+    scene.frame_start = IDLE_START
+    scene.frame_end = WIN_END
 
     bpy.ops.object.select_all(action='DESELECT')
     rig.select_set(True)
     context.view_layer.objects.active = rig
     scene.frame_set(1)
-    return f"Created vertical Root rig + beveled cube [{_version_string()}]"
-
+    return f"Created Rig & Cube successfully! [{_version_string()}]"
 
 # ---------------------------------------------------------------------------
-# Idle motion profiles
+# Idle motion profiles (Pure World Space calculations)
 # ---------------------------------------------------------------------------
 
 def _idle_pose(style, t, variant, intensity=1.0):
@@ -221,92 +233,88 @@ def _idle_pose(style, t, variant, intensity=1.0):
     wave07 = math.sin(p) * math.cos(phase + 0.7) + 0.5 * math.sin(2.0*p) * math.sin(phase + 0.7)
     amp = 0.85 + 0.15 * math.sin(variant * 1.71)
 
-    x = y = z = 0.0
-    rx = ry = rz = 0.0
-    sx = sy = sz = 1.0
+    wx = wy = wz = 0.0
+    wrx = wry = wrz = 0.0
+    wsx = wsy = wsz = 1.0
 
     if style == "FloatingSpin":
-        z = 0.075 * amp * wave
-        x = 0.025 * amp * math.sin(p * 0.5 + phase) * (1.0 - math.cos(p))
-        rz = 0.28 * wave + 0.18 * math.sin(2.0 * p)
-        ry = 0.10 * wave
+        wz = 0.075 * amp * wave
+        wx = 0.025 * amp * math.sin(p * 0.5 + phase) * (1.0 - math.cos(p))
+        wrz = 0.28 * wave + 0.18 * math.sin(2.0 * p)
+        wry = 0.10 * wave
     elif style == "HoverDance":
-        z = 0.045 * wave2
-        x = 0.055 * wave
-        rx = 0.12 * wave2
-        rz = 0.16 * wave
+        wz = 0.045 * wave2
+        wx = 0.055 * wave
+        wrx = 0.12 * wave2
+        wrz = 0.16 * wave
     elif style == "JumpingIdle":
         hop = 0.5 - 0.5 * math.cos(2.0 * p)
-        z = 0.13 * hop
-        sx = sy = 1.0 + 0.045 * math.sin(2.0 * p + math.pi)
-        sz = 1.0 - 0.075 * math.sin(2.0 * p + math.pi)
-        rx = 0.08 * math.sin(p)
+        wz = 0.13 * hop
+        wsx = wsy = 1.0 + 0.045 * math.sin(2.0 * p + math.pi)
+        wsz = 1.0 - 0.075 * math.sin(2.0 * p + math.pi)
+        wrx = 0.08 * math.sin(p)
     elif style == "Lean":
-        rx = 0.22 * wave
-        ry = 0.08 * math.sin(p * 2.0 + phase)
-        x = 0.025 * (1.0 - math.cos(p))
+        wrx = 0.22 * wave
+        wry = 0.08 * math.sin(p * 2.0 + phase)
+        wx = 0.025 * (1.0 - math.cos(p))
     elif style == "Orbit":
-        x = 0.105 * wave
-        z = 0.0375 * (1.0 - math.cos(p))
-        y = 0.035 * wave2
-        rz = 0.18 * wave
+        wx = 0.105 * wave
+        wz = 0.0375 * (1.0 - math.cos(p))
+        wy = 0.035 * wave2
+        wrz = 0.18 * wave
     elif style == "PulsingIdle":
         pulse = wave
-        sx = sy = 1.0 + 0.075 * pulse
-        sz = 1.0 - 0.065 * pulse
-        z = 0.018 * pulse
+        wsx = wsy = 1.0 + 0.075 * pulse
+        wsz = 1.0 - 0.065 * pulse
+        wz = 0.018 * pulse
     elif style == "Rocking":
-        rx = 0.19 * wave
-        rz = 0.075 * wave2
-        x = 0.025 * wave
+        wrx = 0.19 * wave
+        wrz = 0.075 * wave2
+        wx = 0.025 * wave
     elif style == "Shake":
-        x = 0.035 * math.sin(3.0 * p + phase)
-        rz = 0.12 * math.sin(3.0 * p + phase)
-        ry = 0.07 * wave2
+        wx = 0.035 * math.sin(3.0 * p + phase)
+        wrz = 0.12 * math.sin(3.0 * p + phase)
+        wry = 0.07 * wave2
     elif style == "SideHop":
-        x = 0.105 * wave
-        z = 0.045 * (1.0 - math.cos(2.0 * p))
-        rz = 0.12 * wave
-        sx = 1.0 + 0.035 * math.sin(2.0 * p)
-        sz = 1.0 - 0.045 * math.sin(2.0 * p)
+        wx = 0.105 * wave
+        wz = 0.045 * (1.0 - math.cos(2.0 * p))
+        wrz = 0.12 * wave
+        wsx = 1.0 + 0.035 * math.sin(2.0 * p)
+        wsz = 1.0 - 0.045 * math.sin(2.0 * p)
     elif style == "SpinningIdle":
-        rz = 2.0 * wave + 0.28 * math.sin(2.0 * p)
-        z = 0.025 * math.sin(2.0 * p)
+        wrz = 2.0 * wave + 0.28 * math.sin(2.0 * p)
+        wz = 0.025 * math.sin(2.0 * p)
     elif style == "SpringBounce":
         bounce = 0.5 - 0.5 * math.cos(2.0 * p)
-        z = 0.12 * bounce
-        sx = sy = 1.0 - 0.045 * bounce
-        sz = 1.0 + 0.085 * bounce
-        rx = 0.045 * math.sin(2.0 * p)
+        wz = 0.12 * bounce
+        wsx = wsy = 1.0 - 0.045 * bounce
+        wsz = 1.0 + 0.085 * bounce
+        wrx = 0.045 * math.sin(2.0 * p)
     elif style == "SquashStretchIdle":
         pulse = wave
-        sx = sy = 1.0 + 0.09 * pulse
-        sz = 1.0 - 0.12 * pulse
-        z = 0.025 * pulse
+        wsx = wsy = 1.0 + 0.09 * pulse
+        wsz = 1.0 - 0.12 * pulse
+        wz = 0.025 * pulse
     elif style == "TiltingIdle":
-        rx = 0.15 * wave
-        ry = 0.17 * wave12
-        rz = 0.08 * math.sin(2.0 * p)
+        wrx = 0.15 * wave
+        wry = 0.17 * wave12
+        wrz = 0.08 * math.sin(2.0 * p)
     elif style == "Tumble":
-        rx = 0.42 * wave
-        rz = 0.55 * wave
-        z = 0.055 * (1.0 - math.cos(p))
+        wrx = 0.42 * wave
+        wrz = 0.55 * wave
+        wz = 0.055 * (1.0 - math.cos(p))
     elif style == "Twist":
-        rz = 0.42 * wave
-        ry = 0.16 * wave2
-        rx = 0.08 * wave07
+        wrz = 0.42 * wave
+        wry = 0.16 * wave2
+        wrx = 0.08 * wave07
     elif style == "WobbleIdle":
-        rx = 0.16 * wave + 0.045 * math.sin(3.0 * p)
-        ry = 0.14 * wave15
-        rz = 0.12 * wave2
-        sx = 1.0 + 0.025 * math.sin(2.0 * p)
-        sy = 1.0 - 0.025 * math.sin(2.0 * p)
+        wrx = 0.16 * wave + 0.045 * math.sin(3.0 * p)
+        wry = 0.14 * wave15
+        wrz = 0.12 * wave2
+        wsx = 1.0 + 0.025 * math.sin(2.0 * p)
+        wsy = 1.0 - 0.025 * math.sin(2.0 * p)
 
-    # Automatically mapped to maintain exact visual logic on the new Vertical Bone
-    return (y * intensity, z * intensity, x * intensity), \
-           (ry * intensity, rz * intensity, rx * intensity), \
-           (1.0 + (sy - 1.0) * intensity, 1.0 + (sz - 1.0) * intensity, 1.0 + (sx - 1.0) * intensity)
-
+    return world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity)
 
 def _idle_pose_loop(style, t, variant, intensity=1.0):
     loc, rot, sca = _idle_pose(style, t, variant, intensity)
@@ -317,99 +325,116 @@ def _idle_pose_loop(style, t, variant, intensity=1.0):
         tuple(a / b for a, b in zip(sca, sca0)),
     )
 
-
 # ---------------------------------------------------------------------------
-# Win animation profiles
+# Win animation profiles (Pure World Space calculations)
 # ---------------------------------------------------------------------------
 
-def _win_pose(style_index, t, distance, intensity=1.0):
+def _win_pose(style_index, t, travel_y, travel_z, intensity=1.0):
     spin_sign = -1.0 if style_index % 2 else 1.0
     angle = 0.35 + (style_index % 5) * 0.13
     side = math.sin(style_index * 1.37)
-    lift = 0.10 + (style_index % 4) * 0.025
+    
+    # Base variations based on the style
+    lift = travel_z + (style_index % 4) * 0.025
+
+    wx = wy = wz = 0.0
+    wrx = wry = wrz = 0.0
+    wsx = wsy = wsz = 1.0
 
     if t <= 0.10:
         q = t / 0.10
-        l = (0.0, -distance * 0.12 * q, -0.025 * q)
-        r = (angle * 0.12 * q, side * 0.08 * q, -spin_sign * 0.16 * q)
-        s = (1.0 + 0.10*q, 1.0 + 0.04*q, 1.0 - 0.10*q)
+        wx = 0.0
+        wy = (travel_y * 0.12) * q # Anticipation moves slightly away from camera (+Y)
+        wz = -0.025 * q
+        wrx = angle * 0.12 * q
+        wry = side * 0.08 * q
+        wrz = -spin_sign * 0.16 * q
+        wsx, wsy, wsz = (1.0 + 0.10*q, 1.0 + 0.04*q, 1.0 - 0.10*q)
 
     elif t <= 0.38:
         q = (t - 0.10) / 0.28
         ease = q*q*(3.0 - 2.0*q)
-        l = (side * distance * 0.10 * ease, distance * (0.95 * ease), lift * math.sin(q * math.pi))
-        r = (angle * math.sin(q * math.pi), side * 0.18 * math.sin(q * math.pi), spin_sign * (0.8 + 0.9*q))
-        s = (1.0 - 0.12*math.sin(q*math.pi), 1.0 - 0.06*math.sin(q*math.pi), 1.0 + 0.22*math.sin(q*math.pi))
+        wx = side * travel_y * 0.10 * ease
+        wy = -travel_y * (0.95 * ease) # Moves towards Camera (-Y)
+        wz = lift * math.sin(q * math.pi)
+        wrx = angle * math.sin(q * math.pi)
+        wry = side * 0.18 * math.sin(q * math.pi)
+        wrz = spin_sign * (0.8 + 0.9*q)
+        wsx, wsy, wsz = (1.0 - 0.12*math.sin(q*math.pi), 1.0 - 0.06*math.sin(q*math.pi), 1.0 + 0.22*math.sin(q*math.pi))
 
     elif t <= 0.56:
         q = (t - 0.38) / 0.18
-        l = (side * distance * 0.10 * (1.0-q), distance * (0.95 + 0.16*math.sin(q*math.pi/2.0)), lift * (1.0-q))
-        r = (angle * (1.0-q), side * 0.18 * (1.0-q), spin_sign * (1.7 + 0.25*q))
-        s = (1.22 - 0.25*q, 1.08 - 0.08*q, 0.78 + 0.25*q)
+        wx = side * travel_y * 0.10 * (1.0-q)
+        wy = -travel_y * (0.95 + 0.16*math.sin(q*math.pi/2.0))
+        wz = lift * (1.0-q)
+        wrx = angle * (1.0-q)
+        wry = side * 0.18 * (1.0-q)
+        wrz = spin_sign * (1.7 + 0.25*q)
+        wsx, wsy, wsz = (1.22 - 0.25*q, 1.08 - 0.08*q, 0.78 + 0.25*q)
 
     elif t <= 0.78:
         q = (t - 0.56) / 0.22
         bounce = math.sin(q * math.pi)
-        l = (0.0, distance * (1.11 - 0.11*q), lift * 0.55 * bounce)
-        r = (angle * 0.35 * bounce, side * 0.10 * bounce, spin_sign * (1.95 - 0.35*q))
-        s = (1.0 + 0.08*bounce, 1.0 + 0.035*bounce, 1.0 - 0.07*bounce)
+        wx = 0.0
+        wy = -travel_y * (1.11 - 0.11*q)
+        wz = lift * 0.55 * bounce
+        wrx = angle * 0.35 * bounce
+        wry = side * 0.10 * bounce
+        wrz = spin_sign * (1.95 - 0.35*q)
+        wsx, wsy, wsz = (1.0 + 0.08*bounce, 1.0 + 0.035*bounce, 1.0 - 0.07*bounce)
 
     else:
         q = (t - 0.78) / 0.22
         decay = (1.0-q) ** 2
-        l = (0.0, distance * 0.12 * decay, lift * 0.18 * math.sin(q*math.pi) * decay)
-        r = (angle * 0.22 * decay, side * 0.06 * decay, spin_sign * 1.60 * decay)
-        s = (1.0 + 0.035*decay, 1.0 + 0.02*decay, 1.0 - 0.035*decay)
+        wx = 0.0
+        wy = -travel_y * 0.12 * decay
+        wz = lift * 0.18 * math.sin(q*math.pi) * decay
+        wrx = angle * 0.22 * decay
+        wry = side * 0.06 * decay
+        wrz = spin_sign * 1.60 * decay
+        wsx, wsy, wsz = (1.0 + 0.035*decay, 1.0 + 0.02*decay, 1.0 - 0.035*decay)
 
-    # Automatically mapped to maintain exact visual logic on the new Vertical Bone
-    return (l[1], l[2] * intensity, l[0] * intensity), \
-           (r[1] * intensity, r[2] * intensity, r[0] * intensity), \
-           (1.0 + (s[1] - 1.0) * intensity, 1.0 + (s[2] - 1.0) * intensity, 1.0 + (s[0] - 1.0) * intensity)
-
+    return world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity)
 
 # ---------------------------------------------------------------------------
 # Animation generation
 # ---------------------------------------------------------------------------
 
 def _idle_key_frames():
-    frames = list(range(1, IDLE_FRAMES + 1, max(1, IDLE_KEY_STEP)))
-    if frames[-1] != IDLE_FRAMES:
-        frames.append(IDLE_FRAMES)
+    # 1 to 45
+    frames = list(range(IDLE_START, IDLE_END + 1, max(1, IDLE_KEY_STEP)))
+    if frames[-1] != IDLE_END:
+        frames.append(IDLE_END)
     return frames
-
 
 def _idle_samples(style, variant, intensity):
     samples = []
+    frames_count = IDLE_END - IDLE_START
     for frame in _idle_key_frames():
-        if frame in (1, IDLE_FRAMES):
+        if frame in (IDLE_START, IDLE_END):
             pose = _REST_POSE
         else:
-            t = (frame - 1) / (IDLE_FRAMES - 1)
+            t = (frame - IDLE_START) / frames_count
             pose = _idle_pose_loop(style, t, variant, intensity)
         samples.append((frame, pose))
     return samples
 
-
-def _win_samples(style_index, distance, intensity):
+def _win_samples(style_index, travel_y, travel_z, intensity):
     samples = []
     for t in WIN_KEY_TIMES:
-        frame = 1 + int(round(t * (WIN_FRAMES - 1)))
-        if frame in (1, WIN_FRAMES):
+        frame = WIN_START + int(round(t * WIN_FRAMES_COUNT))
+        if frame in (WIN_START, WIN_END):
             pose = _REST_POSE
         else:
-            pose = _win_pose(style_index, t, distance, intensity)
+            pose = _win_pose(style_index, t, travel_y, travel_z, intensity)
         samples.append((frame, pose))
     return samples
 
-
-def create_animations(rig, forward_distance, idle_intensity=1.0, win_intensity=1.0):
+def create_animations(rig, travel_y, travel_z, idle_intensity=1.0, win_intensity=1.0):
     _validate_rig(rig)
-    if forward_distance <= 0.0:
-        raise ValueError("Forward distance must be greater than zero.")
 
     ad = rig.animation_data_create()
     ad.action = None
-
     pb = rig.pose.bones[ROOT_BONE]
     _reset_root(pb)
     created = 0
@@ -418,29 +443,33 @@ def create_animations(rig, forward_distance, idle_intensity=1.0, win_intensity=1
         for style_index, style in enumerate(IDLE_STYLES):
             idle = _new_action(rig, f"Idle_{style}")
             _bake_curves(rig, idle, _idle_samples(style, style_index + 1, idle_intensity), cyclic=True)
-            _set_action_range(idle, IDLE_FRAMES)
+            _set_action_range(idle, IDLE_START, IDLE_END)
             created += 1
 
             win = _new_action(rig, f"Win_{style}")
-            _bake_curves(rig, win, _win_samples(style_index, forward_distance, win_intensity), cyclic=False)
-            _set_action_range(win, WIN_FRAMES)
+            _bake_curves(rig, win, _win_samples(style_index, travel_y, travel_z, win_intensity), cyclic=False)
+            _set_action_range(win, WIN_START, WIN_END)
             created += 1
     finally:
         ad.action = None
         _reset_root(pb)
 
-    return f"Created {len(IDLE_STYLES)} idle loops + {len(IDLE_STYLES)} win actions ({created} total)."
-
+    return f"Created {len(IDLE_STYLES)} idle & {len(IDLE_STYLES)} win actions!"
 
 # ---------------------------------------------------------------------------
 # Settings and operators
 # ---------------------------------------------------------------------------
 
 class SlotSymbolSettings(PropertyGroup):
-    forward_distance: FloatProperty(
-        name="Win Forward Distance",
-        description="Forward travel distance used by the win actions",
-        default=0.40, min=0.01, max=3.0, unit='LENGTH',
+    win_travel_y: FloatProperty(
+        name="Towards Camera",
+        description="How far the object moves towards the camera during a win (-Y World Axis)",
+        default=0.80, min=0.01, max=5.0, unit='LENGTH',
+    )
+    win_travel_z: FloatProperty(
+        name="Jump Height",
+        description="How high the object jumps during a win (+Z World Axis)",
+        default=0.35, min=0.0, max=5.0, unit='LENGTH',
     )
     idle_intensity: FloatProperty(
         name="Idle Intensity",
@@ -477,7 +506,7 @@ class SLOTSYMBOL_OT_create_symbol(Operator):
 class SLOTSYMBOL_OT_create_animations(Operator):
     bl_idname = "slotsymbol.create_animations"
     bl_label = "Generate 32 Animations"
-    bl_description = "Generate 16 seamless 45-frame idle loops and 16 distinct 60-frame win actions"
+    bl_description = f"Generates Idle loops ({IDLE_START}-{IDLE_END}) and Win actions ({WIN_START}-{WIN_END})"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -486,7 +515,8 @@ class SLOTSYMBOL_OT_create_animations(Operator):
         try:
             settings.status = create_animations(
                 rig,
-                settings.forward_distance,
+                settings.win_travel_y,
+                settings.win_travel_z,
                 settings.idle_intensity,
                 settings.win_intensity
             )
@@ -510,39 +540,57 @@ class SLOTSYMBOL_PT_main(Panel):
         layout = self.layout
         settings = context.scene.slot_symbol_settings
 
-        header = layout.box()
-        header.label(text="Standard Vertical Root • Beveled Cube", icon='ARMATURE_DATA')
-
-        col = layout.column(align=True)
-        col.scale_y = 1.35
-        col.operator("slotsymbol.create_symbol", icon='MESH_CUBE')
-        col.operator("slotsymbol.create_animations", icon='ACTION')
-
+        # ---- HEADER ----
         box = layout.box()
-        box.label(text="Animation Setup", icon='ANIM')
-        box.label(text=f"Idle: 1–{IDLE_FRAMES} frames • seamless loop")
-        box.label(text=f"Win: 1–{WIN_FRAMES} frames • one-shot")
+        row = box.row()
+        row.alignment = 'CENTER'
+        row.label(text="SLOT SYMBOL GENERATOR", icon='DIAMOND_WIDGET')
 
+        # ---- STEP 1: RIG ----
+        col = layout.column(align=True)
+        col.scale_y = 1.3
+        col.operator("slotsymbol.create_symbol", text="1. Create Rig & Cube", icon='ARMATURE_DATA')
+
+        layout.separator()
+
+        # ---- SETTINGS: MANUAL TRANSLATION ----
+        box = layout.box()
+        box.label(text="Win Animation (Manual Axis)", icon='VIEW_PAN')
         col = box.column(align=True)
-        col.prop(settings, "forward_distance")
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(settings, "win_travel_y")
+        col.prop(settings, "win_travel_z")
+
+        # ---- SETTINGS: INTENSITIES ----
+        box = layout.box()
+        box.label(text="Global Intensities", icon='MOD_HUE_SATURATION')
+        col = box.column(align=True)
+        col.use_property_split = True
+        col.use_property_decorate = False
         col.prop(settings, "idle_intensity")
         col.prop(settings, "win_intensity")
 
+        # ---- FRAME RANGES INFO ----
         box = layout.box()
-        box.label(text="Idle Variations", icon='IPO_BEZIER')
-        for style in IDLE_STYLES:
-            box.label(text=f"Idle_{style}")
-        box = layout.box()
-        box.label(text="Win Variations", icon='ACTION')
-        for style in IDLE_STYLES:
-            box.label(text=f"Win_{style}")
+        box.label(text="Action Frame Ranges", icon='TIME')
+        col = box.column(align=True)
+        col.label(text=f"• Idle Loop: {IDLE_START} to {IDLE_END}")
+        col.label(text=f"• Win Action: {WIN_START} to {WIN_END}")
 
-        info = layout.box()
-        info.label(text=f"Blender {_version_string()}")
-        info.label(text="Single vertical Root bone • FPS 30")
-        info.label(text=f"Status: {settings.status}",
-                   icon='ERROR' if settings.status.startswith("ERROR") else 'CHECKMARK')
+        layout.separator()
 
+        # ---- STEP 2: GENERATE ----
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        col.operator("slotsymbol.create_animations", text="2. Generate Animations", icon='PLAY')
+
+        # ---- STATUS FEEDBACK ----
+        if settings.status != "Ready":
+            layout.separator()
+            row = layout.row()
+            row.alert = settings.status.startswith("ERROR")
+            row.label(text=settings.status, icon='ERROR' if row.alert else 'CHECKMARK')
 
 _CLASSES = (
     SlotSymbolSettings,
@@ -551,7 +599,6 @@ _CLASSES = (
     SLOTSYMBOL_PT_main,
 )
 
-
 def register():
     for cls in _CLASSES:
         bpy.utils.register_class(cls)
@@ -559,13 +606,11 @@ def register():
         type=SlotSymbolSettings
     )
 
-
 def unregister():
     if hasattr(bpy.types.Scene, "slot_symbol_settings"):
         del bpy.types.Scene.slot_symbol_settings
     for cls in reversed(_CLASSES):
         bpy.utils.unregister_class(cls)
-
 
 if __name__ == "__main__":
     try:
