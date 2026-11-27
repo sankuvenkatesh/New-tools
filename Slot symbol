@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (2, 9, 0),
+    "version": (3, 0, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > Slot Symbol",
-    "description": "16 Unique Idles + Juicy Win Impacts (Proper Squash/Stretch & Hop)",
+    "description": "16 Unique Idles + 16 COMPLETELY UNIQUE Win Impacts",
     "category": "Animation",
 }
 
@@ -202,7 +202,7 @@ def create_symbol():
     return f"Created Rig & Cube successfully! [{_version_string()}]"
 
 # ---------------------------------------------------------------------------
-# Idle motion profiles (Fixed: 16 Unique branches with proper amplitudes)
+# Idle motion profiles 
 # ---------------------------------------------------------------------------
 
 def _idle_pose(style, t, variant, intensity=1.0):
@@ -222,87 +222,72 @@ def _idle_pose(style, t, variant, intensity=1.0):
     if style == "FloatingSpin":
         wz = 0.15 * wave
         wx = 0.05 * math.sin(p * 0.5 + phase) * (1.0 - math.cos(p))
-        wrz = 0.60 * wave + 0.18 * math.sin(2.0 * p)  # ~34 deg spin
+        wrz = 0.60 * wave + 0.18 * math.sin(2.0 * p)
         wry = 0.15 * wave
-        
     elif style == "HoverDance":
         wz = 0.08 * wave2
         wx = 0.10 * wave
         wrx = 0.20 * wave2
         wrz = 0.25 * wave
-        
     elif style == "JumpingIdle":
         hop = 0.5 - 0.5 * math.cos(2.0 * p)
-        wz = 0.25 * hop  # Visible 25cm jump
+        wz = 0.25 * hop
         wsx = wsy = 1.0 + 0.08 * math.sin(2.0 * p + math.pi)
         wsz = 1.0 - 0.12 * math.sin(2.0 * p + math.pi)
         wrx = 0.15 * math.sin(p)
-        
     elif style == "Lean":
-        wrx = 0.25 + 0.05 * math.sin(2.0 * p)  # Static tilt + slight breathing
+        wrx = 0.25 + 0.05 * math.sin(2.0 * p)
         wry = 0.08 * math.sin(p * 2.0 + phase)
         wx = 0.025 * (1.0 - math.cos(p))
-        
     elif style == "Orbit":
         wx = 0.15 * math.cos(p)
-        wry = 0.15 * math.sin(p) # Circular roll
+        wry = 0.15 * math.sin(p) 
         wz = 0.05 * math.sin(2.0 * p)
-        
     elif style == "PulsingIdle":
         pulse = wave
         wsx = wsy = 1.0 + 0.12 * pulse
         wsz = 1.0 - 0.10 * pulse
         wz = 0.03 * pulse
-        
     elif style == "Rocking":
         wrx = 0.30 * wave
         wrz = 0.15 * wave2
         wx = 0.05 * wave
-        
     elif style == "Shake":
-        wrx = 0.20 * math.sin(4.0 * p) # Fast, high-freq jitter (11 deg)
+        wrx = 0.20 * math.sin(4.0 * p) 
         wry = 0.15 * math.sin(5.0 * p + phase)
         wx = 0.05 * math.sin(3.0 * p + phase)
-        
     elif style == "SideHop":
-        wx = 0.15 * math.sin(2.0 * p) # Left/right translation
-        wz = 0.10 * max(0.0, math.sin(2.0 * p)) ** 2 # Small arc hops
+        wx = 0.15 * math.sin(2.0 * p) 
+        wz = 0.10 * max(0.0, math.sin(2.0 * p)) ** 2
         wrz = 0.15 * wave
         wsx = 1.0 + 0.06 * math.sin(4.0 * p)
         wsz = 1.0 - 0.08 * math.sin(4.0 * p)
-        
     elif style == "SpinningIdle":
-        wrz = 1.5 * wave + 0.28 * math.sin(2.0 * p) # Huge spin (~85+ deg)
+        wrz = 1.5 * wave + 0.28 * math.sin(2.0 * p) 
         wz = 0.05 * math.sin(2.0 * p)
-        
     elif style == "SpringBounce":
         bounce = 0.5 - 0.5 * math.cos(2.0 * p)
         wz = 0.20 * bounce
         wsx = wsy = 1.0 - 0.08 * bounce
         wsz = 1.0 + 0.15 * bounce
         wrx = 0.10 * math.sin(2.0 * p)
-        
     elif style == "SquashStretchIdle":
         pulse = wave
         wsx = wsy = 1.0 + 0.15 * pulse
         wsz = 1.0 - 0.18 * pulse
         wz = 0.04 * pulse
-        
     elif style == "TiltingIdle":
         wrx = 0.25 * wave
         wry = 0.25 * wave12
         wrz = 0.15 * math.sin(2.0 * p)
-        
     elif style == "Tumble":
-        wrx = 1.5 * wave # Huge back-and-forth tumble
+        wrx = 1.5 * wave 
         wrz = 0.8 * wave
         wz = 0.10 * (1.0 - math.cos(p))
-        
     elif style == "Twist":
-        wrz = 0.70 * wave # Strong yaw twist
+        wrz = 0.70 * wave 
         wry = 0.25 * wave2
         wrx = 0.15 * wave07
-        
     elif style == "WobbleIdle":
         wrx = 0.25 * wave + 0.08 * math.sin(3.0 * p)
         wry = 0.20 * wave15
@@ -322,67 +307,111 @@ def _idle_pose_loop(style, t, variant, intensity=1.0):
     )
 
 # ---------------------------------------------------------------------------
-# Win animation profiles (Fixed: Juicy Squash + Vertical Hop)
+# UNIQUE Win animation profiles (The Magic!)
 # ---------------------------------------------------------------------------
 
-def _win_pose(style_index, t, travel_y, intensity=1.0):
-    spin_sign = -1.0 if style_index % 2 else 1.0
-    angle = 0.08 + (style_index % 5) * 0.02 
-    side = math.sin(style_index * 1.37) * 0.1 
-
+def _win_pose(style, style_index, t, travel_y, intensity=1.0):
+    # 1. BASE "POP & SQUASH" LOGIC (Common to all, gives that juicy feeling)
     wx = wy = wz = 0.0
     wrx = wry = wrz = 0.0
     wsx = wsy = wsz = 1.0
 
-    if t <= 0.10: # Anticipation
+    if t <= 0.10: 
         q = t / 0.10
         wy = -(travel_y * 0.15) * q 
-        wz = -0.03 * q # Squash down slightly
-        wrx = angle * 0.5 * q
-        wry = side * 0.5 * q
-        wrz = -spin_sign * 0.05 * q 
+        wz = -0.03 * q 
         wsx, wsy, wsz = (1.0 + 0.05*q, 1.0 - 0.05*q, 1.0 + 0.05*q)
-
-    elif t <= 0.38: # Forward Pop
+    elif t <= 0.38:
         q = (t - 0.10) / 0.28
         ease = q*q*(3.0 - 2.0*q)
         wy = travel_y * ease 
-        wz = 0.08 * math.sin(q * math.pi) # Nice little pop up during travel
-        wrx = angle * math.sin(q * math.pi)
-        wry = side * math.sin(q * math.pi)
-        wrz = spin_sign * 0.15 * q
-        # Stretch during flight
+        wz = 0.08 * math.sin(q * math.pi) 
         wsx, wsy, wsz = (1.0 - 0.10*math.sin(q*math.pi), 1.0 + 0.15*math.sin(q*math.pi), 1.0 - 0.05*math.sin(q*math.pi)) 
-
-    elif t <= 0.56: # Squash Impact
+    elif t <= 0.56: 
         q = (t - 0.38) / 0.18
         wy = travel_y * (1.0 + 0.08*math.sin(q*math.pi/2.0))
-        wz = 0.04 * math.sin(q * math.pi) # Small vertical pop you requested
-        wrx = angle * (1.0-q)
-        wry = side * (1.0-q)
-        wrz = spin_sign * (0.15 + 0.03*q)
-        # JUICY SQUASH! (15% deformation)
+        wz = 0.04 * math.sin(q * math.pi) 
         wsx, wsy, wsz = (1.15 - 0.10*q, 0.85 + 0.10*q, 1.10 - 0.05*q)
-
-    elif t <= 0.78: # Rebound
+    elif t <= 0.78:
         q = (t - 0.56) / 0.22
         bounce = math.sin(q * math.pi)
         wy = travel_y * (1.08 - 0.08*q)
-        wz = 0.02 * bounce # Tiny residual bounce
-        wrx = angle * 0.3 * bounce
-        wry = side * 0.3 * bounce
-        wrz = spin_sign * (0.18 - 0.08*q)
+        wz = 0.02 * bounce 
         wsx, wsy, wsz = (1.0 + 0.05*bounce, 1.0 - 0.04*bounce, 1.0 + 0.03*bounce)
-
-    else: # Settle back
+    else: 
         q = (t - 0.78) / 0.22
         decay = (1.0-q) ** 2
         wy = travel_y * decay
         wz = 0.0
-        wrx = angle * 0.1 * decay
-        wry = side * 0.1 * decay
-        wrz = spin_sign * 0.10 * decay
         wsx, wsy, wsz = (1.0 + 0.02*decay, 1.0 - 0.02*decay, 1.0 + 0.01*decay)
+
+
+    # 2. STYLE-SPECIFIC OVERLAYS (This makes each win unique!)
+    
+    # ఎన్వలప్ (Envelope) లాజిక్: 0.1 నుండి 0.9 ఫ్రేమ్స్ మధ్యలో మాత్రమే యాక్షన్ జరుగుతుంది.
+    # కాబట్టి లూప్ మొదట్లో, చివర్లో కచ్చితంగా జీరో (0) అవుతుంది. జెర్క్స్ అస్సలు రావు.
+    active_env = 0.0
+    if 0.10 < t < 0.90:
+        active_env = math.sin((t - 0.10) / 0.80 * math.pi)
+        
+    impact_env = 0.0
+    if 0.38 < t < 0.78:
+        impact_env = math.sin((t - 0.38) / 0.40 * math.pi)
+
+    if style == "FloatingSpin":
+        wrz += (math.pi * 1.5) * active_env  # ముందుకు వస్తూ గాల్లో పెద్ద స్పిన్
+    
+    elif style == "Tumble":
+        wrx += (math.pi * 1.5) * active_env  # ముందుకు వస్తూ ఫ్రంట్ ఫ్లిప్
+        
+    elif style == "SpinningIdle":
+        wrz -= (math.pi * 2.0) * active_env  # డబుల్ స్పిన్
+        
+    elif style == "Shake":
+        wrx += 0.3 * impact_env * math.sin(t * 60.0) # పంఛ్ ఇవ్వగానే వైలెంట్ షేక్
+        wrz += 0.3 * impact_env * math.cos(t * 60.0)
+        
+    elif style == "JumpingIdle":
+        wz += 0.25 * active_env  # విన్ అయినప్పుడు బాగా పైకి ఎగరడం
+        
+    elif style == "SideHop":
+        wx += 0.35 * active_env * (1 if style_index % 2 == 0 else -1) # ఎడమ/కుడికి ఊగడం
+        
+    elif style == "SquashStretchIdle":
+        # బేస్ స్క్వాష్ ని 2.5 రెట్లు పెంచడం
+        dsx, dsy, dsz = wsx - 1.0, wsy - 1.0, wsz - 1.0
+        wsx, wsy, wsz = 1.0 + dsx * 2.5, 1.0 + dsy * 2.5, 1.0 + dsz * 2.5
+        
+    elif style == "Twist":
+        wrz += 1.0 * impact_env * math.sin(t * 25.0) # విపరీతమైన ట్విస్ట్
+        
+    elif style == "Rocking":
+        wrx += 0.7 * impact_env * math.sin(t * 18.0) # ముందుకి వెనక్కి ఊగడం
+        
+    elif style == "Orbit":
+        wx += 0.25 * active_env * math.cos(t * 15.0) # గాల్లో ఆర్క్ లాగా రావడం
+        wz += 0.15 * active_env * math.sin(t * 15.0)
+        
+    elif style == "SpringBounce":
+        wz += 0.20 * impact_env * abs(math.sin(t * 30.0)) # ల్యాండ్ అయ్యాక డబుల్ బౌన్స్
+        
+    elif style == "PulsingIdle":
+        wsx += 0.15 * impact_env * math.sin(t * 35.0)
+        wsz += 0.15 * impact_env * math.sin(t * 35.0)
+        
+    elif style == "TiltingIdle":
+        wry += 0.6 * impact_env * math.sin(t * 20.0)
+        
+    elif style == "Lean":
+        wry += 0.5 * active_env # ముందుకు వచ్చేటప్పుడు సైడ్ కి ఒరగడం
+        
+    elif style == "HoverDance":
+        wx += 0.20 * active_env * math.sin(t * 25.0) # ఫ్రంట్ పాప్ లో ఫిగర్-8 లాగా ఊగడం
+        wrx += 0.25 * active_env * math.cos(t * 25.0)
+        
+    elif style == "WobbleIdle":
+        wrx += 0.4 * impact_env * math.sin(t * 45.0)
+        wry += 0.4 * impact_env * math.cos(t * 40.0)
 
     return world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz, intensity)
 
@@ -408,14 +437,14 @@ def _idle_samples(style, variant, intensity):
         samples.append((frame, pose))
     return samples
 
-def _win_samples(style_index, travel_y, intensity):
+def _win_samples(style, style_index, travel_y, intensity):
     samples = []
     for t in WIN_KEY_TIMES:
         frame = WIN_START + int(round(t * WIN_FRAMES_COUNT))
         if frame in (WIN_START, WIN_END):
             pose = _REST_POSE
         else:
-            pose = _win_pose(style_index, t, travel_y, intensity)
+            pose = _win_pose(style, style_index, t, travel_y, intensity)
         samples.append((frame, pose))
     return samples
 
@@ -434,7 +463,8 @@ def create_animations(rig, travel_y, idle_intensity=1.0, win_intensity=1.0):
             
             combined_samples = []
             combined_samples.extend(_idle_samples(style, style_index + 1, idle_intensity))
-            combined_samples.extend(_win_samples(style_index, travel_y, win_intensity))
+            # ఇక్కడ style పేరు కూడా పాస్ చేస్తున్నాం (Unique Win Animations కోసం)
+            combined_samples.extend(_win_samples(style, style_index, travel_y, win_intensity))
             
             _bake_curves(rig, action, combined_samples)
             _set_action_range(action, IDLE_START, WIN_END)
@@ -444,7 +474,7 @@ def create_animations(rig, travel_y, idle_intensity=1.0, win_intensity=1.0):
         ad.action = None
         _reset_root(pb)
 
-    return f"Created {created} Fine-Tuned Actions (Idle+Win)!"
+    return f"Created {created} Pro Actions (16 Unique Idles + 16 Unique Wins)!"
 
 # ---------------------------------------------------------------------------
 # Settings and operators
@@ -490,8 +520,8 @@ class SLOTSYMBOL_OT_create_symbol(Operator):
 
 class SLOTSYMBOL_OT_create_animations(Operator):
     bl_idname = "slotsymbol.create_animations"
-    bl_label = "Generate 16 Pro Actions"
-    bl_description = f"Generates merged pro-actions with Idle ({IDLE_START}-{IDLE_END}) and Win ({WIN_START}-{WIN_END})"
+    bl_label = "Generate 16 Master Actions"
+    bl_description = f"Generates merged master actions with Idle ({IDLE_START}-{IDLE_END}) and Win ({WIN_START}-{WIN_END})"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
