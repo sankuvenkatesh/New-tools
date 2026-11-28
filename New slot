@@ -1,10 +1,10 @@
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (9, 6, 3),
+    "version": (9, 7, 0),
     "blender": (5, 2, 4),
     "location": "View3D > Sidebar > Slot Symbol",
-    "description": "AAA C2 Envelopes, SO(3)-Seamless Spin Loops, Custom Action Preservation, Logarithmic Lags, Juiciness & Blender 5.2.4 LTS Channel Bags API",
+    "description": "30 Truly Unique Styles, AAA C2/C3 Envelopes, SO(3)-Seamless Spin Loops, Custom Action Preservation, Logarithmic Lags, Juiciness & Blender 5.2.4 LTS Channel Bags API",
     "category": "Animation",
 }
 
@@ -35,17 +35,25 @@ IDLE_STYLES = (
     "Orbit", "PulsingIdle", "Rocking", "Shake",
     "SideHop", "SpinningIdle", "SpringBounce", "SquashStretchIdle",
     "TiltingIdle", "Tumble", "Twist", "WobbleIdle",
+    # +14 Unique Styles (Total 30)
+    "Cartwheel", "ClickWheel", "DepthLunge", "FigureEightDepth",
+    "GyroPrecess", "Heartbeat", "HeavyStomp", "JelloWave",
+    "Pendulum", "ShiverBurst", "SnapLook", "SwaggerStrut",
+    "VictoryNod", "ZeroGDrift",
 )
 
-# Styles with unidirectional continuous 360/720-deg SO(3) spin loops
+# Styles with unidirectional continuous 360-deg SO(3) spin loops
 _CONTINUOUS_SPIN_META = {
-    "FloatingSpin": ("Y", 1, 3),   # Bone Y (= world Z): 1 rev/idle, 3 revs/total
-    "SpinningIdle": ("Y", 2, 6),   # Bone Y (= world Z): 2 revs/idle, 6 revs/total
+    "FloatingSpin": ("XY", 1, 3),  # Bone X & Y: diagonal crystal 3D spin, 1 rev/idle, 3 revs/total
+    "SpinningIdle": ("Y", 1, 3),   # Bone Y (= world Z): 1 rev/idle (smooth turntable), 3 revs/total
     "Tumble": ("X", 1, 3),         # Bone X (= world X): 1 rev/idle, 3 revs/total
+    "Cartwheel": ("Z", 1, 3),      # Bone Z (= world -Y): 1 rev/idle, 3 revs/total
+    "ClickWheel": ("Y", 1, 3),     # Bone Y (= world Z): 1 rev/idle (4 magnetic detents), 3 revs/total
+    "GyroPrecess": ("Y", 1, 3),    # Bone Y (= world Z): 1 rev/idle (zero-gimbal nutating cone), 3 revs/total
 }
 
 _STYLE_ENUM_ITEMS = (
-    ("ALL", "All 16 Styles (Batch)", "Generate all 16 styles"),
+    ("ALL", "All 30 Styles (Batch)", "Generate all 30 styles"),
     *((s, s, f"Preview {s}") for s in IDLE_STYLES),
 )
 
@@ -174,11 +182,10 @@ def _lag(base_offset, intensity, prop_type="rot"):
 
 
 # ---------------------------------------------------------------------------
-# Base Continuous C2 Math Motions (Retained Personalities + Juiciness Control)
+# Base Continuous C2 Math Motions (30 Truly Unique Personalities + Juiciness)
 # ---------------------------------------------------------------------------
 def _idle_base(style, t, variant, intensity=1.0, squash_intensity=1.0):
     p = 2.0 * math.pi * t
-    phase = variant * 0.37
     wave = math.sin(p)
     wave2 = math.sin(2.0 * p)
 
@@ -187,12 +194,17 @@ def _idle_base(style, t, variant, intensity=1.0, squash_intensity=1.0):
     wsx = wsy = wsz = 1.0
 
     if style == "FloatingSpin":
-        wz = (0.10 * math.sin(p - _lag(0.25, intensity, "loc"))) * intensity
-        wrz = t * (2.0 * math.pi) + (0.05 * math.sin(4.0 * p))
+        wz = (0.18 * math.sin(p - _lag(0.25, intensity, "loc"))) * intensity
+        wrx = t * (2.0 * math.pi)
+        wrz = t * (2.0 * math.pi)
     elif style == "HoverDance":
-        wx = (0.15 * math.sin(p + phase)) * intensity
-        wz = (0.10 * math.sin(2.0 * p - _lag(0.4, intensity, "loc"))) * intensity
-        wry = (0.15 * math.sin(p - _lag(0.1, intensity, "rot"))) * intensity
+        wx = (0.16 * wave2) * intensity
+        wz = (0.11 * (wave2 * wave2)) * intensity
+        wry = (0.22 * math.sin(2.0 * p - _lag(0.20, intensity, "rot"))) * intensity
+        wrz = (0.24 * math.sin(p - _lag(0.30, intensity, "rot"))) * intensity
+        s_dance = math.sin(2.0 * p - _lag(0.15, intensity, "scale"))
+        ds = 0.08 * (s_dance * s_dance) * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + ds, 1.0 + ds, 1.0 - 1.3 * ds
     elif style == "JumpingIdle":
         hop = max(0.0, wave)
         wz = (0.25 * (hop * hop * hop)) * intensity
@@ -200,15 +212,22 @@ def _idle_base(style, t, variant, intensity=1.0, squash_intensity=1.0):
         dsz = -0.15 * math.sin(2.0 * p + math.pi - _lag(0.25, intensity, "scale")) * intensity * squash_intensity
         wsx, wsy, wsz = 1.0 + dsx, 1.0 + dsx, 1.0 + dsz
     elif style == "Lean":
-        wrx = (0.25 + 0.05 * wave) * intensity
-        wry = (0.10 * math.sin(p * 2.0 - _lag(0.5, intensity, "rot"))) * intensity
+        hold = smooth_step(0.05, 0.80, 0.5 * (1.0 - math.cos(p)))
+        hold_r = smooth_step(0.05, 0.80, 0.5 * (1.0 - math.cos(p - _lag(0.25, intensity, "rot"))))
+        wx = (0.14 * hold) * intensity
+        wy = (-0.09 * hold) * intensity
+        wrx = (-0.26 * hold_r) * intensity
+        wry = (-0.28 * hold_r) * intensity
     elif style == "Orbit":
-        wx = (0.20 * math.cos(p)) * intensity
-        wz = (0.10 * math.sin(2.0 * p - _lag(0.3, intensity, "loc"))) * intensity
-        wry = (0.15 * math.sin(p - _lag(0.2, intensity, "rot"))) * intensity
+        wx = (0.22 * wave) * intensity
+        wz = (0.16 * (1.0 - math.cos(p))) * intensity
+        wry = (-0.22 * math.sin(p - _lag(0.20, intensity, "rot"))) * intensity
     elif style == "PulsingIdle":
-        ds = 0.15 * math.sin(p - _lag(0.2, intensity, "scale")) * intensity * squash_intensity
-        wsx, wsy, wsz = 1.0 + ds, 1.0 + ds, 1.0 - ds
+        breath = smooth_step(0.05, 0.85, 0.5 * (1.0 - math.cos(p)))
+        breath_s = smooth_step(0.05, 0.85, 0.5 * (1.0 - math.cos(p - _lag(0.20, intensity, "scale"))))
+        wz = (0.05 * breath) * intensity
+        ds = 0.22 * breath_s * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + ds, 1.0 + ds, 1.0 + ds
     elif style == "Rocking":
         wrx = (0.35 * wave) * intensity
         wz = (0.05 * math.sin(2.0 * p - _lag(0.6, intensity, "loc"))) * intensity
@@ -221,29 +240,144 @@ def _idle_base(style, t, variant, intensity=1.0, squash_intensity=1.0):
         wz = (0.15 * (hop2 * hop2 * hop2)) * intensity
         wrz = (0.20 * math.sin(p - _lag(0.35, intensity, "rot"))) * intensity
     elif style == "SpinningIdle":
-        wrz = t * (4.0 * math.pi) + (0.08 * math.sin(2.0 * p))
+        wrz = t * (2.0 * math.pi) - (0.15 * math.sin(p))
     elif style == "SpringBounce":
-        wz = (0.25 * (wave * wave)) * intensity
-        s_lag = math.sin(p - _lag(0.2, intensity, "scale"))
-        s_sq = s_lag * s_lag
-        dsx = -0.1 * s_sq * intensity * squash_intensity
-        dsz = 0.2 * s_sq * intensity * squash_intensity
+        u = t % 1.0
+        env_sp = smooth_step(0.0, 0.12, u) * ((1.0 - u) ** 3)
+        coil = -math.sin(u * math.pi * 6.0) * env_sp
+        coil_s = -math.sin(u * math.pi * 6.0 - _lag(0.25, intensity, "scale")) * env_sp
+        wz = (0.34 * coil) * intensity
+        dsx = -0.18 * coil_s * intensity * squash_intensity
+        dsz = 0.28 * coil_s * intensity * squash_intensity
         wsx, wsy, wsz = 1.0 + dsx, 1.0 + dsx, 1.0 + dsz
     elif style == "SquashStretchIdle":
         ds = 0.20 * math.sin(p - _lag(0.15, intensity, "scale")) * intensity * squash_intensity
         dsz = -0.25 * math.sin(p - _lag(0.15, intensity, "scale")) * intensity * squash_intensity
         wsx, wsy, wsz = 1.0 + ds, 1.0 + ds, 1.0 + dsz
     elif style == "TiltingIdle":
-        wry = (0.30 * wave) * intensity
-        wrx = (0.15 * math.sin(p + 1.5 - _lag(0.4, intensity, "rot"))) * intensity
+        tilt = math.tanh(2.6 * wave)
+        tilt_r = math.tanh(2.6 * math.sin(p - _lag(0.20, intensity, "rot")))
+        wx = (-0.06 * tilt) * intensity
+        wz = (0.05 * (tilt * tilt)) * intensity
+        wry = (0.38 * tilt_r) * intensity
     elif style == "Tumble":
         wrx = t * (2.0 * math.pi) + (0.08 * math.sin(2.0 * p))
     elif style == "Twist":
-        wrz = (0.60 * wave) * intensity
-        wry = (0.15 * math.sin(2.0 * p - _lag(0.35, intensity, "rot"))) * intensity
+        u = t % 1.0
+        wind = -0.60 * _bell_c2(u / 0.50) if u < 0.50 else 0.0
+        if u > 0.35:
+            r = (u - 0.35) / 0.65
+            ring = 1.55 * math.sin(r * math.pi * 3.0) * smooth_step(0.0, 0.22, r) * ((1.0 - r) ** 3)
+        else:
+            ring = 0.0
+        twist_ang = wind + ring
+        wz = (0.08 * twist_ang) * intensity
+        wrz = twist_ang * intensity
+        ds = 0.09 * wind * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + ds, 1.0 + ds, 1.0 - 1.2 * ds
     elif style == "WobbleIdle":
         wrx = (0.25 * wave) * intensity
         wry = (0.25 * math.sin(p + 1.5 - _lag(0.5, intensity, "rot"))) * intensity
+    # --- +14 Unique Animations ---
+    elif style == "Cartwheel":
+        wx = (0.14 * wave) * intensity
+        wz = (0.06 * math.sin(2.0 * p - _lag(0.25, intensity, "loc"))) * intensity
+        wry = t * (2.0 * math.pi) + (0.06 * math.sin(2.0 * p))
+    elif style == "ClickWheel":
+        wrz = t * (2.0 * math.pi) - (0.22 * math.sin(4.0 * p))
+        click = 0.05 * math.sin(4.0 * p - _lag(0.15, intensity, "scale")) * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + click, 1.0 + click, 1.0 - click
+    elif style == "DepthLunge":
+        wy = (0.16 * wave - 0.04 * wave2) * intensity
+        wrx = (0.18 * math.sin(p - _lag(0.30, intensity, "rot"))) * intensity
+        ds = 0.09 * math.sin(p - _lag(0.20, intensity, "scale")) * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + ds, 1.0 - ds * 1.4, 1.0 + ds
+    elif style == "FigureEightDepth":
+        wx = (0.22 * wave) * intensity
+        wy = (0.14 * wave2) * intensity
+        wrz = (0.28 * math.sin(2.0 * p - _lag(0.30, intensity, "rot"))) * intensity
+        wry = (-0.20 * math.sin(p - _lag(0.25, intensity, "rot"))) * intensity
+    elif style == "GyroPrecess":
+        wx = (0.05 * wave) * intensity
+        wy = (0.05 * math.cos(p)) * intensity
+        wrx = (0.16 * (1.0 - math.cos(p - _lag(0.20, intensity, "rot")))) * intensity
+        wrz = t * (2.0 * math.pi)
+    elif style == "Heartbeat":
+        lag_s = _lag(0.15, intensity, "scale")
+        b1 = max(0.0, (math.cos(p - 1.3) - 0.75) / 0.25) ** 3
+        b2 = max(0.0, (math.cos(p - 2.6) - 0.75) / 0.25) ** 3
+        b1_s = max(0.0, (math.cos(p - 1.3 - lag_s) - 0.75) / 0.25) ** 3
+        b2_s = max(0.0, (math.cos(p - 2.6 - lag_s) - 0.75) / 0.25) ** 3
+        wy = (0.09 * b1 + 0.06 * b2) * intensity
+        ds = (0.16 * b1_s + 0.11 * b2_s) * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + ds, 1.0 + ds, 1.0 + ds
+    elif style == "HeavyStomp":
+        theta = p - 0.75 * (1.0 - math.cos(p))
+        s_th = math.sin(theta)
+        lift = max(0.0, s_th) ** 3
+        slam = max(0.0, -s_th) ** 3
+        wz = (0.24 * lift) * intensity
+        wrx = (0.16 * slam) * intensity
+        dsx = 0.16 * slam * intensity * squash_intensity
+        dsz = -0.22 * slam * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 + dsx, 1.0 + dsx, 1.0 + dsz
+    elif style == "JelloWave":
+        s_amp = 0.16 * intensity * squash_intensity
+        j2 = math.sin(2.0 * p)
+        j3 = math.sin(3.0 * p)
+        wsx = 1.0 + s_amp * j2
+        wsy = 1.0 + s_amp * j3
+        wsz = 1.0 - s_amp * (0.65 * j2 + 0.65 * j3)
+        wrx = (0.10 * math.sin(2.0 * p - _lag(0.25, intensity, "rot"))) * intensity
+        wry = (0.12 * math.sin(3.0 * p - _lag(0.25, intensity, "rot"))) * intensity
+    elif style == "Pendulum":
+        swing = wave + 0.09 * math.sin(3.0 * p)
+        p_r = p - _lag(0.25, intensity, "rot")
+        swing_r = math.sin(p_r) + 0.09 * math.sin(3.0 * p_r)
+        wx = (0.30 * swing) * intensity
+        wz = (0.15 * (swing * swing)) * intensity
+        wry = (0.45 * swing_r) * intensity
+    elif style == "ShiverBurst":
+        u = t % 1.0
+        if 0.55 < u < 0.90:
+            s = (u - 0.55) / 0.35
+            zap_env = _bell_c2(s)
+            zap_w = math.sin(s * math.pi * 6.0)
+            wz = (0.09 * zap_env) * intensity
+            wrx = (0.20 * zap_w * zap_env) * intensity
+            wry = (0.22 * math.cos(s * math.pi * 5.0) * zap_env) * intensity
+            ds = 0.10 * zap_w * zap_env * intensity * squash_intensity
+            wsx, wsy, wsz = 1.0 + ds, 1.0 - ds, 1.0 + 0.5 * ds
+    elif style == "SnapLook":
+        glance = math.tanh(2.4 * wave)
+        wx = (0.08 * glance) * intensity
+        wrz = (0.42 * glance) * intensity
+        wry = (0.14 * math.tanh(2.4 * math.sin(p - _lag(0.25, intensity, "rot")))) * intensity
+    elif style == "SwaggerStrut":
+        wz = (0.12 * (wave * wave)) * intensity
+        wy = (0.08 * wave2) * intensity
+        wrx = (0.10 * (wave * wave)) * intensity
+        wry = (-0.22 * math.sin(p - _lag(0.15, intensity, "rot"))) * intensity
+        wrz = (0.26 * math.sin(p - _lag(0.35, intensity, "rot"))) * intensity
+        s_step = math.sin(p - _lag(0.20, intensity, "scale"))
+        ds = 0.09 * (s_step * s_step) * intensity * squash_intensity
+        wsx, wsy, wsz = 1.0 - 0.7 * ds, 1.0 - 0.7 * ds, 1.0 + 1.2 * ds
+    elif style == "VictoryNod":
+        lag_r = _lag(0.12, intensity, "rot")
+        n1 = max(0.0, (math.cos(p - 1.2) - 0.72) / 0.28) ** 3
+        n2 = max(0.0, (math.cos(p - 2.5) - 0.72) / 0.28) ** 3
+        n1_r = max(0.0, (math.cos(p - 1.2 - lag_r) - 0.72) / 0.28) ** 3
+        n2_r = max(0.0, (math.cos(p - 2.5 - lag_r) - 0.72) / 0.28) ** 3
+        wz = (-0.06 * n1 - 0.045 * n2) * intensity
+        wy = (0.05 * n1 + 0.035 * n2) * intensity
+        wrx = (0.34 * n1_r + 0.26 * n2_r) * intensity
+    elif style == "ZeroGDrift":
+        wx = (0.09 * math.sin(p + 0.4)) * intensity
+        wy = (0.08 * math.sin(p + 2.1)) * intensity
+        wz = (0.10 * math.sin(p - _lag(0.35, intensity, "loc"))) * intensity
+        wrx = (0.14 * math.sin(p + 1.1 - _lag(0.25, intensity, "rot"))) * intensity
+        wry = (0.14 * math.sin(p + 3.2 - _lag(0.35, intensity, "rot"))) * intensity
+        wrz = (0.16 * math.sin(p + 5.0 - _lag(0.45, intensity, "rot"))) * intensity
 
     return wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz
 
@@ -253,7 +387,7 @@ def world_to_bone_space(wx, wy, wz, wrx, wry, wrz, wsx, wsy, wsz):
 
 
 # ---------------------------------------------------------------------------
-# The Master Evaluator (C2 Envelopes, SO(3)-Seamless Spins & Decaying Tremor)
+# The Master Evaluator (C2 Envelopes, SO(3)-Seamless Spins & Soft Settle)
 # ---------------------------------------------------------------------------
 def _evaluate_frame(style, variant, frame, travel_y, idle_intensity, win_intensity, squash_intensity=1.0):
     t_continuous = (frame - 1) / float(IDLE_PERIOD)
@@ -372,6 +506,8 @@ def _capture_custom_action(rig):
 def _restore_custom_action(rig, custom_action, custom_slot):
     if rig is None or custom_action is None:
         return
+    if custom_action.name not in bpy.data.actions:
+        return
     ad = rig.animation_data or rig.animation_data_create()
     ad.action = custom_action
     if custom_slot is not None:
@@ -460,6 +596,9 @@ def _setup_action_metadata(action, style_name):
         action["spin_cycles_total"] = total_revs
     else:
         action["loop_type"] = "EXACT_EULER_C2"
+        for stale_key in ("spin_axis", "spin_cycles_idle", "spin_cycles_total"):
+            if stale_key in action:
+                del action[stale_key]
 
     if len(action.pose_markers) == 0:
         action.pose_markers.new("Idle_Loop").frame = 1
@@ -497,7 +636,7 @@ def _ensure_slot_and_channelbag_5_2(rig, action):
 def _bake_curves_5_2_safe(rig, action, samples, endpoint_velocities=None):
     """
     Blender 5.2.4 LTS Strict API: Fast ChannelBag F-Curve baking.
-    Always enforces consistent BEZIER interpolation & handles even during in-place updates,
+    Always enforces consistent BEZIER interpolation & AUTO_CLAMPED handles even during in-place updates,
     plus exact analytical ALIGNED endpoint tangents at Frame 1 & Frame 151.
     """
     slot, channelbag = _ensure_slot_and_channelbag_5_2(rig, action)
@@ -671,7 +810,7 @@ def _on_live_setting_changed(self, context):
             active_style = self.preview_style
         else:
             _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=scene)
-            self.status = "Clean State: Pick a Target style or enable 'Sync All 16 Live'"
+            self.status = "Clean State: Pick a Target style or enable 'Sync All 30 Live'"
             return
 
         # Pre-evaluate atomically before committing
@@ -705,9 +844,9 @@ def _on_live_setting_changed(self, context):
             scene.frame_set(scene.frame_current)
 
         if self.live_sync_all:
-            self.status = f"Live Synced ALL {len(styles_to_update)} Actions (v9.6.3)"
+            self.status = f"Live Synced ALL {len(styles_to_update)} Actions (v9.7.0)"
         else:
-            self.status = f"Live Preview: {active_style} (v9.6.3)"
+            self.status = f"Live Preview: {active_style} (v9.7.0)"
     except Exception as exc:
         traceback.print_exc()
         self.status = f"ERROR: {exc}"
@@ -862,16 +1001,16 @@ def create_animations(rig, travel_y, idle_intensity, win_intensity, squash_inten
     if target_style == "ALL":
         if custom_action is not None:
             _restore_custom_action(rig, custom_action, custom_slot)
-            return f"Generated {len(created_map)} Actions — Custom Action Preserved (v9.6.3 | 5.2.4 LTS)!"
+            return f"Generated {len(created_map)} Actions — Custom Action Preserved (v9.7.0 | 5.2.4 LTS)!"
         _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=scene)
         scene.frame_set(1)
-        return f"Generated {len(created_map)} Actions — Rig Clean/Unlinked (v9.6.3 | 5.2.4 LTS)!"
+        return f"Generated {len(created_map)} Actions — Rig Clean/Unlinked (v9.7.0 | 5.2.4 LTS)!"
     else:
         act, slot = created_map[target_style]
         _bind_preview_action(rig, act, slot)
         scene.frame_set(scene.frame_current)
         note = f" | '{custom_action.name}' kept (Fake User)" if custom_action is not None else ""
-        return f"Previewing: {target_style} (v9.6.3 | 5.2.4 LTS){note}"
+        return f"Previewing: {target_style} (v9.7.0 | 5.2.4 LTS){note}"
 
 
 # ---------------------------------------------------------------------------
@@ -927,8 +1066,8 @@ class SlotSymbolSettings(PropertyGroup):
         update=_on_live_preview_toggled,
     )
     live_sync_all: BoolProperty(
-        name="Sync All 16 Live",
-        description="When Real-Time Preview is ON, update ALL 16 actions together instead of only the active preview action",
+        name="Sync All 30 Live",
+        description="When Real-Time Preview is ON, update ALL 30 actions together instead of only the active preview action",
         default=False,
         update=_on_live_setting_changed,
     )
