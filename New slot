@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Slot Symbol Animation Generator",
     "author": "Venkatesh Sanku",
-    "version": (9, 6, 1),
+    "version": (9, 6, 3),
     "blender": (5, 2, 4),
     "location": "View3D > Sidebar > Slot Symbol",
     "description": "AAA C2 Envelopes, SO(3)-Seamless Spin Loops, Custom Action Preservation, Logarithmic Lags, Juiciness & Blender 5.2.4 LTS Channel Bags API",
@@ -141,7 +141,7 @@ def get_squash_stretch(t_win, squash_intensity=1.0):
         )
     elif t_win < 0.35:
         u = (t_win - 0.15) / 0.20
-        attack = smooth_step(0.0, 0.15, u)
+        attack = smooth_step(0.0, 0.25, u)
         decay = (1.0 - u) ** 3
         w = math.sin(u * math.pi * 3.0) * attack * decay * squash_intensity
         return (
@@ -296,27 +296,24 @@ def _evaluate_frame(style, variant, frame, travel_y, idle_intensity, win_intensi
     wsy *= ssy
     wsz *= ssz
 
-    # C2-Enveloped Decaying Impact Tremor (0 pos/vel/acc at both 0.15 and 0.35)
+    # C2/C3-Enveloped Soft Impact Settle (no scale collision with squash, bounded amplitude, smooth 2-3 Hz settle)
     if 0.15 < t_win < 0.35:
         tremor_time = (t_win - 0.15) / 0.20
-        attack = smooth_step(0.0, 0.12, tremor_time)
+        attack = smooth_step(0.0, 0.25, tremor_time)
         decay = (1.0 - tremor_time) ** 3
         tremor_env = attack * decay
 
-        freq_decay = 1.0 + 0.5 * (1.0 - tremor_time)
-        freq_z = 15.0 * (0.8 + 0.2 * win_intensity) * freq_decay
-        freq_rot = 18.0 * (0.8 + 0.2 * win_intensity) * freq_decay
-        freq_scale = 24.0 * (0.8 + 0.2 * win_intensity) * freq_decay
+        # Bounded frequency & logarithmic amplitude (never explodes even at win_intensity = 5.0)
+        freq_scale_i = 1.0 + 0.15 * math.tanh((win_intensity - 1.0) * 0.5)
+        phase_t = tremor_time * (1.2 - 0.2 * tremor_time)
 
-        punch_power = current_intensity ** 1.2
+        freq_z = 3.0 * freq_scale_i       # ~13 frames/cycle: smooth weight settle
+        freq_rot = 3.5 * freq_scale_i     # ~11 frames/cycle: subtle nod settle
 
-        wz += math.sin(tremor_time * math.pi * freq_z) * 0.04 * tremor_env * punch_power
-        wrx += math.cos(tremor_time * math.pi * freq_rot) * 0.06 * tremor_env * punch_power
+        punch_power = math.log1p(max(0.0, current_intensity)) / _LN2
 
-        s_tremor = math.sin(tremor_time * math.pi * freq_scale) * 0.05 * tremor_env * punch_power * squash_intensity
-        wsx += s_tremor
-        wsz += s_tremor
-        wsy -= s_tremor * 1.5
+        wz += math.sin(phase_t * math.pi * freq_z) * 0.018 * tremor_env * punch_power
+        wrx += math.sin(phase_t * math.pi * freq_rot) * 0.025 * tremor_env * punch_power
 
     wsx = max(0.1, min(4.0, safe_val(wsx, 1.0)))
     wsy = max(0.1, min(4.0, safe_val(wsy, 1.0)))
@@ -528,11 +525,11 @@ def _bake_curves_5_2_safe(rig, action, samples, endpoint_velocities=None):
 
             fc.keyframe_points.foreach_set("co", coords)
 
-            # Enforce consistent BEZIER + AUTO handles on every bake (prevents stale LINEAR/VECTOR curves)
+            # Enforce consistent BEZIER + AUTO_CLAMPED handles on every bake (prevents stale LINEAR/VECTOR curves)
             for key in fc.keyframe_points:
                 key.interpolation = "BEZIER"
-                key.handle_left_type = "AUTO"
-                key.handle_right_type = "AUTO"
+                key.handle_left_type = "AUTO_CLAMPED"
+                key.handle_right_type = "AUTO_CLAMPED"
 
             fc.update()
 
@@ -708,9 +705,9 @@ def _on_live_setting_changed(self, context):
             scene.frame_set(scene.frame_current)
 
         if self.live_sync_all:
-            self.status = f"Live Synced ALL {len(styles_to_update)} Actions (v9.6.1)"
+            self.status = f"Live Synced ALL {len(styles_to_update)} Actions (v9.6.3)"
         else:
-            self.status = f"Live Preview: {active_style} (v9.6.1)"
+            self.status = f"Live Preview: {active_style} (v9.6.3)"
     except Exception as exc:
         traceback.print_exc()
         self.status = f"ERROR: {exc}"
@@ -865,16 +862,16 @@ def create_animations(rig, travel_y, idle_intensity, win_intensity, squash_inten
     if target_style == "ALL":
         if custom_action is not None:
             _restore_custom_action(rig, custom_action, custom_slot)
-            return f"Generated {len(created_map)} Actions — Custom Action Preserved (v9.6.1 | 5.2.4 LTS)!"
+            return f"Generated {len(created_map)} Actions — Custom Action Preserved (v9.6.3 | 5.2.4 LTS)!"
         _unlink_preview_action(rig, only_slot_symbol=True, reset_pose=True, scene=scene)
         scene.frame_set(1)
-        return f"Generated {len(created_map)} Actions — Rig Clean/Unlinked (v9.6.1 | 5.2.4 LTS)!"
+        return f"Generated {len(created_map)} Actions — Rig Clean/Unlinked (v9.6.3 | 5.2.4 LTS)!"
     else:
         act, slot = created_map[target_style]
         _bind_preview_action(rig, act, slot)
         scene.frame_set(scene.frame_current)
         note = f" | '{custom_action.name}' kept (Fake User)" if custom_action is not None else ""
-        return f"Previewing: {target_style} (v9.6.1 | 5.2.4 LTS){note}"
+        return f"Previewing: {target_style} (v9.6.3 | 5.2.4 LTS){note}"
 
 
 # ---------------------------------------------------------------------------
